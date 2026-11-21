@@ -37,3 +37,20 @@ export function formatSlotInOffset(slotAt: number, offsetMinutes: number): strin
   const day = `${pad(d.getUTCDate())}/${pad(d.getUTCMonth() + 1)}/${d.getUTCFullYear()}`;
   return `${SHORT_DAYS[d.getUTCDay()]} ${day} ${pad(d.getUTCHours())}:${pad(d.getUTCMinutes())}`;
 }
+
+/** "UTC+10", "UTC-5" or "UTC+5:30", for an offset that is not one of the named options. */
+export function offsetLabel(minutes: number): string {
+  const abs = Math.abs(minutes);
+  const mins = abs % 60 === 0 ? "" : `:${pad(abs % 60)}`;
+  return `UTC${minutes < 0 ? "-" : "+"}${Math.floor(abs / 60)}${mins}`;
+}
+
+export function weekdayName(id: WeekdayId): string {
+  return WEEKDAYS.find((d) => d.id === id)?.name ?? id;
+}
+
+/** Week order, then time of day. HH:MM sorts correctly as text. */
+export function sortRules<T extends { weekday: WeekdayId; time: string }>(rules: T[]): T[] {
+  const order = (r: T) => WEEKDAYS.findIndex((d) => d.id === r.weekday);
+  return [...rules].sort((a, b) => order(a) - order(b) || a.time.localeCompare(b.time));
+}
