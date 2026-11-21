@@ -89,6 +89,15 @@ pub fn is_slot_conflict(text: &str) -> bool {
     text.contains("UNIQUE constraint failed: posts.slot_at")
 }
 
+/// CSRF guard: a cross-site form cannot send `application/json`, so POSTs must.
+pub fn is_json_content_type(header: Option<&str>) -> bool {
+    let Some(value) = header else {
+        return false;
+    };
+    let media_type = value.split(';').next().unwrap_or("").trim();
+    media_type.eq_ignore_ascii_case("application/json")
+}
+
 /// HTTP status and a safe message. Port errors never leak their detail.
 pub fn error_status(e: &AppError) -> (u16, String) {
     match e {
@@ -141,6 +150,24 @@ mod tests {
     fn port_errors_do_not_leak_detail() {
         let (code, msg) = error_status(&AppError::Port(PortError("D1: secret table".into())));
         assert_eq!((code, msg.as_str()), (500, "storage error"));
+    }
+
+    #[test]
+    fn only_json_content_types_pass_the_csrf_check() {
+        assert!(is_json_content_type(Some("application/json")));
+        assert!(is_json_content_type(Some(
+            "Application/JSON; charset=utf-8"
+        )));
+        assert!(!is_json_content_type(None));
+        assert!(!is_json_content_type(Some("text/plain")));
+        assert!(!is_json_content_type(Some(
+            "application/x-www-form-urlencoded"
+        )));
+        assert!(!is_json_content_type(Some(
+            "multipart/form-data; boundary=x"
+        )));
+        assert!(!is_json_content_type(Some("application/jsonp")));
+        assert!(!is_json_content_type(Some("")));
     }
 
     #[test]

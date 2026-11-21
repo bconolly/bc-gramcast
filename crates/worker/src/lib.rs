@@ -31,6 +31,16 @@ mod entry {
         Response::error(msg, code)
     }
 
+    /// Rejects non-JSON POSTs (415) before the body is read.
+    fn require_json(req: &Request) -> Option<Response> {
+        let header = req.headers().get("Content-Type").ok().flatten();
+        if dto::is_json_content_type(header.as_deref()) {
+            None
+        } else {
+            Response::error("content type must be application/json", 415).ok()
+        }
+    }
+
     fn now_secs() -> i64 {
         (Date::now().as_millis() / 1000) as i64
     }
@@ -42,6 +52,9 @@ mod entry {
         }
         Router::new()
             .post_async("/api/uploads", |mut req, ctx| async move {
+                if let Some(rejected) = require_json(&req) {
+                    return Ok(rejected);
+                }
                 let Ok(body) = req.json::<StartUploadBody>().await else {
                     return Response::error("bad request", 400);
                 };
@@ -62,6 +75,9 @@ mod entry {
                 }
             })
             .post_async("/api/posts", |mut req, ctx| async move {
+                if let Some(rejected) = require_json(&req) {
+                    return Ok(rejected);
+                }
                 let Ok(body) = req.json::<QueuePostBody>().await else {
                     return Response::error("bad request", 400);
                 };
