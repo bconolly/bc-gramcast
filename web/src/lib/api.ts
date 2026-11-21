@@ -150,8 +150,26 @@ export async function submitPost(
   });
 }
 
+const isRecord = (v: unknown): v is Record<string, unknown> => typeof v === "object" && v !== null;
+
+/** Reads a JSON body and checks its shape; any mismatch gets the generic failure line. */
+async function readChecked<T>(res: Response, ok: (body: unknown) => body is T): Promise<T> {
+  const body: unknown = await res.json().catch(() => undefined);
+  if (!ok(body)) throw new ApiError(`Something went wrong (error ${res.status}). Please try again.`, res.status);
+  return body;
+}
+
+const isPattern = (b: unknown): b is PatternJson =>
+  isRecord(b) &&
+  Number.isInteger(b.utc_offset_minutes) &&
+  Array.isArray(b.rules) &&
+  b.rules.every((r) => isRecord(r) && typeof r.weekday === "string" && typeof r.time === "string");
+
+const isSlots = (b: unknown): b is { slots: number[] } =>
+  isRecord(b) && Array.isArray(b.slots) && b.slots.every((n) => Number.isInteger(n));
+
 export async function getPattern(): Promise<PatternJson> {
-  return (await call("/api/slots/pattern")).json();
+  return readChecked(await call("/api/slots/pattern"), isPattern);
 }
 
 /** Saves the weekly pattern. Resolves to the pattern as the server normalised it. */
@@ -161,6 +179,5 @@ export async function savePattern(pattern: PatternJson): Promise<PatternJson> {
 
 /** The next free pattern slots, as Unix seconds in ascending order. */
 export async function getNextSlots(count: number): Promise<number[]> {
-  const body: { slots: number[] } = await (await call(`/api/slots/next?count=${count}`)).json();
-  return body.slots;
+  return (await readChecked(await call(`/api/slots/next?count=${count}`), isSlots)).slots;
 }

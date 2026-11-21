@@ -199,4 +199,33 @@ describe("slot pattern", () => {
     mockFetch(reply("count must be a whole number from 1 to 20", 422));
     await expect(getNextSlots(0)).rejects.toMatchObject({ status: 422 });
   });
+
+  const GENERIC = /^Something went wrong/;
+
+  it.each([
+    ["slots missing", {}],
+    ["slots not an array", { slots: "1,2" }],
+    ["slot not an integer", { slots: [1.5] }],
+    ["slot a string", { slots: ["100"] }],
+  ])("getNextSlots rejects a bad body: %s", async (_name, body) => {
+    mockFetch(reply(JSON.stringify(body)));
+    await expect(getNextSlots(5)).rejects.toThrow(GENERIC);
+  });
+
+  it.each([
+    ["not an object", "null"],
+    ["offset missing", { rules: [] }],
+    ["offset fractional", { utc_offset_minutes: 1.5, rules: [] }],
+    ["rules not an array", { utc_offset_minutes: 600, rules: {} }],
+    ["rule weekday not a string", { utc_offset_minutes: 600, rules: [{ weekday: 1, time: "19:00" }] }],
+    ["rule time missing", { utc_offset_minutes: 600, rules: [{ weekday: "wed" }] }],
+  ])("getPattern rejects a bad body: %s", async (_name, body) => {
+    mockFetch(reply(typeof body === "string" ? body : JSON.stringify(body)));
+    await expect(getPattern()).rejects.toThrow(GENERIC);
+  });
+
+  it("getPattern rejects a body that is not JSON", async () => {
+    mockFetch(reply("<html>"));
+    await expect(getPattern()).rejects.toThrow(GENERIC);
+  });
 });
