@@ -182,16 +182,19 @@ pub fn check_header(header: &JwtHeader) -> Result<(), AuthError> {
     if header.alg != "RS256" {
         return Err(AuthError::UnsupportedAlg);
     }
-    let kid_ok = (1..=128).contains(&header.kid.len())
-        && header
-            .kid
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'));
-    if kid_ok {
+    if valid_kid(&header.kid) {
         Ok(())
     } else {
         Err(AuthError::BadKeyId)
     }
+}
+
+/// A key id is 1 to 128 plain characters: letters, digits, `.`, `_` and `-`.
+pub fn valid_kid(kid: &str) -> bool {
+    (1..=128).contains(&kid.len())
+        && kid
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
 }
 
 /// Checks the claims against this deployment. `now` is unix seconds.

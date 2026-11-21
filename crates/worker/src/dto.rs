@@ -377,6 +377,77 @@ pub fn is_same_origin(
         .any(|scheme| origin.eq_ignore_ascii_case(&format!("{scheme}{host}")))
 }
 
+/// Largest key-set response we will read, in bytes.
+pub const MAX_JWKS_BYTES: usize = 64 * 1024;
+/// Most keys a key set may list. Access publishes two at a time.
+pub const MAX_JWKS_KEYS: usize = 10;
+
+/// An RSA public key from the key set, ready for Web Crypto.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Jwk {
+    pub kid: String,
+    /// base64url modulus (at least 2048 bits).
+    pub n: String,
+    /// base64url exponent.
+    pub e: String,
+}
+
+/// The key set could not be used at all.
+#[derive(Debug, PartialEq, Eq)]
+pub struct JwksError;
+
+#[derive(Deserialize)]
+struct JwkWire {
+    kty: String,
+    kid: Option<String>,
+    n: Option<String>,
+    e: Option<String>,
+    alg: Option<String>,
+}
+
+/// Reads the key set from `/cdn-cgi/access/certs`. Keys that are not usable RSA
+/// signing keys are skipped one by one; the whole set is refused when it is too
+/// big, too long, not the expected shape, or has no usable key.
+pub fn parse_jwks(body: &str) -> Result<Vec<Jwk>, JwksError> {
+    if body.len() > MAX_JWKS_BYTES {
+        return Err(JwksError);
+    }
+    let value: serde_json::Value = serde_json::from_str(body).map_err(|_| JwksError)?;
+    let listed = value
+        .get("keys")
+        .and_then(serde_json::Value::as_array)
+        .filter(|k| k.len() <= MAX_JWKS_KEYS)
+        .ok_or(JwksError)?;
+    let mut keys: Vec<Jwk> = Vec::new();
+    for item in listed {
+        let Some(jwk) = usable_key(item) else {
+            continue;
+        };
+        if !keys.iter().any(|k| k.kid == jwk.kid) {
+            keys.push(jwk);
+        }
+    }
+    if keys.is_empty() {
+        Err(JwksError)
+    } else {
+        Ok(keys)
+    }
+}
+
+fn usable_key(item: &serde_json::Value) -> Option<Jwk> {
+    let wire: JwkWire = serde_json::from_value(item.clone()).ok()?;
+    let (kid, n, e) = (wire.kid?, wire.n?, wire.e?);
+    let alg_ok = wire.alg.as_deref().is_none_or(|a| a == "RS256");
+    let e_len = domain::auth::decode_b64url(&e)?.len();
+    let n_ok = domain::auth::decode_b64url(&n).is_some_and(|m| domain::auth::check_modulus_len(&m));
+    (wire.kty == "RSA"
+        && alg_ok
+        && domain::auth::valid_kid(&kid)
+        && n_ok
+        && (1..=8).contains(&e_len))
+    .then_some(Jwk { kid, n, e })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -993,5 +1064,103 @@ mod tests {
             None,
             None
         ));
+    }
+
+    fn key_json(kid: &str, n_bytes: usize, extra: &str) -> String {
+        format!(
+            r#"{{"kid":"{kid}","kty":"RSA","alg":"RS256","use":"sig","e":"AQAB","n":"{}"{extra}}}"#,
+            b64(&vec![0xAB; n_bytes])
+        )
+    }
+
+    fn jwks(keys: &[String]) -> String {
+        format!(
+            r#"{{"keys":[{}],"public_cert":{{"kid":"x","cert":"-----BEGIN CERTIFICATE-----"}},"public_certs":[]}}"#,
+            keys.join(",")
+        )
+    }
+
+    #[test]
+    fn parse_jwks_reads_a_realistic_key_set() {
+        let body = jwks(&[key_json("k1", 256, ""), key_json("k2", 384, "")]);
+        let keys = parse_jwks(&body).unwrap();
+        assert_eq!(keys.len(), 2);
+        assert_eq!(keys[0].kid, "k1");
+        assert_eq!(keys[0].e, "AQAB");
+        assert_eq!(keys[0].n, b64(&[0xAB; 256]));
+        assert_eq!(keys[1].kid, "k2");
+    }
+
+    #[test]
+    fn parse_jwks_skips_each_unusable_key_and_keeps_the_good_one() {
+        let bad = [
+            key_json("short", 255, ""),
+            key_json("bad kid", 256, ""),
+            key_json("hs", 256, "").replace("RS256", "HS256"),
+            key_json("ec", 256, "").replace("RSA", "EC"),
+            key_json("nokid", 256, "").replace(r#""kid":"nokid","#, ""),
+            key_json("badn", 256, "").replace(&b64(&[0xAB; 256]), "***"),
+            key_json("bade", 256, "").replace("AQAB", "A+B="),
+            key_json("nile", 256, "").replace(r#""e":"AQAB""#, r#""e":"""#),
+            key_json("bige", 256, "").replace("AQAB", "AQABAQABAQAB"),
+            "7".to_string(),
+            "null".to_string(),
+        ];
+        for b in bad {
+            let keys = parse_jwks(&jwks(&[b.clone(), key_json("good", 256, "")])).unwrap();
+            assert_eq!(keys.len(), 1, "{b}");
+            assert_eq!(keys[0].kid, "good");
+        }
+    }
+
+    #[test]
+    fn parse_jwks_accepts_a_key_without_alg_and_keeps_the_first_of_a_repeated_kid() {
+        let no_alg = key_json("k", 256, "").replace(r#""alg":"RS256","#, "");
+        let other = key_json("k", 300, "");
+        let keys = parse_jwks(&jwks(&[no_alg, other])).unwrap();
+        assert_eq!(keys.len(), 1);
+        assert_eq!(keys[0].n, b64(&[0xAB; 256]));
+    }
+
+    #[test]
+    fn parse_jwks_refuses_a_set_with_no_usable_key() {
+        assert_eq!(
+            parse_jwks(&jwks(&[key_json("short", 128, "")])),
+            Err(JwksError)
+        );
+        assert_eq!(parse_jwks(&jwks(&[])), Err(JwksError));
+    }
+
+    #[test]
+    fn parse_jwks_refuses_wrong_shapes() {
+        for body in [
+            "",
+            "null",
+            "[]",
+            r#"{"keys":7}"#,
+            r#"{"keys":{}}"#,
+            r#"{"public_cert":{}}"#,
+            "not json",
+        ] {
+            assert_eq!(parse_jwks(body), Err(JwksError), "{body}");
+        }
+    }
+
+    #[test]
+    fn parse_jwks_caps_the_key_count_and_the_body_size() {
+        let ten: Vec<String> = (0..MAX_JWKS_KEYS)
+            .map(|i| key_json(&format!("k{i}"), 256, ""))
+            .collect();
+        assert_eq!(parse_jwks(&jwks(&ten)).unwrap().len(), MAX_JWKS_KEYS);
+        let eleven: Vec<String> = (0..=MAX_JWKS_KEYS)
+            .map(|i| key_json(&format!("k{i}"), 256, ""))
+            .collect();
+        assert_eq!(parse_jwks(&jwks(&eleven)), Err(JwksError));
+        let padded = format!(
+            "{}{}",
+            jwks(&[key_json("k", 256, "")]),
+            " ".repeat(MAX_JWKS_BYTES)
+        );
+        assert_eq!(parse_jwks(&padded), Err(JwksError));
     }
 }
