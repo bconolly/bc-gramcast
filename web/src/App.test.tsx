@@ -17,13 +17,23 @@ describe("App", () => {
     expect(await screen.findByText("Nothing queued yet.")).toBeInTheDocument();
   });
 
-  it("shows the BC Guides logo in the header and a footer on both screens", async () => {
+  it("shows a decorative header logo, the visible byline and an accessible footer logo on both screens", async () => {
     vi.stubGlobal("fetch", vi.fn().mockImplementation(() => Promise.resolve(new Response("[]"))));
     const user = userEvent.setup();
     render(<App />);
-    expect(within(screen.getByRole("banner")).getByAltText("BC Guides")).toBeInTheDocument();
-    expect(screen.getByRole("contentinfo")).toHaveTextContent("A BC Guides tool");
+    expect(await screen.findByText("Nothing queued yet.")).toBeInTheDocument();
+    const expectBranding = () => {
+      const banner = screen.getByRole("banner");
+      expect(within(banner).getByText("by BC Guides")).toBeInTheDocument();
+      expect(within(banner).getByRole("presentation")).toHaveAttribute("src", "/brand/bc-monogram.png");
+      expect(within(banner).queryByAltText("BC Guides")).not.toBeInTheDocument();
+      expect(within(screen.getByRole("contentinfo")).getByAltText("BC Guides")).toBeInTheDocument();
+      expect(screen.getAllByAltText("BC Guides")).toHaveLength(1);
+      expect(screen.queryByText("A BC Guides tool")).not.toBeInTheDocument();
+    };
+    expectBranding();
     await user.click(screen.getByRole("button", { name: "Upload" }));
-    expect(screen.getByRole("contentinfo")).toBeInTheDocument();
+    expect(screen.getByLabelText("Title")).toBeInTheDocument();
+    expectBranding();
   });
 });

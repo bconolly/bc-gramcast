@@ -11,7 +11,7 @@ export function App() {
     <div className="mx-auto min-h-screen max-w-2xl px-4 py-6">
       <header className="mb-6 flex items-center justify-between gap-4">
         <div className="flex items-center gap-3">
-          <img src="/brand/bc-monogram.png" alt="BC Guides" width={40} height={40} className="size-10" />
+          <img src="/brand/bc-monogram.png" alt="" width={40} height={40} className="size-10" />
           <div>
             <h1 className="text-xl leading-tight font-semibold">Gramcast</h1>
             <p className="text-muted-foreground text-xs">by BC Guides</p>
@@ -37,9 +37,8 @@ export function App() {
       <main>
         {screen === "queue" ? <Queue /> : <Upload onQueued={() => setScreen("queue")} />}
       </main>
-      <footer className="border-border text-muted-foreground mt-10 flex items-center gap-3 border-t pt-4 text-sm">
-        <img src="/brand/bc-guides-logo-h.png" alt="" width={131} height={40} className="h-10 w-auto" />
-        <span>A BC Guides tool</span>
+      <footer className="border-border mt-10 border-t pt-4">
+        <img src="/brand/bc-guides-logo-h.png" alt="BC Guides" width={206} height={64} className="h-16 w-auto" />
       </footer>
     </div>
   );
