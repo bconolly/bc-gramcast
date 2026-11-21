@@ -1,7 +1,7 @@
 //! JSON shapes for the API, and mapping to and from the domain. No logic here.
 
 use domain::app::{AppError, InsertError, PortError};
-use domain::auth::{AuthError, Claims, JwtHeader};
+use domain::auth::{self, AuthError, Claims, JwtHeader};
 use domain::media::UploadError;
 use domain::queue::{Platform, QueueError, QueuedPost};
 use domain::slots::{SlotError, SlotPattern, SlotRule, Weekday};
@@ -411,15 +411,13 @@ pub fn parse_jwks(body: &str) -> Result<Vec<Jwk>, JwksError> {
 fn usable_key(item: &serde_json::Value) -> Option<Jwk> {
     let wire: JwkWire = serde_json::from_value(item.clone()).ok()?;
     let (kid, n, e) = (wire.kid?, wire.n?, wire.e?);
-    let alg_ok = wire.alg.as_deref().is_none_or(|a| a == "RS256");
-    let e_len = domain::auth::decode_b64url(&e)?.len();
-    let n_ok = domain::auth::decode_b64url(&n).is_some_and(|m| domain::auth::check_modulus_len(&m));
-    (wire.kty == "RSA"
-        && alg_ok
-        && domain::auth::valid_kid(&kid)
-        && n_ok
-        && (1..=8).contains(&e_len))
-    .then_some(Jwk { kid, n, e })
+    let n_bytes = auth::decode_b64url(&n)?;
+    let e_bytes = auth::decode_b64url(&e)?;
+    auth::accept_jwk(&wire.kty, wire.alg.as_deref(), &kid, &n_bytes, &e_bytes).then_some(Jwk {
+        kid,
+        n,
+        e,
+    })
 }
 
 #[cfg(test)]

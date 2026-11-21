@@ -154,9 +154,31 @@ pub fn decode_b64url(text: &str) -> Option<Vec<u8>> {
     Some(out)
 }
 
-/// Refuses RSA keys under 2048 bits (decoded modulus under 256 bytes).
+/// Refuses RSA keys under 2048 bits. Leading zero bytes are padding, not key
+/// size, so they are not counted.
 pub fn check_modulus_len(modulus: &[u8]) -> bool {
-    modulus.len() >= MIN_MODULUS_BYTES
+    strip_leading_zeros(modulus).len() >= MIN_MODULUS_BYTES
+}
+
+fn strip_leading_zeros(bytes: &[u8]) -> &[u8] {
+    let start = bytes.iter().position(|&b| b != 0).unwrap_or(bytes.len());
+    &bytes[start..]
+}
+
+/// Whether a published key may be used to check tokens: an RSA key marked for
+/// RS256 (or not marked), with a plain key id, a modulus of at least 2048 bits
+/// and an odd public exponent of at least 3 that fits in 8 bytes.
+pub fn accept_jwk(kty: &str, alg: Option<&str>, kid: &str, n: &[u8], e: &[u8]) -> bool {
+    let exponent = strip_leading_zeros(e);
+    let exponent_ok = (1..=8).contains(&exponent.len()) && {
+        let value = exponent.iter().fold(0u64, |a, &b| (a << 8) | u64::from(b));
+        value % 2 == 1 && value >= 3
+    };
+    kty == "RSA"
+        && alg.is_none_or(|a| a == "RS256")
+        && valid_kid(kid)
+        && check_modulus_len(n)
+        && exponent_ok
 }
 
 /// The parts of the token header we look at.
@@ -779,5 +801,54 @@ mod tests {
             None,
             Some("localhost:8787")
         ));
+    }
+
+    #[test]
+    fn modulus_length_ignores_leading_zero_bytes() {
+        let mut padded = vec![0u8; 3];
+        padded.extend([1u8; 255]);
+        assert!(!check_modulus_len(&padded));
+        let mut ok = vec![0u8];
+        ok.extend([1u8; 256]);
+        assert!(check_modulus_len(&ok));
+        assert!(!check_modulus_len(&[0u8; 400]));
+    }
+
+    #[test]
+    fn accept_jwk_takes_a_normal_key() {
+        let n = [0xABu8; 256];
+        assert!(accept_jwk("RSA", Some("RS256"), "k1", &n, &[1, 0, 1]));
+        assert!(accept_jwk("RSA", None, "k1", &n, &[3]));
+        assert!(accept_jwk("RSA", None, "k1", &n, &[0, 1, 0, 1]));
+    }
+
+    #[test]
+    fn accept_jwk_refuses_each_bad_part() {
+        let n = [0xABu8; 256];
+        let e = [1u8, 0, 1];
+        assert!(!accept_jwk("EC", None, "k", &n, &e));
+        assert!(!accept_jwk("RSA", Some("HS256"), "k", &n, &e));
+        assert!(!accept_jwk("RSA", Some("rs256"), "k", &n, &e));
+        assert!(!accept_jwk("RSA", None, "bad kid", &n, &e));
+        assert!(!accept_jwk("RSA", None, "", &n, &e));
+        assert!(!accept_jwk("RSA", None, "k", &n[..255], &e));
+    }
+
+    #[test]
+    fn accept_jwk_needs_an_odd_exponent_of_at_least_three() {
+        let n = [0xABu8; 256];
+        for bad in [
+            &[][..],
+            &[0],
+            &[1],
+            &[2],
+            &[4],
+            &[1, 0, 0],
+            &[0, 0, 0],
+            &[1; 9],
+        ] {
+            assert!(!accept_jwk("RSA", None, "k", &n, bad), "{bad:?}");
+        }
+        assert!(accept_jwk("RSA", None, "k", &n, &[1; 8]));
     }
 }
