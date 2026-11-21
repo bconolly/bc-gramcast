@@ -53,6 +53,8 @@ pub struct PresignRequest<'a> {
     /// Timestamp in `YYYYMMDDTHHMMSSZ` form.
     pub amz_date: &'a str,
     pub expires_secs: u32,
+    /// When set, `content-type` is a signed header, so an upload must send exactly this type.
+    pub content_type: Option<&'a str>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -62,6 +64,7 @@ pub enum PresignError {
     BadPath,
     BadHost,
     BadRegion,
+    BadContentType,
 }
 
 /// Returns a full `https://` presigned URL.
@@ -92,22 +95,34 @@ pub fn presign(creds: &Credentials, req: &PresignRequest) -> Result<String, Pres
     {
         return Err(PresignError::BadRegion);
     }
+    if let Some(ct) = req.content_type {
+        if ct.is_empty() || ct.bytes().any(|b| b.is_ascii_control()) {
+            return Err(PresignError::BadContentType);
+        }
+    }
+    let (signed_headers, canonical_headers) = match req.content_type {
+        Some(ct) => (
+            "content-type;host",
+            format!("content-type:{}\nhost:{}\n", ct.trim(), req.host),
+        ),
+        None => ("host", format!("host:{}\n", req.host)),
+    };
     let date = &req.amz_date[..8];
     let scope = format!("{date}/{}/s3/aws4_request", req.region);
     let credential = format!("{}/{scope}", creds.access_key_id);
 
     // Query parameters, already in sorted order.
     let query = format!(
-        "X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential={}&X-Amz-Date={}&X-Amz-Expires={}&X-Amz-SignedHeaders=host",
+        "X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential={}&X-Amz-Date={}&X-Amz-Expires={}&X-Amz-SignedHeaders={}",
         uri_encode(&credential, true),
         req.amz_date,
-        req.expires_secs
+        req.expires_secs,
+        uri_encode(signed_headers, true)
     );
     let canonical_path = uri_encode(req.path, false);
     let canonical_request = format!(
-        "{}\n{canonical_path}\n{query}\nhost:{}\n\nhost\nUNSIGNED-PAYLOAD",
-        req.method.as_str(),
-        req.host
+        "{}\n{canonical_path}\n{query}\n{canonical_headers}\n{signed_headers}\nUNSIGNED-PAYLOAD",
+        req.method.as_str()
     );
     let string_to_sign = format!(
         "AWS4-HMAC-SHA256\n{}\n{scope}\n{}",
@@ -184,6 +199,7 @@ mod tests {
             region: "us-east-1",
             amz_date: "20130524T000000Z",
             expires_secs: 86_400,
+            content_type: None,
         }
     }
 
@@ -269,6 +285,27 @@ mod tests {
         let mut req = aws_doc_request();
         req.path = "/bucket/../other/key.mp4";
         assert_eq!(presign(&CREDS, &req), Err(PresignError::BadPath));
+    }
+
+    #[test]
+    fn signs_content_type_when_given() {
+        let mut req = aws_doc_request();
+        req.method = Method::Put;
+        let plain = presign(&CREDS, &req).unwrap();
+        req.content_type = Some("video/mp4");
+        let typed = presign(&CREDS, &req).unwrap();
+        assert!(
+            typed.contains("X-Amz-SignedHeaders=content-type%3Bhost"),
+            "{typed}"
+        );
+        assert_ne!(plain, typed);
+    }
+
+    #[test]
+    fn rejects_content_type_with_line_breaks() {
+        let mut req = aws_doc_request();
+        req.content_type = Some("video/mp4\nx-evil: 1");
+        assert_eq!(presign(&CREDS, &req), Err(PresignError::BadContentType));
     }
 
     #[test]
