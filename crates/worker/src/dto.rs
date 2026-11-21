@@ -356,6 +356,16 @@ pub const MAX_JWKS_BYTES: usize = 64 * 1024;
 /// Most keys a key set may list. Access publishes two at a time.
 pub const MAX_JWKS_KEYS: usize = 10;
 
+/// Whether a key-set response may be read, judging by its `Content-Length`
+/// header alone. No header is fine (the size is checked again once read); an
+/// unreadable or too-large one is not.
+pub fn jwks_length_ok(content_length: Option<&str>) -> bool {
+    content_length.is_none_or(|v| {
+        v.bytes().all(|b| b.is_ascii_digit())
+            && v.parse::<usize>().is_ok_and(|n| n <= MAX_JWKS_BYTES)
+    })
+}
+
 /// An RSA public key from the key set, ready for Web Crypto.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Jwk {
@@ -1021,5 +1031,24 @@ mod tests {
         assert!(codes
             .iter()
             .all(|c| c.bytes().all(|b| b.is_ascii_lowercase() || b == b'_')));
+    }
+
+    #[test]
+    fn jwks_content_length_is_checked_early() {
+        assert!(jwks_length_ok(None));
+        assert!(jwks_length_ok(Some("0")));
+        assert!(jwks_length_ok(Some("65536")));
+        assert!(!jwks_length_ok(Some("65537")));
+        for bad in [
+            "",
+            "-1",
+            "abc",
+            "1e3",
+            " 10",
+            "+5",
+            "99999999999999999999999",
+        ] {
+            assert!(!jwks_length_ok(Some(bad)), "{bad:?}");
+        }
     }
 }

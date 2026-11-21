@@ -329,6 +329,12 @@ impl AccessVerifier {
         if response.status_code() != 200 {
             return Err(port("key fetch status"));
         }
+        // Refuse an oversized body before reading it. Without the header, the
+        // size is checked again by `parse_jwks`.
+        let declared = response.headers().get("Content-Length").ok().flatten();
+        if !dto::jwks_length_ok(declared.as_deref()) {
+            return Err(port("key body too large"));
+        }
         let body = response.text().await.map_err(|_| port("key body"))?;
         let jwks = dto::parse_jwks(&body).map_err(|_| port("key set not usable"))?;
         let mut imported = Vec::new();
