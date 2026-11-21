@@ -5,6 +5,8 @@
 -- domain parses and validates it again on read, so a bad row is refused.
 CREATE TABLE slot_pattern (
   id INTEGER PRIMARY KEY CHECK (id = 1),
-  utc_offset_minutes INTEGER NOT NULL CHECK (utc_offset_minutes BETWEEN -720 AND 840),
+  utc_offset_minutes INTEGER NOT NULL CHECK (
+    typeof(utc_offset_minutes) = 'integer' AND utc_offset_minutes BETWEEN -720 AND 840
+  ),
   rules TEXT NOT NULL CHECK (length(rules) <= 400)
 );

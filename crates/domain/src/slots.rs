@@ -105,6 +105,19 @@ impl SlotPattern {
         Self::new(utc_offset_minutes, parsed)
     }
 
+    /// Rebuilds a pattern from a database row, where the offset comes back as
+    /// a float. A fractional or out-of-range offset is refused, never truncated.
+    pub fn from_row(utc_offset_minutes: f64, rules: &str) -> Result<Self, SlotError> {
+        let in_range = utc_offset_minutes.is_finite()
+            && utc_offset_minutes.fract() == 0.0
+            && utc_offset_minutes >= f64::from(MIN_OFFSET)
+            && utc_offset_minutes <= f64::from(MAX_OFFSET);
+        if !in_range {
+            return Err(SlotError::OffsetOutOfRange);
+        }
+        Self::from_stored(utc_offset_minutes as i32, rules)
+    }
+
     /// Compact text for storage, e.g. `mon@06:00,wed@19:00`. Empty for none.
     pub fn rules_to_stored(&self) -> String {
         let parts: Vec<String> = self
@@ -308,6 +321,23 @@ mod tests {
         }
         assert_eq!(
             SlotPattern::from_stored(900, ""),
+            Err(SlotError::OffsetOutOfRange)
+        );
+    }
+
+    #[test]
+    fn from_row_rejects_non_integer_offsets_instead_of_truncating() {
+        let ok = SlotPattern::from_row(600.0, "mon@06:00").unwrap();
+        assert_eq!(ok.utc_offset_minutes, 600);
+        for bad in [1.5, -0.5, 600.000_001, f64::NAN, f64::INFINITY, 1e12] {
+            assert_eq!(
+                SlotPattern::from_row(bad, ""),
+                Err(SlotError::OffsetOutOfRange),
+                "{bad}"
+            );
+        }
+        assert_eq!(
+            SlotPattern::from_row(900.0, ""),
             Err(SlotError::OffsetOutOfRange)
         );
     }

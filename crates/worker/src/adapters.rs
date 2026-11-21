@@ -143,7 +143,7 @@ impl SlotPatternRepository for D1SlotPatternRepository {
             .map_err(port_err)?;
         row.map(|r| {
             // The row text is never logged or returned, only that it was bad.
-            SlotPattern::from_stored(r.utc_offset_minutes as i32, &r.rules).map_err(|_| {
+            SlotPattern::from_row(r.utc_offset_minutes, &r.rules).map_err(|_| {
                 worker::console_error!("bad slot_pattern row");
                 PortError("bad slot_pattern row".into())
             })
