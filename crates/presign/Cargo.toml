@@ -1,0 +1,9 @@
+[package]
+name = "presign"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+hex = "0.4"
+hmac = "0.12"
+sha2 = "0.10"
