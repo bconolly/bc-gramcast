@@ -1,5 +1,5 @@
 // Serves the built app (web/dist) against a mocked API and saves screenshots.
-// Usage: npm run build && node scripts/screenshots.cjs [outDir]
+// Usage: npm run build && node scripts/screenshots.cjs <outDir>
 // Needs Playwright with Chromium already installed (require('playwright')).
 const http = require("node:http");
 const fs = require("node:fs");
@@ -7,18 +7,34 @@ const path = require("node:path");
 const { chromium } = require("playwright");
 
 const dist = path.join(__dirname, "..", "dist");
-const outDir = process.argv[2] || "/mnt/project-files/gramcast/screenshots/";
+const outDir = process.argv[2];
+if (!outDir) {
+  console.error("Usage: node scripts/screenshots.cjs <outDir>");
+  process.exit(2);
+}
 const TYPES = { ".html": "text/html", ".js": "text/javascript", ".css": "text/css" };
 
+// Apply the same headers Cloudflare will (public/_headers), so a CSP problem shows up here.
+function readHeaders() {
+  const lines = fs.readFileSync(path.join(dist, "_headers"), "utf8").split("\n");
+  const headers = {};
+  for (const line of lines.filter((l) => /^\s+\S/.test(l))) {
+    const i = line.indexOf(":");
+    headers[line.slice(0, i).trim()] = line.slice(i + 1).trim();
+  }
+  return headers;
+}
+
 function serve() {
+  const headers = readHeaders();
   const server = http.createServer((req, res) => {
     const name = req.url === "/" ? "/index.html" : req.url.split("?")[0];
     const file = path.join(dist, path.normalize(name));
-    if (!file.startsWith(dist) || !fs.existsSync(file)) {
+    if (!(file === dist || file.startsWith(dist + path.sep)) || !fs.existsSync(file)) {
       res.writeHead(404).end();
       return;
     }
-    res.writeHead(200, { "Content-Type": TYPES[path.extname(file)] || "application/octet-stream" });
+    res.writeHead(200, { ...headers, "Content-Type": TYPES[path.extname(file)] || "application/octet-stream" });
     fs.createReadStream(file).pipe(res);
   });
   return new Promise((resolve) => server.listen(0, "127.0.0.1", () => resolve(server)));
@@ -31,9 +47,16 @@ const QUEUE = [
   { id: "c", video_key: "videos/c.mp4", title: "Weekly wrap-up", caption: "Wrap", platforms: ["instagram"], slot_at: at(2099, 3, 12, 8, 15), status: "ready" },
 ];
 
+function fail(message) {
+  console.error(message);
+  process.exitCode = 1;
+}
+
 async function shoot(browser, base, label, viewport) {
   const ctx = await browser.newContext({ viewport, deviceScaleFactor: 2, timezoneId: "Australia/Sydney", locale: "en-AU" });
   const page = await ctx.newPage();
+  page.on("console", (m) => m.type() === "error" && fail(`console error: ${m.text()}`));
+  page.on("pageerror", (e) => fail(`page error: ${e.message}`));
   await page.route("**/api/queue", (r) => r.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(QUEUE) }));
   await page.goto(base);
   await page.getByText("Weekly wrap-up").waitFor();
