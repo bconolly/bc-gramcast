@@ -1,5 +1,5 @@
 name = "gramcast"
-main = "build/worker/shim.mjs"
+main = "crates/worker/build/index.js"
 compatibility_date = "2026-11-01"
 
 [build]
@@ -20,10 +20,12 @@ migrations_dir = "migrations"
 
 [[r2_buckets]]
 binding = "VIDEOS"
+# bucket_name here and the R2_BUCKET var below must name the SAME bucket.
 bucket_name = "REPLACE_WITH_BUCKET_NAME"
 
 # Placeholders only. Secrets (R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY) are set with
 # `wrangler secret put`. Never add LOCAL_DEV_NO_AUTH here: it goes in .dev.vars.
 [vars]
+# Must match the VIDEOS binding's bucket_name above.
 R2_BUCKET = "REPLACE_WITH_BUCKET_NAME"
 R2_ACCOUNT_ID = "REPLACE_WITH_ACCOUNT_ID"
