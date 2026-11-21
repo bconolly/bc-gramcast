@@ -87,7 +87,7 @@ mod entry {
             .ok_or(AuthError::MissingToken)?;
         let parts = dto::parse_token(&token)?;
         let now = now_secs();
-        let verifier = AccessVerifier::new(config.certs_url(), now);
+        let verifier = AccessVerifier::new(config.certs_url());
         app::authenticate_owner(
             &verifier,
             &config,

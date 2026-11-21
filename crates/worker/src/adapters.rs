@@ -244,48 +244,78 @@ impl UploadStore for R2Store {
 // It cannot run natively. Nothing here logs: errors carry fixed text only.
 
 use domain::app::{SignatureVerifier, VerifyError};
-use domain::keycache::{KeyCache, KeyLookup};
+use domain::keycache::{self, KeyCache, KeyLookup};
 use std::cell::RefCell;
+use std::time::Duration;
 use worker::js_sys::{self, Array, Function, Object, Reflect, Uint8Array};
 use worker::wasm_bindgen::{JsCast, JsValue};
 use worker::wasm_bindgen_futures::JsFuture;
-use worker::{Fetch, Method, Request, RequestInit, RequestRedirect};
+use worker::{Delay, Fetch, Method, Request, RequestInit, RequestRedirect};
 
 thread_local! {
     /// Imported public keys, kept for the life of the isolate.
     static KEYS: RefCell<KeyCache<JsValue>> = const { RefCell::new(KeyCache::new_const()) };
 }
 
+/// How many times a request waits for another request's key fetch, and for how long each time.
+const WAIT_POLLS: u32 = 8;
+const WAIT_STEP_MS: u64 = 250;
+
+fn now_secs() -> i64 {
+    (worker::Date::now().as_millis() / 1000) as i64
+}
+
 pub struct AccessVerifier {
     certs_url: String,
-    now: i64,
 }
 
 impl AccessVerifier {
     /// `certs_url` must come from `AccessConfig::certs_url`, never from a token.
-    pub fn new(certs_url: String, now: i64) -> Self {
-        Self { certs_url, now }
+    pub fn new(certs_url: String) -> Self {
+        Self { certs_url }
     }
 
+    fn lookup(kid: &str) -> KeyLookup<JsValue> {
+        KEYS.with(|c| c.borrow_mut().lookup(kid, now_secs()))
+    }
+
+    /// Asks the cache, and waits a little while another request is fetching.
     async fn key_for(&self, kid: &str) -> Result<JsValue, VerifyError> {
-        // The second pass can never ask for another fetch: the cache has just
-        // recorded one, and `now` does not change within a request.
-        for _ in 0..2 {
-            match KEYS.with(|c| c.borrow_mut().lookup(kid, self.now)) {
+        for _ in 0..WAIT_POLLS {
+            match Self::lookup(kid) {
                 KeyLookup::Use(key) => return Ok(key),
-                KeyLookup::Unknown => return Err(VerifyError::UnknownKey),
-                KeyLookup::Unavailable => break,
-                // A failed refresh stores nothing, so the next lookup falls back
-                // to any stale key, or reports the keys unavailable.
-                KeyLookup::Fetch => {
-                    let _ = self.refresh().await;
+                KeyLookup::Fetch => return self.fetch_and_find(kid).await,
+                KeyLookup::Wait => {
+                    Delay::from(Duration::from_millis(WAIT_STEP_MS)).await;
+                }
+                other => return Err(failure(&other)),
+            }
+        }
+        Err(unavailable("keys still loading"))
+    }
+
+    /// This request does the fetch. After a good fetch a missing key id is
+    /// definitely unknown (401). After a failed one, any stale key still serves.
+    async fn fetch_and_find(&self, kid: &str) -> Result<JsValue, VerifyError> {
+        match self.refresh().await {
+            Ok(keys) => {
+                KEYS.with(|c| c.borrow_mut().store(keys, now_secs()));
+                match Self::lookup(kid) {
+                    KeyLookup::Use(key) => Ok(key),
+                    _ => Err(VerifyError::UnknownKey),
+                }
+            }
+            Err(_) => {
+                KEYS.with(|c| c.borrow_mut().fetch_failed(now_secs()));
+                match Self::lookup(kid) {
+                    KeyLookup::Use(key) => Ok(key),
+                    other => Err(failure(&other)),
                 }
             }
         }
-        Err(unavailable("keys unavailable"))
     }
 
-    async fn refresh(&self) -> Result<(), PortError> {
+    async fn refresh(&self) -> Result<Vec<(String, JsValue)>, PortError> {
         let mut init = RequestInit::new();
         // The key endpoint never redirects; a redirect is refused.
         init.with_method(Method::Get)
@@ -310,9 +340,12 @@ impl AccessVerifier {
         if imported.is_empty() {
             return Err(port("no key imported"));
         }
-        KEYS.with(|c| c.borrow_mut().store(imported, self.now));
-        Ok(())
+        Ok(imported)
     }
+}
+
+fn failure(lookup: &KeyLookup<JsValue>) -> VerifyError {
+    keycache::lookup_failure(lookup).unwrap_or_else(|| unavailable("keys unavailable"))
 }
 
 impl SignatureVerifier for AccessVerifier {
