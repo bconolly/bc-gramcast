@@ -1,9 +1,15 @@
 //! Scheduling domain: the queue of posts waiting for a slot.
 
+use crate::media::is_safe_id;
+
 /// YouTube title limit. Confirm against YouTube's current docs before release.
 pub const MAX_TITLE_CHARS: usize = 100;
 /// Instagram caption limit. Confirm against Meta's current docs before release.
 pub const MAX_CAPTION_CHARS: usize = 2_200;
+
+/// Latest allowed slot: 01/01/2100 UTC, in Unix seconds. Keeps slot_at well
+/// inside the range a JavaScript number (as D1 binds it) holds exactly.
+pub const MAX_SLOT_SECS: i64 = 4_102_444_800;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Platform {
@@ -33,8 +39,35 @@ pub enum QueueError {
     NoPlatforms,
     EmptyTitle,
     SlotTaken { slot_at: i64 },
+    VideoAlreadyQueued,
     BadVideoKey,
     TooLong,
+    DuplicatePlatform,
+    SlotInPast,
+    SlotOutOfRange,
+}
+
+/// Checks a new slot is a sensible future time. Applies to new posts only, so
+/// stored posts whose slot has since passed still load.
+pub fn validate_slot(slot_at: i64, now: i64) -> Result<(), QueueError> {
+    if !(0..=MAX_SLOT_SECS).contains(&slot_at) {
+        return Err(QueueError::SlotOutOfRange);
+    }
+    if slot_at < now {
+        return Err(QueueError::SlotInPast);
+    }
+    Ok(())
+}
+
+/// Exactly `videos/` + 1 to 64 of `[A-Za-z0-9_-]` + `.mp4`.
+fn is_valid_video_key(key: &str) -> bool {
+    let Some(name) = key
+        .strip_prefix("videos/")
+        .and_then(|rest| rest.strip_suffix(".mp4"))
+    else {
+        return false;
+    };
+    is_safe_id(name)
 }
 
 impl QueuedPost {
@@ -53,18 +86,22 @@ pub struct Queue {
 }
 
 impl Queue {
-    /// Rebuilds a queue from storage, applying the same rules as `add`.
-    pub fn from_posts(posts: Vec<QueuedPost>) -> Result<Self, QueueError> {
-        let mut q = Self::default();
-        for p in posts {
-            q.add(p)?;
-        }
-        Ok(q)
+    /// Rebuilds a queue from storage without validating. Rules are for new
+    /// posts only, so older rows can never lock the queue.
+    pub fn from_stored(posts: Vec<QueuedPost>) -> Self {
+        Self { posts }
     }
 
     pub fn add(&mut self, post: QueuedPost) -> Result<(), QueueError> {
         if post.platforms.is_empty() {
             return Err(QueueError::NoPlatforms);
+        }
+        let mut seen = Vec::new();
+        for p in &post.platforms {
+            if seen.contains(p) {
+                return Err(QueueError::DuplicatePlatform);
+            }
+            seen.push(*p);
         }
         if post.title.trim().is_empty() {
             return Err(QueueError::EmptyTitle);
@@ -74,13 +111,16 @@ impl Queue {
         {
             return Err(QueueError::TooLong);
         }
-        if !post.video_key.starts_with("videos/") || post.video_key.contains("..") {
+        if !is_valid_video_key(&post.video_key) {
             return Err(QueueError::BadVideoKey);
         }
         if self.posts.iter().any(|p| p.slot_at == post.slot_at) {
             return Err(QueueError::SlotTaken {
                 slot_at: post.slot_at,
             });
+        }
+        if self.posts.iter().any(|p| p.video_key == post.video_key) {
+            return Err(QueueError::VideoAlreadyQueued);
         }
         self.posts.push(post);
         Ok(())
@@ -132,7 +172,7 @@ mod tests {
 
     #[test]
     fn one_post_per_slot() {
-        let mut q = Queue::from_posts(vec![post("a", 100)]).unwrap();
+        let mut q = Queue::from_stored(vec![post("a", 100)]);
         assert_eq!(
             q.add(post("b", 100)),
             Err(QueueError::SlotTaken { slot_at: 100 })
@@ -141,16 +181,27 @@ mod tests {
 
     #[test]
     fn upcoming_is_in_slot_order_and_skips_the_past() {
-        let q = Queue::from_posts(vec![post("late", 300), post("past", 50), post("soon", 200)])
-            .unwrap();
+        let q = Queue::from_stored(vec![post("late", 300), post("past", 50), post("soon", 200)]);
         let ids: Vec<&str> = q.upcoming(100).iter().map(|p| p.id.as_str()).collect();
         assert_eq!(ids, ["soon", "late"]);
     }
 
     #[test]
-    fn from_posts_applies_the_same_rules_as_add() {
-        let result = Queue::from_posts(vec![post("a", 100), post("b", 100)]);
-        assert_eq!(result.err(), Some(QueueError::SlotTaken { slot_at: 100 }));
+    fn one_post_per_video() {
+        let mut q = Queue::from_stored(vec![post("a", 100)]);
+        let mut dup = post("b", 200);
+        dup.video_key = "videos/a.mp4".into();
+        assert_eq!(q.add(dup), Err(QueueError::VideoAlreadyQueued));
+    }
+
+    #[test]
+    fn from_stored_does_not_validate_old_rows() {
+        let mut bad = post("a", 100);
+        bad.video_key = "legacy/odd key".into();
+        bad.platforms.clear();
+        bad.title.clear();
+        let q = Queue::from_stored(vec![bad, post("b", 100)]);
+        assert_eq!(q.upcoming(0).len(), 2);
     }
 
     #[test]
@@ -158,6 +209,55 @@ mod tests {
         let mut p = post("a", 100);
         p.video_key = "secrets/x.mp4".into();
         assert_eq!(Queue::default().add(p), Err(QueueError::BadVideoKey));
+    }
+
+    #[test]
+    fn video_key_must_match_the_exact_shape() {
+        for bad in [
+            "videos/.mp4",
+            "videos/a.MP4",
+            "videos/a/b.mp4",
+            "videos/a b.mp4",
+            "videos/a.mp4\n",
+            "videos/a..b.mp4",
+            "videos/é.mp4",
+            "videos/a.mp4.exe",
+            "/videos/a.mp4",
+        ] {
+            let mut p = post("a", 100);
+            p.video_key = bad.into();
+            assert_eq!(
+                Queue::default().add(p),
+                Err(QueueError::BadVideoKey),
+                "{bad}"
+            );
+        }
+        let mut p = post("a", 100);
+        p.video_key = format!("videos/{}.mp4", "A-z_9".repeat(12) + "abcd");
+        assert_eq!(p.video_key.len(), 7 + 64 + 4);
+        assert!(Queue::default().add(p).is_ok());
+        let mut p = post("a", 100);
+        p.video_key = format!("videos/{}.mp4", "a".repeat(65));
+        assert_eq!(Queue::default().add(p), Err(QueueError::BadVideoKey));
+    }
+
+    #[test]
+    fn duplicate_platforms_are_rejected() {
+        let mut p = post("a", 100);
+        p.platforms = vec![Platform::YouTube, Platform::YouTube];
+        assert_eq!(Queue::default().add(p), Err(QueueError::DuplicatePlatform));
+    }
+
+    #[test]
+    fn slot_must_be_in_range_and_not_in_the_past() {
+        assert_eq!(validate_slot(-1, 0), Err(QueueError::SlotOutOfRange));
+        assert_eq!(
+            validate_slot(MAX_SLOT_SECS + 1, 0),
+            Err(QueueError::SlotOutOfRange)
+        );
+        assert_eq!(validate_slot(99, 100), Err(QueueError::SlotInPast));
+        assert_eq!(validate_slot(100, 100), Ok(()));
+        assert_eq!(validate_slot(MAX_SLOT_SECS, 100), Ok(()));
     }
 
     #[test]
