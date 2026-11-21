@@ -1,6 +1,7 @@
 //! JSON shapes for the API, and mapping to and from the domain. No logic here.
 
-use domain::app::AppError;
+use domain::app::{AppError, InsertError, PortError};
+use domain::media::UploadError;
 use domain::queue::{Platform, QueueError, QueuedPost};
 use serde::{Deserialize, Serialize};
 
@@ -84,9 +85,32 @@ pub fn to_json(p: &QueuedPost) -> PostJson {
     }
 }
 
-/// True when D1's error text says the slot's UNIQUE constraint failed.
-pub fn is_slot_conflict(text: &str) -> bool {
-    text.contains("UNIQUE constraint failed: posts.slot_at")
+/// Maps the text of a D1 failure to an `InsertError`. UNIQUE violations on the
+/// slot or the video become their own cases; anything else stays a port error
+/// (which the API never shows to the client).
+pub fn classify_insert_error(text: &str) -> InsertError {
+    if text.contains("UNIQUE constraint failed: posts.slot_at") {
+        InsertError::SlotTaken
+    } else if text.contains("UNIQUE constraint failed: posts.video_key") {
+        InsertError::VideoAlreadyQueued
+    } else {
+        InsertError::Port(PortError(text.to_string()))
+    }
+}
+
+/// DNS-rebinding guard for local dev: only a Host of exactly `localhost` or
+/// `127.0.0.1`, with an optional numeric port, may use the no-auth mode.
+pub fn is_local_host(host_header: Option<&str>) -> bool {
+    let Some(value) = host_header else {
+        return false;
+    };
+    let (host, port) = match value.split_once(':') {
+        Some((host, port)) => (host, Some(port)),
+        None => (value, None),
+    };
+    let port_ok =
+        port.is_none_or(|p| (1..=5).contains(&p.len()) && p.bytes().all(|b| b.is_ascii_digit()));
+    port_ok && (host.eq_ignore_ascii_case("localhost") || host == "127.0.0.1")
 }
 
 /// CSRF guard: a cross-site form cannot send `application/json`, so POSTs must.
@@ -98,20 +122,40 @@ pub fn is_json_content_type(header: Option<&str>) -> bool {
     media_type.eq_ignore_ascii_case("application/json")
 }
 
-/// HTTP status and a safe message. Port errors never leak their detail.
-pub fn error_status(e: &AppError) -> (u16, String) {
+/// HTTP status and a fixed message per error. Never built from Debug output or
+/// client-sent values, and port errors never leak their detail.
+pub fn error_status(e: &AppError) -> (u16, &'static str) {
     match e {
-        AppError::Upload(u) => (422, format!("upload rejected: {u:?}")),
-        AppError::Queue(QueueError::SlotTaken { .. }) => (409, "slot already taken".into()),
-        AppError::Queue(q) => (422, format!("post rejected: {q:?}")),
-        AppError::Port(_) => (500, "storage error".into()),
+        AppError::Upload(u) => (
+            422,
+            match u {
+                UploadError::NotMp4 => "file must be an MP4",
+                UploadError::Empty => "file is empty",
+                UploadError::TooLarge { .. } => "file is too large",
+                UploadError::BadFileName => "file name is not allowed",
+                UploadError::BadId => "upload id is not valid",
+            },
+        ),
+        AppError::Queue(q) => match q {
+            QueueError::SlotTaken { .. } => (409, "that slot is already taken"),
+            QueueError::VideoAlreadyQueued => (409, "that video is already queued"),
+            QueueError::NoPlatforms => (422, "choose at least one platform"),
+            QueueError::EmptyTitle => (422, "title is required"),
+            QueueError::BadVideoKey => (422, "video key is not valid"),
+            QueueError::TooLong => (422, "title or caption is too long"),
+            QueueError::DuplicatePlatform => (422, "each platform can be chosen once"),
+            QueueError::SlotInPast => (422, "slot must be in the future"),
+            QueueError::SlotOutOfRange => (422, "slot is out of range"),
+        },
+        AppError::Port(_) => (500, "storage error"),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use domain::app::PortError;
+    use domain::app::{InsertError, PortError};
+    use domain::media::UploadError;
 
     fn body() -> QueuePostBody {
         QueuePostBody {
@@ -149,7 +193,133 @@ mod tests {
     #[test]
     fn port_errors_do_not_leak_detail() {
         let (code, msg) = error_status(&AppError::Port(PortError("D1: secret table".into())));
-        assert_eq!((code, msg.as_str()), (500, "storage error"));
+        assert_eq!((code, msg), (500, "storage error"));
+    }
+
+    #[test]
+    fn every_error_has_a_fixed_message_and_status() {
+        let cases = [
+            (
+                AppError::Upload(UploadError::NotMp4),
+                422,
+                "file must be an MP4",
+            ),
+            (AppError::Upload(UploadError::Empty), 422, "file is empty"),
+            (
+                AppError::Upload(UploadError::TooLarge {
+                    size_bytes: 123_456_789,
+                }),
+                422,
+                "file is too large",
+            ),
+            (
+                AppError::Upload(UploadError::BadFileName),
+                422,
+                "file name is not allowed",
+            ),
+            (
+                AppError::Upload(UploadError::BadId),
+                422,
+                "upload id is not valid",
+            ),
+            (
+                AppError::Queue(QueueError::NoPlatforms),
+                422,
+                "choose at least one platform",
+            ),
+            (
+                AppError::Queue(QueueError::EmptyTitle),
+                422,
+                "title is required",
+            ),
+            (
+                AppError::Queue(QueueError::SlotTaken { slot_at: 777 }),
+                409,
+                "that slot is already taken",
+            ),
+            (
+                AppError::Queue(QueueError::VideoAlreadyQueued),
+                409,
+                "that video is already queued",
+            ),
+            (
+                AppError::Queue(QueueError::BadVideoKey),
+                422,
+                "video key is not valid",
+            ),
+            (
+                AppError::Queue(QueueError::TooLong),
+                422,
+                "title or caption is too long",
+            ),
+            (
+                AppError::Queue(QueueError::DuplicatePlatform),
+                422,
+                "each platform can be chosen once",
+            ),
+            (
+                AppError::Queue(QueueError::SlotInPast),
+                422,
+                "slot must be in the future",
+            ),
+            (
+                AppError::Queue(QueueError::SlotOutOfRange),
+                422,
+                "slot is out of range",
+            ),
+        ];
+        for (err, code, msg) in cases {
+            assert_eq!(error_status(&err), (code, msg), "{err:?}");
+        }
+    }
+
+    #[test]
+    fn classifies_d1_unique_violations_by_column() {
+        assert_eq!(
+            classify_insert_error(
+                "D1_ERROR: UNIQUE constraint failed: posts.slot_at: SQLITE_CONSTRAINT"
+            ),
+            InsertError::SlotTaken
+        );
+        assert_eq!(
+            classify_insert_error("UNIQUE constraint failed: posts.video_key"),
+            InsertError::VideoAlreadyQueued
+        );
+        assert_eq!(
+            classify_insert_error("network down"),
+            InsertError::Port(PortError("network down".into()))
+        );
+    }
+
+    #[test]
+    fn local_dev_only_answers_to_loopback_hosts() {
+        for ok in [
+            "localhost",
+            "localhost:8787",
+            "127.0.0.1",
+            "127.0.0.1:8787",
+            "LOCALHOST:8787",
+        ] {
+            assert!(is_local_host(Some(ok)), "{ok}");
+        }
+        for bad in [
+            "",
+            "evil.com",
+            "localhost.evil.com",
+            "evil.com:8787",
+            "localhost:",
+            "localhost:abc",
+            "localhost:8787@evil.com",
+            "user@localhost",
+            "127.0.0.1.evil.com",
+            "127.0.0.2",
+            "[::1]",
+            "localhost:8787:1",
+            " localhost",
+        ] {
+            assert!(!is_local_host(Some(bad)), "{bad:?}");
+        }
+        assert!(!is_local_host(None));
     }
 
     #[test]
@@ -168,28 +338,5 @@ mod tests {
         )));
         assert!(!is_json_content_type(Some("application/jsonp")));
         assert!(!is_json_content_type(Some("")));
-    }
-
-    #[test]
-    fn slot_taken_is_409() {
-        let (code, _) = error_status(&AppError::Queue(QueueError::SlotTaken { slot_at: 5 }));
-        assert_eq!(code, 409);
-    }
-
-    #[test]
-    fn detects_a_d1_slot_conflict_by_its_text() {
-        assert!(is_slot_conflict(
-            "D1_ERROR: UNIQUE constraint failed: posts.slot_at: SQLITE_CONSTRAINT"
-        ));
-        assert!(!is_slot_conflict(
-            "UNIQUE constraint failed: posts.video_key"
-        ));
-        assert!(!is_slot_conflict("network down"));
-    }
-
-    #[test]
-    fn rule_errors_are_422() {
-        let (code, _) = error_status(&AppError::Queue(QueueError::NoPlatforms));
-        assert_eq!(code, 422);
     }
 }

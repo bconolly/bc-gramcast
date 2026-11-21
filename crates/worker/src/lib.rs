@@ -13,16 +13,23 @@ mod entry {
     use worker::*;
 
     /// Fails closed. Real owner sign-in (Cloudflare Access JWT check) comes in the
-    /// security slice. Until then the API only answers in local dev.
-    fn require_owner(env: &Env) -> Option<Response> {
+    /// security slice. Until then the API only answers in local dev, and then
+    /// only for loopback Host headers, so DNS rebinding can't reach it.
+    /// Returns the response that denies the request, or `None` to let it through.
+    /// Building a denial can fail; `?` then stops the request instead of passing it.
+    fn require_owner(req: &Request, env: &Env) -> Result<Option<Response>> {
         let local = env
             .var("LOCAL_DEV_NO_AUTH")
             .map(|v| v.to_string() == "true")
             .unwrap_or(false);
-        if local {
-            None
+        if !local {
+            return Response::error("sign-in not configured yet", 503).map(Some);
+        }
+        let host = req.headers().get("Host").ok().flatten();
+        if dto::is_local_host(host.as_deref()) {
+            Ok(None)
         } else {
-            Response::error("sign-in not configured yet", 503).ok()
+            Response::error("forbidden", 403).map(Some)
         }
     }
 
@@ -32,12 +39,12 @@ mod entry {
     }
 
     /// Rejects non-JSON POSTs (415) before the body is read.
-    fn require_json(req: &Request) -> Option<Response> {
+    fn require_json(req: &Request) -> Result<Option<Response>> {
         let header = req.headers().get("Content-Type").ok().flatten();
         if dto::is_json_content_type(header.as_deref()) {
-            None
+            Ok(None)
         } else {
-            Response::error("content type must be application/json", 415).ok()
+            Response::error("content type must be application/json", 415).map(Some)
         }
     }
 
@@ -47,12 +54,12 @@ mod entry {
 
     #[event(fetch)]
     async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
-        if let Some(denied) = require_owner(&env) {
+        if let Some(denied) = require_owner(&req, &env)? {
             return Ok(denied);
         }
         Router::new()
             .post_async("/api/uploads", |mut req, ctx| async move {
-                if let Some(rejected) = require_json(&req) {
+                if let Some(rejected) = require_json(&req)? {
                     return Ok(rejected);
                 }
                 let Ok(body) = req.json::<StartUploadBody>().await else {
@@ -75,7 +82,7 @@ mod entry {
                 }
             })
             .post_async("/api/posts", |mut req, ctx| async move {
-                if let Some(rejected) = require_json(&req) {
+                if let Some(rejected) = require_json(&req)? {
                     return Ok(rejected);
                 }
                 let Ok(body) = req.json::<QueuePostBody>().await else {

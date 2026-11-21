@@ -30,12 +30,23 @@ fn port_err(e: impl std::fmt::Debug) -> PortError {
     PortError(format!("{e:?}"))
 }
 
-/// Maps D1's text for a UNIQUE violation on the slot to `SlotTaken`.
-fn insert_err(text: &str) -> InsertError {
-    if dto::is_slot_conflict(text) {
-        InsertError::SlotTaken
-    } else {
-        InsertError::Port(PortError(text.to_string()))
+/// Builds the text the pure matcher in `dto` searches.
+///
+/// Found in worker 0.9.0 (src/d1/mod.rs, src/error.rs): `worker::Error::D1`
+/// wraps a `D1Error` around a `js_sys::Error` whose `message` is only the
+/// generic "D1_ERROR: ..." text; the SQLite detail ("UNIQUE constraint failed:
+/// posts.slot_at") lives in the JS error's `cause`. `D1Error::cause()` returns
+/// that cause's message, `Display` prints the cause, and `Error`'s Display uses
+/// the `{:#?}` Debug form, which only shows the cause as a raw JsValue. So we
+/// join the cause and the JS error message explicitly rather than rely on a
+/// formatter, and fall back to Display for any other error kind.
+fn d1_error_text(e: &worker::Error) -> String {
+    match e {
+        worker::Error::D1(d1) => {
+            let js: &worker::js_sys::Error = d1.as_ref();
+            format!("{} | {}", d1.cause(), String::from(js.message()))
+        }
+        other => other.to_string(),
     }
 }
 
@@ -97,7 +108,7 @@ impl PostRepository for D1PostRepository {
             .map_err(|e| InsertError::Port(port_err(e)))?
             .run()
             .await
-            .map_err(|e| insert_err(&e.to_string()))?;
+            .map_err(|e| dto::classify_insert_error(&d1_error_text(&e)))?;
         Ok(())
     }
 }
