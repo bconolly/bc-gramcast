@@ -159,6 +159,65 @@ pub fn check_modulus_len(modulus: &[u8]) -> bool {
     modulus.len() >= MIN_MODULUS_BYTES
 }
 
+/// The parts of the token header we look at.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JwtHeader {
+    pub alg: String,
+    pub kid: String,
+}
+
+/// The parts of the token payload we look at. Everything else is ignored.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Claims {
+    pub iss: String,
+    pub aud: Vec<String>,
+    pub exp: i64,
+    pub nbf: Option<i64>,
+    pub email: Option<String>,
+}
+
+/// Only RS256 is accepted (so `none`, `HS256` and `rs256` are refused), and the
+/// key id must be a short plain identifier.
+pub fn check_header(header: &JwtHeader) -> Result<(), AuthError> {
+    if header.alg != "RS256" {
+        return Err(AuthError::UnsupportedAlg);
+    }
+    let kid_ok = (1..=128).contains(&header.kid.len())
+        && header
+            .kid
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'));
+    if kid_ok {
+        Ok(())
+    } else {
+        Err(AuthError::BadKeyId)
+    }
+}
+
+/// Checks the claims against this deployment. `now` is unix seconds.
+pub fn check_claims(claims: &Claims, config: &AccessConfig, now: i64) -> Result<(), AuthError> {
+    if claims.iss != config.issuer() {
+        return Err(AuthError::WrongIssuer);
+    }
+    if !claims.aud.contains(&config.audience) {
+        return Err(AuthError::WrongAudience);
+    }
+    // `saturating_sub` and `saturating_add` keep extreme values from wrapping.
+    if claims.exp <= now.saturating_sub(CLOCK_LEEWAY_SECS) {
+        return Err(AuthError::Expired);
+    }
+    if claims
+        .nbf
+        .is_some_and(|nbf| nbf > now.saturating_add(CLOCK_LEEWAY_SECS))
+    {
+        return Err(AuthError::NotYetValid);
+    }
+    match &claims.email {
+        Some(e) if e.eq_ignore_ascii_case(&config.owner_email) => Ok(()),
+        _ => Err(AuthError::NotOwner),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -308,5 +367,166 @@ mod tests {
         assert!(!check_modulus_len(&[1; 255]));
         assert!(check_modulus_len(&[1; 256]));
         assert!(check_modulus_len(&[1; 512]));
+    }
+
+    fn header(alg: &str, kid: &str) -> JwtHeader {
+        JwtHeader {
+            alg: alg.into(),
+            kid: kid.into(),
+        }
+    }
+
+    #[test]
+    fn header_accepts_rs256_with_a_plain_kid() {
+        assert_eq!(check_header(&header("RS256", "abc.DEF_1-2")), Ok(()));
+        assert_eq!(check_header(&header("RS256", &"k".repeat(128))), Ok(()));
+    }
+
+    #[test]
+    fn header_refuses_every_other_algorithm() {
+        for alg in [
+            "none", "None", "HS256", "rs256", "RS384", "ES256", "", "RS256 ",
+        ] {
+            assert_eq!(
+                check_header(&header(alg, "k1")),
+                Err(AuthError::UnsupportedAlg),
+                "{alg:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn header_refuses_bad_key_ids() {
+        let long = "k".repeat(129);
+        for kid in [
+            "",
+            "a b",
+            "a/b",
+            "a\u{0}",
+            "../x",
+            "k\n",
+            "é",
+            long.as_str(),
+        ] {
+            assert_eq!(
+                check_header(&header("RS256", kid)),
+                Err(AuthError::BadKeyId),
+                "{kid:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn header_checks_alg_before_kid() {
+        assert_eq!(
+            check_header(&header("none", "")),
+            Err(AuthError::UnsupportedAlg)
+        );
+    }
+
+    const NOW: i64 = 1_800_000_000;
+
+    fn claims() -> Claims {
+        Claims {
+            iss: "https://team-x.cloudflareaccess.com".into(),
+            aud: vec!["other".into(), "abc123DEF".into()],
+            exp: NOW + 600,
+            nbf: Some(NOW - 5),
+            email: Some("Owner@Example.com".into()),
+        }
+    }
+
+    fn check(c: &Claims) -> Result<(), AuthError> {
+        check_claims(c, &cfg().unwrap(), NOW)
+    }
+
+    #[test]
+    fn claims_accept_a_good_token_for_the_owner_ignoring_email_case() {
+        assert_eq!(check(&claims()), Ok(()));
+        let mut c = claims();
+        c.nbf = None;
+        assert_eq!(check(&c), Ok(()));
+    }
+
+    #[test]
+    fn claims_refuse_a_wrong_issuer() {
+        for iss in [
+            "",
+            "https://team-x.cloudflareaccess.com/",
+            "https://TEAM-X.cloudflareaccess.com",
+            "http://team-x.cloudflareaccess.com",
+            "https://other.cloudflareaccess.com",
+        ] {
+            let mut c = claims();
+            c.iss = iss.into();
+            assert_eq!(check(&c), Err(AuthError::WrongIssuer), "{iss:?}");
+        }
+    }
+
+    #[test]
+    fn claims_refuse_a_missing_or_different_audience() {
+        for aud in [
+            vec![],
+            vec!["nope".to_string()],
+            vec!["ABC123DEF".to_string()],
+        ] {
+            let mut c = claims();
+            c.aud = aud;
+            assert_eq!(check(&c), Err(AuthError::WrongAudience));
+        }
+    }
+
+    #[test]
+    fn claims_expiry_has_a_thirty_second_leeway() {
+        let mut c = claims();
+        c.exp = NOW - CLOCK_LEEWAY_SECS + 1;
+        assert_eq!(check(&c), Ok(()));
+        c.exp = NOW - CLOCK_LEEWAY_SECS;
+        assert_eq!(check(&c), Err(AuthError::Expired));
+        c.exp = i64::MIN;
+        assert_eq!(check(&c), Err(AuthError::Expired));
+    }
+
+    #[test]
+    fn claims_not_before_has_a_thirty_second_leeway() {
+        let mut c = claims();
+        c.nbf = Some(NOW + CLOCK_LEEWAY_SECS);
+        assert_eq!(check(&c), Ok(()));
+        c.nbf = Some(NOW + CLOCK_LEEWAY_SECS + 1);
+        assert_eq!(check(&c), Err(AuthError::NotYetValid));
+        c.nbf = Some(i64::MAX);
+        assert_eq!(check(&c), Err(AuthError::NotYetValid));
+    }
+
+    #[test]
+    fn claims_need_the_owner_email() {
+        for email in [
+            None,
+            Some("".to_string()),
+            Some("someone@example.com".into()),
+        ] {
+            let mut c = claims();
+            c.email = email;
+            assert_eq!(check(&c), Err(AuthError::NotOwner));
+        }
+    }
+
+    #[test]
+    fn claims_report_the_first_failed_check_in_a_fixed_order() {
+        let mut c = claims();
+        c.iss = "x".into();
+        c.aud = vec![];
+        c.exp = 0;
+        c.email = None;
+        assert_eq!(check(&c), Err(AuthError::WrongIssuer));
+        c.iss = claims().iss;
+        assert_eq!(check(&c), Err(AuthError::WrongAudience));
+        c.aud = claims().aud;
+        assert_eq!(check(&c), Err(AuthError::Expired));
+        c.exp = claims().exp;
+        c.nbf = Some(i64::MAX);
+        assert_eq!(check(&c), Err(AuthError::NotYetValid));
+        c.nbf = None;
+        assert_eq!(check(&c), Err(AuthError::NotOwner));
     }
 }
