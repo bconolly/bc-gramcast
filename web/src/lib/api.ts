@@ -45,6 +45,13 @@ export class ApiError extends Error {
   }
 }
 
+/** The Worker's fixed 409 text for a slot someone else has taken. */
+export const SLOT_TAKEN_MESSAGE = "that slot is already taken";
+
+/** True for the 409 that means the chosen slot is gone (not "that video is already queued"). */
+export const isSlotTaken = (e: unknown): boolean =>
+  e instanceof ApiError && e.status === 409 && e.message === SLOT_TAKEN_MESSAGE;
+
 const UPLOAD_FAILED = "The video could not be uploaded. Please try again.";
 const MAX_SERVER_MESSAGE = 200;
 

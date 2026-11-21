@@ -1,7 +1,7 @@
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
-import { formatSlotInOffset } from "@/lib/slots";
+import { formatSlotInOffset, offsetName } from "@/lib/slots";
 import type { SlotOptions } from "@/screens/useSlotOptions";
 
 interface Props {
@@ -34,22 +34,22 @@ function Radio({ label, checked, onSelect }: { label: string; checked: boolean; 
 }
 
 export function WhenField({ options, choice, onChoice, when, onWhen, onOpenSlots }: Props) {
-  if (options.status === "loading") {
-    return <p className="text-muted-foreground text-sm">Loading your slots…</p>;
-  }
-  if (options.status === "none") {
+  // While loading, and when there are no slots, the owner can always type a time.
+  if (options.status !== "ready") {
     return (
       <div className="space-y-2">
         <WhenInput id="when" label="When" when={when} onWhen={onWhen} />
-        <Button type="button" variant="ghost" className="text-primary min-h-11 px-0 underline" onClick={onOpenSlots}>
-          Set your weekly slots
-        </Button>
+        {options.status === "none" && (
+          <Button type="button" variant="ghost" className="text-primary min-h-11 px-0 underline" onClick={onOpenSlots}>
+            Set your weekly slots
+          </Button>
+        )}
       </div>
     );
   }
   return (
     <fieldset className="space-y-1">
-      <legend className="mb-1 text-sm font-medium">When</legend>
+      <legend className="mb-1 text-sm font-medium">When ({offsetName(options.offset)})</legend>
       {options.slots.map((slot) => (
         <Radio
           key={slot}

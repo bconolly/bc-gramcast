@@ -11,15 +11,25 @@ export type SlotOptions =
 
 /**
  * The next free pattern slots and the one the owner has picked. `choice` is a slot's
- * Unix seconds, or null for "Pick another time". `refresh` looks again and
- * preselects the first slot.
+ * Unix seconds, or null for "Pick another time".
+ *
+XX the first slot is preselected. It resolves to the new choice, or
+ * undefined when a newer lookup (or unmounting) made this one stale. The first
+ * lookup keeps "Pick another time" when `typed` says the owner already typed a time.
  */
-export function useSlotOptions() {
+export function useSlotOptions(typed: boolean) {
   const [options, setOptions] = useState<SlotOptions>({ status: "loading" });
   const [choice, setChoice] = useState<number | null>(null);
   const live = useRef(true);
+  // Counts lookups so an older one finishing late cannot overwrite a newer one.
+  const latest = useRef(0);
+  const typedRef = useRef(typed);
+  useEffect(() => {
+    typedRef.current = typed;
+  }, [typed]);
 
-  const refresh = useCallback(async () => {
+  const refresh = useCallback(async (keepOther?: boolean): Promise<number | null | undefined> => {
+    const id = ++latest.current;
     let next: SlotOptions;
     try {
       const [pattern, slots] = await Promise.all([getPattern(), getNextSlots(SLOT_COUNT)]);
@@ -30,9 +40,12 @@ export function useSlotOptions() {
     } catch {
       next = { status: "none" };
     }
-    if (!live.current) return;
+    if (!live.current || id !== latest.current) return undefined;
+    const keep = keepOther ?? typedRef.current;
+    const picked = next.status === "ready" && !keep ? (next.slots[0] ?? null) : null;
     setOptions(next);
-    setChoice(next.status === "ready" ? (next.slots[0] ?? null) : null);
+    setChoice(picked);
+    return picked;
   }, []);
 
   useEffect(() => {

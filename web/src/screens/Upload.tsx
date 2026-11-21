@@ -3,7 +3,7 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Textarea } from "@/components/ui/textarea";
-import { ApiError, submitPost, type Platform } from "@/lib/api";
+import { isSlotTaken, submitPost, type Platform } from "@/lib/api";
 import {
   MAX_CAPTION_CHARS,
   MAX_TITLE_CHARS,
@@ -89,7 +89,7 @@ export function Upload({ onQueued, onOpenSlots }: { onQueued: () => void; onOpen
   const [when, setWhen] = useState("");
   const [problems, setProblems] = useState<string[]>([]);
   const [busy, setBusy] = useState(false);
-  const slotOptions = useSlotOptions();
+  const slotOptions = useSlotOptions(when !== "");
   // Key of the video already in storage for the chosen file, so a failed queue
   // call retries without uploading again. A new file clears it. The upload link
   // itself is never kept.
@@ -97,6 +97,16 @@ export function Upload({ onQueued, onOpenSlots }: { onQueued: () => void; onOpen
 
   function toggle(id: Platform, on: boolean) {
     setPlatforms((cur) => (on ? [...cur, id] : cur.filter((p) => p !== id)));
+  }
+
+  /**
+   * Someone else took the slot: look again. A chosen "Pick another time" stays as it
+   * was; a chosen slot moves to the first free one, and the owner is told.
+   */
+  async function refreshAfterTaken(message: string) {
+    const hadRadio = slotOptions.options.status === "ready" && slotOptions.choice !== null;
+    const picked = await slotOptions.refresh(!hadRadio);
+    if (hadRadio && typeof picked === "number") setProblems([message, "We have picked the next free slot."]);
   }
 
   async function onSubmit(e: FormEvent) {
@@ -124,9 +134,9 @@ export function Upload({ onQueued, onOpenSlots }: { onQueued: () => void; onOpen
       );
       onQueued();
     } catch (err) {
-      setProblems([err instanceof Error ? err.message : "Something went wrong."]);
-      // Someone else may have taken the slot, so look again and offer the first free one.
-      if (err instanceof ApiError && err.status === 409) await slotOptions.refresh();
+      const message = err instanceof Error ? err.message : "Something went wrong.";
+      setProblems([message]);
+      if (isSlotTaken(err)) await refreshAfterTaken(message);
       setBusy(false);
     }
   }
