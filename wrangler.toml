@@ -1,0 +1,29 @@
+name = "gramcast"
+main = "build/worker/shim.mjs"
+compatibility_date = "2026-11-01"
+
+[build]
+command = "cargo install --locked worker-build@0.9.0 && worker-build --release crates/worker"
+
+[assets]
+directory = "web/dist"
+binding = "ASSETS"
+# API calls reach the Worker; everything else is a static file (single-page app).
+run_worker_first = ["/api/*"]
+not_found_handling = "single-page-application"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "gramcast"
+database_id = "REPLACE_WITH_D1_DATABASE_ID"
+migrations_dir = "migrations"
+
+[[r2_buckets]]
+binding = "VIDEOS"
+bucket_name = "REPLACE_WITH_BUCKET_NAME"
+
+# Placeholders only. Secrets (R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY) are set with
+# `wrangler secret put`. Never add LOCAL_DEV_NO_AUTH here: it goes in .dev.vars.
+[vars]
+R2_BUCKET = "REPLACE_WITH_BUCKET_NAME"
+R2_ACCOUNT_ID = "REPLACE_WITH_ACCOUNT_ID"
