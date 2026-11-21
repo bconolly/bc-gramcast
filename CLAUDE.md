@@ -18,6 +18,9 @@ Built with the "Beyond vibe coding" workflow. The full build plan is the source 
 - Never post to a real Instagram or YouTube account from tests. Use fakes.
 - Never add a dependency without checking it exists, is maintained and is the intended package.
 
-## Review
-- A code reviewer on a different model from the developer reviews each slice, capped at three turns.
-- After three turns, stop and ask the owner before continuing.
+## Agents (see .claude/agents)
+- `developer` (Sonnet) writes all code, test first.
+- `code-reviewer` (Opus) reviews every change. A different model from the developer, capped at three turns.
+- `security-reviewer` (Opus) reviews every change with Cloudflare's security-audit skill (`.claude/skills/security-audit`) in guidance mode.
+- `judge` (Opus, optional) scores a finished slice against the acceptance criteria.
+- Any failed check goes back to the developer. After three review turns, stop and ask the owner before continuing.
