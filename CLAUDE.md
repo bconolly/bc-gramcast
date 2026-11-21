@@ -1,4 +1,4 @@
-# Slotcast harness rules
+# Gramcast harness rules
 
 Built with the "Beyond vibe coding" workflow. The full build plan is the source of truth for scope.
 

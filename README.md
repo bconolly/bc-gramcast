@@ -1,4 +1,4 @@
-# Slotcast
+# Gramcast
 
 Self-hosted scheduler that auto-publishes the same video as an Instagram Reel and a YouTube Short on a weekly slot pattern, with platform analytics and Payhip sales in one place. Runs on Cloudflare's free tiers.
 
