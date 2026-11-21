@@ -2,7 +2,7 @@
 //! so the Worker (and later an AWS adapter) plugs in without changing them.
 
 use crate::media::{UploadError, VideoUpload};
-use crate::queue::{Queue, QueueError, QueuedPost};
+use crate::queue::{validate_slot, Queue, QueueError, QueuedPost};
 
 /// How long an upload link stays valid.
 pub const UPLOAD_LINK_SECS: u32 = 15 * 60;
@@ -64,7 +64,12 @@ pub fn start_upload(
     Ok(UploadTicket { video_key, put_url })
 }
 
-pub async fn queue_post(repo: &impl PostRepository, post: QueuedPost) -> Result<(), AppError> {
+pub async fn queue_post(
+    repo: &impl PostRepository,
+    now: i64,
+    post: QueuedPost,
+) -> Result<(), AppError> {
+    validate_slot(post.slot_at, now).map_err(AppError::Queue)?;
     let existing = repo.all().await.map_err(AppError::Port)?;
     let mut queue = Queue::from_posts(existing).map_err(AppError::Queue)?;
     queue.add(post.clone()).map_err(AppError::Queue)?;
@@ -149,7 +154,7 @@ mod tests {
     #[test]
     fn queue_post_stores_a_valid_post() {
         let repo = FakeRepo::default();
-        pollster::block_on(queue_post(&repo, post("a", 100))).unwrap();
+        pollster::block_on(queue_post(&repo, 0, post("a", 100))).unwrap();
         assert_eq!(repo.posts.borrow().len(), 1);
     }
 
@@ -157,7 +162,7 @@ mod tests {
     fn queue_post_refuses_a_taken_slot_without_storing() {
         let repo = FakeRepo::default();
         repo.posts.borrow_mut().push(post("a", 100));
-        let e = pollster::block_on(queue_post(&repo, post("b", 100)));
+        let e = pollster::block_on(queue_post(&repo, 0, post("b", 100)));
         assert_eq!(
             e,
             Err(AppError::Queue(QueueError::SlotTaken { slot_at: 100 }))
@@ -166,8 +171,18 @@ mod tests {
     }
 
     #[test]
+    fn queue_post_rejects_past_and_out_of_range_slots_without_storing() {
+        let repo = FakeRepo::default();
+        let past = pollster::block_on(queue_post(&repo, 500, post("a", 100)));
+        assert_eq!(past, Err(AppError::Queue(QueueError::SlotInPast)));
+        let far = pollster::block_on(queue_post(&repo, 500, post("b", 4_102_444_801)));
+        assert_eq!(far, Err(AppError::Queue(QueueError::SlotOutOfRange)));
+        assert!(repo.posts.borrow().is_empty());
+    }
+
+    #[test]
     fn queue_post_maps_a_lost_slot_race_to_slot_taken() {
-        let e = pollster::block_on(queue_post(&RacingRepo, post("a", 100)));
+        let e = pollster::block_on(queue_post(&RacingRepo, 0, post("a", 100)));
         assert_eq!(
             e,
             Err(AppError::Queue(QueueError::SlotTaken { slot_at: 100 }))

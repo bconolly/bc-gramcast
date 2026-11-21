@@ -56,7 +56,11 @@ impl PostRepository for D1PostRepository {
                     .split(',')
                     .map(dto::platform_from_str)
                     .collect::<Option<Vec<_>>>()
-                    .ok_or_else(|| PortError("bad platforms in row".into()))?;
+                    .ok_or_else(|| {
+                        // Row id only: never log URLs, keys or secrets.
+                        worker::console_error!("bad platforms in posts row {}", r.id);
+                        PortError("bad platforms in row".into())
+                    })?;
                 Ok(QueuedPost {
                     id: r.id,
                     video_key: r.video_key,
@@ -86,6 +90,8 @@ impl PostRepository for D1PostRepository {
                 post.title.as_str().into(),
                 post.caption.as_str().into(),
                 platforms.join(",").into(),
+                // D1 binds numbers as JS doubles. The domain caps slot_at at 2100,
+                // far below 2^53, so the f64 is exact.
                 (post.slot_at as f64).into(),
             ])
             .map_err(|e| InsertError::Port(port_err(e)))?

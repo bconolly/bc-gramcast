@@ -70,7 +70,7 @@ mod entry {
                     return Response::error("unknown platform", 422);
                 };
                 let repo = D1PostRepository::new(ctx.env.d1("DB")?);
-                match app::queue_post(&repo, post.clone()).await {
+                match app::queue_post(&repo, now_secs(), post.clone()).await {
                     Ok(()) => Ok(Response::from_json(&dto::to_json(&post))?.with_status(201)),
                     Err(e) => app_error(&e),
                 }
