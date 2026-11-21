@@ -139,7 +139,14 @@ pub fn parse_next_count(query: Option<&str>) -> Option<usize> {
     let mut values = query
         .unwrap_or("")
         .split('&')
-        .filter_map(|pair| pair.strip_prefix("count="));
+        // A bare `count` with no `=` is a present-but-empty value, so it is refused.
+        .filter_map(|pair| {
+            if pair == "count" {
+                Some("")
+            } else {
+                pair.strip_prefix("count=")
+            }
+        });
     let Some(value) = values.next() else {
         return Some(DEFAULT_NEXT_COUNT);
     };
@@ -522,6 +529,9 @@ mod tests {
             "count=0",
             "count=21",
             "count=",
+            "count",
+            "x=1&count",
+            "count&count=2",
             "count=-1",
             "count=+3",
             "count=3.0",

@@ -63,7 +63,7 @@ All endpoints answer only to the owner (see Run locally). Request bodies are JSO
 - `POST /api/uploads`, `POST /api/posts`, `GET /api/queue`: upload a video and queue it.
 - `GET /api/slots/pattern`: the weekly posting pattern, for example `{"utc_offset_minutes":600,"rules":[{"weekday":"wed","time":"19:00"}]}`. Before one is saved it is Brisbane (+600) with no rules.
 - `PUT /api/slots/pattern`: save the pattern (same shape; weekday `mon` to `sun`, time 24h `HH:MM`, offset -720 to 840, at most 14 rules). Answers with the normalised pattern.
-- `GET /api/slots/next?count=N`: `{"slots":[<unix seconds>, ...]}`, the next free slots after the posts already queued. `count` is 1 to 20 and defaults to 5.
+- `GET /api/slots/next?count=N`: `{"slots":[<unix seconds>, ...]}`, the next pattern slots not already taken by a queued post. `count` is 1 to 20 and defaults to 5.
 
 ## Known gaps for later slices
 - The slot pattern's UTC offset is fixed, so daylight saving is not adjusted (Brisbane has none). Change the offset by hand when your clocks change.
