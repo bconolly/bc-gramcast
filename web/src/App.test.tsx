@@ -6,9 +6,21 @@ import { PAYHIP_URL, PROMO_CTA } from "@/lib/brand";
 
 afterEach(() => vi.unstubAllGlobals());
 
+/** Answers each endpoint with a harmless empty body. */
+function stubEmptyApi() {
+  const bodies: Record<string, string> = {
+    "/api/slots/pattern": '{"utc_offset_minutes":600,"rules":[]}',
+    "/api/slots/next?count=5": '{"slots":[]}',
+  };
+  vi.stubGlobal(
+    "fetch",
+    vi.fn().mockImplementation((url: string) => Promise.resolve(new Response(bodies[url] ?? "[]"))),
+  );
+}
+
 describe("App", () => {
   it("starts on the queue and switches to upload and back", async () => {
-    vi.stubGlobal("fetch", vi.fn().mockImplementation(() => Promise.resolve(new Response("[]"))));
+    stubEmptyApi();
     const user = userEvent.setup();
     render(<App />);
     expect(await screen.findByText("Nothing queued yet.")).toBeInTheDocument();
@@ -18,8 +30,19 @@ describe("App", () => {
     expect(await screen.findByText("Nothing queued yet.")).toBeInTheDocument();
   });
 
+  it("has Queue, Upload and Slots in the nav and opens the slots screen", async () => {
+    stubEmptyApi();
+    const user = userEvent.setup();
+    render(<App />);
+    const nav = screen.getByRole("navigation", { name: "Screens" });
+    expect(within(nav).getAllByRole("button").map((b) => b.textContent)).toEqual(["Queue", "Upload", "Slots"]);
+    await user.click(within(nav).getByRole("button", { name: "Slots" }));
+    expect(within(nav).getByRole("button", { name: "Slots" })).toHaveAttribute("aria-current", "page");
+    expect(await screen.findByLabelText("UTC offset")).toBeInTheDocument();
+  });
+
   it("links the header brand and the footer promo link to Payhip on both screens", async () => {
-    vi.stubGlobal("fetch", vi.fn().mockImplementation(() => Promise.resolve(new Response("[]"))));
+    stubEmptyApi();
     const user = userEvent.setup();
     render(<App />);
     expect(await screen.findByText("Nothing queued yet.")).toBeInTheDocument();
@@ -50,6 +73,8 @@ describe("App", () => {
     expectBranding();
     await user.click(screen.getByRole("button", { name: "Upload" }));
     expect(screen.getByLabelText("Title")).toBeInTheDocument();
+    expectBranding();
+    await user.click(screen.getByRole("button", { name: "Slots" }));
     expectBranding();
   });
 });

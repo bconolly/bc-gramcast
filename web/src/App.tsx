@@ -1,10 +1,17 @@
 import { useState } from "react";
 import { Button } from "@/components/ui/button";
 import { Queue } from "@/screens/Queue";
+import { Slots } from "@/screens/Slots";
 import { Upload } from "@/screens/Upload";
 import { PAYHIP_URL, PROMO_CTA } from "@/lib/brand";
 
-type Screen = "queue" | "upload";
+type Screen = "queue" | "upload" | "slots";
+
+const NAV: { id: Screen; label: string }[] = [
+  { id: "queue", label: "Queue" },
+  { id: "upload", label: "Upload" },
+  { id: "slots", label: "Slots" },
+];
 
 export function App() {
   const [screen, setScreen] = useState<Screen>("queue");
@@ -27,24 +34,23 @@ export function App() {
           </a>
         </div>
         <nav className="flex gap-1" aria-label="Screens">
-          <Button
-            variant={screen === "queue" ? "default" : "ghost"}
-            aria-current={screen === "queue" ? "page" : undefined}
-            onClick={() => setScreen("queue")}
-          >
-            Queue
-          </Button>
-          <Button
-            variant={screen === "upload" ? "default" : "ghost"}
-            aria-current={screen === "upload" ? "page" : undefined}
-            onClick={() => setScreen("upload")}
-          >
-            Upload
-          </Button>
+          {NAV.map((item) => (
+            <Button
+              key={item.id}
+              variant={screen === item.id ? "default" : "ghost"}
+              className="min-h-11"
+              aria-current={screen === item.id ? "page" : undefined}
+              onClick={() => setScreen(item.id)}
+            >
+              {item.label}
+            </Button>
+          ))}
         </nav>
       </header>
       <main>
-        {screen === "queue" ? <Queue /> : <Upload onQueued={() => setScreen("queue")} />}
+        {screen === "queue" && <Queue />}
+        {screen === "upload" && <Upload onQueued={() => setScreen("queue")} />}
+        {screen === "slots" && <Slots />}
       </main>
       <footer className="border-border mt-10 border-t pt-4">
         <div className="border-border bg-card flex items-center gap-3 rounded-xl border p-3">
