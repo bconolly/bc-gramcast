@@ -7,7 +7,7 @@ mod adapters;
 
 #[cfg(target_arch = "wasm32")]
 mod entry {
-    use crate::adapters::{D1PostRepository, R2Signer};
+    use crate::adapters::{D1PostRepository, R2Signer, R2Store};
     use crate::dto::{self, QueuePostBody, StartUploadBody};
     use domain::app;
     use worker::*;
@@ -93,7 +93,8 @@ mod entry {
                     return Response::error("unknown platform", 422);
                 };
                 let repo = D1PostRepository::new(ctx.env.d1("DB")?);
-                match app::queue_post(&repo, now_secs(), post.clone()).await {
+                let store = R2Store::new(ctx.env.bucket("VIDEOS")?);
+                match app::queue_post(&repo, &store, now_secs(), post.clone()).await {
                     Ok(()) => Ok(Response::from_json(&dto::to_json(&post))?.with_status(201)),
                     Err(e) => app_error(&e),
                 }

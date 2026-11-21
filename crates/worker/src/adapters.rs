@@ -1,10 +1,11 @@
-//! Cloudflare adapters for the domain ports: D1 for posts, R2 presigning for uploads.
+//! Cloudflare adapters for the domain ports: D1 for posts, R2 presigning and
+//! the R2 binding for uploads.
 
 use crate::dto;
-use domain::app::{InsertError, PortError, PostRepository, UploadSigner};
+use domain::app::{InsertError, PortError, PostRepository, UploadSigner, UploadStore};
 use domain::queue::QueuedPost;
 use serde::Deserialize;
-use worker::{D1Database, Env};
+use worker::{Bucket, D1Database, Env};
 
 pub struct D1PostRepository {
     db: D1Database,
@@ -156,5 +157,25 @@ impl UploadSigner for R2Signer {
             content_type: Some(content_type),
         };
         presign::presign(&creds, &req).map_err(port_err)
+    }
+}
+
+/// Reads object metadata through the R2 binding (`VIDEOS`), no signing needed.
+pub struct R2Store {
+    bucket: Bucket,
+}
+
+impl R2Store {
+    pub fn new(bucket: Bucket) -> Self {
+        Self { bucket }
+    }
+}
+
+impl UploadStore for R2Store {
+    async fn object_size(&self, key: &str) -> Result<Option<u64>, PortError> {
+        // head() returns None for a missing key. The error text can carry the key, so
+        // it goes through port_err, which the API never shows to the client.
+        let object = self.bucket.head(key).await.map_err(port_err)?;
+        Ok(object.map(|o| o.size()))
     }
 }

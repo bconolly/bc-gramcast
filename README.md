@@ -11,4 +11,55 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo nextest run --workspace
 ```
 
+Front end (`web/`, Vite + React + TypeScript + Tailwind; Node 22.13 or newer):
+```
+cd web
+npm ci
+npm run lint && npm test && npm run build
+```
+
+## Run locally
+`wrangler.toml` holds placeholders only: no secrets, and no `LOCAL_DEV_NO_AUTH`. Until owner sign-in exists the API answers 503 unless local dev mode is on. Turn it on for local use only, in `.dev.vars` (git-ignored, never commit it):
+```
+LOCAL_DEV_NO_AUTH=true
+R2_ACCESS_KEY_ID=...
+R2_SECRET_ACCESS_KEY=...
+```
+Run `wrangler dev` bound to loopback so nothing else on your network can reach the no-auth API:
+```
+npm --prefix web run build
+wrangler dev --ip 127.0.0.1
+```
+Never run `vite --host`, and never bind wrangler to anything but 127.0.0.1, while `LOCAL_DEV_NO_AUTH` is set: the API has no sign-in in that mode.
+
+`R2_BUCKET` (a var) and the `VIDEOS` binding's `bucket_name` in `wrangler.toml` must name the same bucket. The binding is for the Worker's own reads; the var is used to build presigned URLs.
+
+The browser PUTs the video straight to R2, so the bucket needs a CORS rule. Use the specific origins, never `"*"` (replace the production placeholder with your real hostname):
+```json
+[
+  {
+    "AllowedOrigins": [
+      "http://127.0.0.1:8787",
+      "http://localhost:8787",
+      "https://gramcast.example.com"
+    ],
+    "AllowedMethods": ["PUT"],
+    "AllowedHeaders": ["Content-Type"],
+    "MaxAgeSeconds": 3600
+  }
+]
+```
+
+Dates: the date-time picker follows the browser's locale for display (so it may show month first); the queue always shows dd/mm/yyyy.
+
+Security headers for the static app live in `web/public/_headers` (CSP, nosniff, no-referrer). The CSP needs no `'unsafe-inline'`: the build has no inline scripts or styles.
+
+Screenshots (needs Playwright and Chromium installed): `npm --prefix web run build && node web/scripts/screenshots.cjs <out-dir>/` (the output directory is required; the script serves the build with `web/public/_headers` applied and fails on console errors, so CSP problems show up).
+
 `spike/cpu` measures how long one R2 presign takes in V8 WebAssembly, to check the Workers free plan's 10 ms CPU limit.
+
+## Known gaps for later slices
+- Re-check the object's size and type with `head()` in the publish use case: the 15 minute upload link can still overwrite the object after the post is queued.
+- Delete rejected and orphaned uploads (add an R2 lifecycle rule as a backstop).
+- In the sign-in slice, put Cloudflare Access in front of every hostname, or set `workers_dev = false` and `preview_urls = false`, and validate the Access JWT in `require_owner`.
+- Install `worker-build` in CI from a pinned, cached copy instead of building it each run.
