@@ -146,11 +146,12 @@ pub fn format_hhmm(minute_of_day: u16) -> String {
 
 /// The next free slots after `now`, as UTC Unix seconds in ascending order.
 /// Skips anything in `taken`, looks at most 52 weeks ahead and never passes
-/// `MAX_SLOT_SECS`. Returns at most `min(count, MAX_NEXT_SLOTS)`.
+/// `MAX_SLOT_SECS`. A `now` outside `0..MAX_SLOT_SECS` gives nothing, which
+/// matches `validate_slot`'s bounds. Returns at most `min(count, MAX_NEXT_SLOTS)`.
 pub fn next_free_slots(pattern: &SlotPattern, taken: &[i64], now: i64, count: usize) -> Vec<i64> {
     let want = count.min(MAX_NEXT_SLOTS);
     let mut out = Vec::with_capacity(want);
-    if want == 0 || pattern.rules.is_empty() || now >= MAX_SLOT_SECS {
+    if want == 0 || pattern.rules.is_empty() || !(0..MAX_SLOT_SECS).contains(&now) {
         return out;
     }
     let offset_secs = i64::from(pattern.utc_offset_minutes) * 60;
@@ -425,10 +426,10 @@ mod tests {
     }
 
     #[test]
-    fn works_before_the_epoch_and_on_the_epoch_thursday() {
+    fn nothing_before_the_epoch_and_the_epoch_thursday_is_not_after_now() {
         // 1970-01-01 was a Thursday.
         let p = pat(0, vec![r(Weekday::Thu, 0, 0)]);
-        assert_eq!(next_free_slots(&p, &[], -1, 1), vec![0]);
+        assert!(next_free_slots(&p, &[], -1, 1).is_empty());
         assert_eq!(next_free_slots(&p, &[], 0, 1), vec![604_800]);
     }
 
@@ -456,13 +457,74 @@ mod tests {
         assert_eq!(got, vec![604_800 * 11, 604_800 * 12, 604_800 * 13]);
     }
 
+    fn every_day_noon() -> SlotPattern {
+        pat(0, Weekday::ALL.iter().map(|d| r(*d, 12, 0)).collect())
+    }
+
     #[test]
     fn never_passes_the_queue_ceiling() {
-        let all: Vec<_> = Weekday::ALL.iter().map(|d| r(*d, 12, 0)).collect();
-        let got = next_free_slots(&pat(0, all), &[], MAX_SLOT_SECS - 3 * 86_400, 20);
-        assert!(!got.is_empty() && got.len() < 20);
-        assert!(got.iter().all(|s| *s <= MAX_SLOT_SECS));
+        // MAX_SLOT_SECS is Fri 2100-01-01 00:00 UTC, so three days before is
+        // Tuesday 00:00. Fri 12:00 is past the ceiling and is left out.
+        let got = next_free_slots(&every_day_noon(), &[], MAX_SLOT_SECS - 3 * 86_400, 20);
+        assert_eq!(
+            got,
+            vec![
+                MAX_SLOT_SECS - 216_000,
+                MAX_SLOT_SECS - 129_600,
+                MAX_SLOT_SECS - 43_200
+            ]
+        );
+    }
+
+    #[test]
+    fn a_slot_exactly_on_the_ceiling_is_allowed() {
+        let p = pat(0, vec![r(Weekday::Fri, 0, 0)]);
+        assert_eq!(
+            next_free_slots(&p, &[], MAX_SLOT_SECS - 86_400, 5),
+            vec![MAX_SLOT_SECS]
+        );
+    }
+
+    #[test]
+    fn extreme_now_values_are_safe() {
         assert!(next_free_slots(&mon_wed(), &[], i64::MAX, 5).is_empty());
-        assert!(next_free_slots(&mon_wed(), &[], i64::MIN, 5).len() <= 5);
+        let wide = pat(840, Weekday::ALL.iter().map(|d| r(*d, 0, 0)).collect());
+        assert!(next_free_slots(&wide, &[], i64::MIN, 5).is_empty());
+        assert!(next_free_slots(&wide, &[], i64::MIN + 1, 5).is_empty());
+        assert!(next_free_slots(&wide, &[], -1, 5).is_empty());
+    }
+
+    // Expected values below were computed in Python with datetime and fixed
+    // offsets, from now = 2024-03-01 00:00 UTC (1_709_251_200).
+    const MARCH_FIRST: i64 = 1_709_251_200;
+
+    #[test]
+    fn extreme_positive_offset_plus_840() {
+        // Saturday 08:00 at +14:00 is Friday 18:00 UTC.
+        let p = pat(840, vec![r(Weekday::Sat, 8, 0)]);
+        assert_eq!(
+            next_free_slots(&p, &[], MARCH_FIRST, 2),
+            vec![1_709_316_000, 1_709_920_800]
+        );
+    }
+
+    #[test]
+    fn extreme_negative_offset_minus_720() {
+        // Wednesday 20:30 at -12:00 is Thursday 08:30 UTC.
+        let p = pat(-720, vec![r(Weekday::Wed, 20, 30)]);
+        assert_eq!(
+            next_free_slots(&p, &[], MARCH_FIRST, 2),
+            vec![1_709_800_200, 1_710_405_000]
+        );
+    }
+
+    #[test]
+    fn half_hour_offset_plus_570() {
+        // Friday 19:15 at +09:30 is Friday 09:45 UTC.
+        let p = pat(570, vec![r(Weekday::Fri, 19, 15)]);
+        assert_eq!(
+            next_free_slots(&p, &[], MARCH_FIRST, 2),
+            vec![1_709_286_300, 1_709_891_100]
+        );
     }
 }
