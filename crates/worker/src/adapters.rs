@@ -234,3 +234,162 @@ impl UploadStore for R2Store {
         Ok(object.map(|o| o.size()))
     }
 }
+
+// ---- Cloudflare Access signature check -----------------------------------
+//
+// Thin glue: the key-cache policy is `domain::keycache`, the key-set parsing is
+// `dto::parse_jwks`, and the token checks are `domain::auth`. This only fetches
+// the key set and calls Web Crypto (`crypto.subtle`) through js_sys, which the
+// `worker` crate re-exports, so no dependency or web-sys feature was added.
+// It cannot run natively. Nothing here logs: errors carry fixed text only.
+
+use domain::app::{SignatureVerifier, VerifyError};
+use domain::keycache::{KeyCache, KeyLookup};
+use std::cell::RefCell;
+use worker::js_sys::{self, Array, Function, Object, Reflect, Uint8Array};
+use worker::wasm_bindgen::{JsCast, JsValue};
+use worker::wasm_bindgen_futures::JsFuture;
+use worker::{Fetch, Method, Request, RequestInit, RequestRedirect};
+
+thread_local! {
+    /// Imported public keys, kept for the life of the isolate.
+    static KEYS: RefCell<KeyCache<JsValue>> = const { RefCell::new(KeyCache::new_const()) };
+}
+
+pub struct AccessVerifier {
+    certs_url: String,
+    now: i64,
+}
+
+impl AccessVerifier {
+    /// `certs_url` must come from `AccessConfig::certs_url`, never from a token.
+    pub fn new(certs_url: String, now: i64) -> Self {
+        Self { certs_url, now }
+    }
+
+    async fn key_for(&self, kid: &str) -> Result<JsValue, VerifyError> {
+        // The second pass can never ask for another fetch: the cache has just
+        // recorded one, and `now` does not change within a request.
+        for _ in 0..2 {
+            match KEYS.with(|c| c.borrow_mut().lookup(kid, self.now)) {
+                KeyLookup::Use(key) => return Ok(key),
+                KeyLookup::Unknown => return Err(VerifyError::UnknownKey),
+                KeyLookup::Unavailable => break,
+                // A failed refresh stores nothing, so the next lookup falls back
+                // to any stale key, or reports the keys unavailable.
+                KeyLookup::Fetch => {
+                    let _ = self.refresh().await;
+                }
+            }
+        }
+        Err(unavailable("keys unavailable"))
+    }
+
+    async fn refresh(&self) -> Result<(), PortError> {
+        let mut init = RequestInit::new();
+        // The key endpoint never redirects; a redirect is refused.
+        init.with_method(Method::Get)
+            .with_redirect(RequestRedirect::Error);
+        let request =
+            Request::new_with_init(&self.certs_url, &init).map_err(|_| port("bad key request"))?;
+        let mut response = Fetch::Request(request)
+            .send()
+            .await
+            .map_err(|_| port("key fetch failed"))?;
+        if response.status_code() != 200 {
+            return Err(port("key fetch status"));
+        }
+        let body = response.text().await.map_err(|_| port("key body"))?;
+        let jwks = dto::parse_jwks(&body).map_err(|_| port("key set not usable"))?;
+        let mut imported = Vec::new();
+        for jwk in jwks {
+            if let Ok(key) = import_key(&jwk).await {
+                imported.push((jwk.kid, key));
+            }
+        }
+        if imported.is_empty() {
+            return Err(port("no key imported"));
+        }
+        KEYS.with(|c| c.borrow_mut().store(imported, self.now));
+        Ok(())
+    }
+}
+
+impl SignatureVerifier for AccessVerifier {
+    async fn verify(
+        &self,
+        kid: &str,
+        signing_input: &[u8],
+        signature: &[u8],
+    ) -> Result<bool, VerifyError> {
+        let key = self.key_for(kid).await?;
+        let subtle = subtle().map_err(|_| unavailable("no web crypto"))?;
+        let args = [
+            JsValue::from_str("RSASSA-PKCS1-v1_5"),
+            key,
+            Uint8Array::from(signature).into(),
+            Uint8Array::from(signing_input).into(),
+        ];
+        let result = call(&subtle, "verify", &args)
+            .await
+            .map_err(|_| unavailable("verify failed"))?;
+        Ok(result.as_bool() == Some(true))
+    }
+}
+
+fn port(text: &str) -> PortError {
+    PortError(text.to_string())
+}
+
+fn unavailable(text: &str) -> VerifyError {
+    VerifyError::Unavailable(port(text))
+}
+
+fn object(fields: &[(&str, JsValue)]) -> Result<Object, JsValue> {
+    let o = Object::new();
+    for (k, v) in fields {
+        Reflect::set(&o, &JsValue::from_str(k), v)?;
+    }
+    Ok(o)
+}
+
+fn subtle() -> Result<JsValue, JsValue> {
+    let crypto = Reflect::get(&js_sys::global(), &JsValue::from_str("crypto"))?;
+    Reflect::get(&crypto, &JsValue::from_str("subtle"))
+}
+
+/// Calls `crypto.subtle[method](...args)` and awaits the promise.
+async fn call(subtle: &JsValue, method: &str, args: &[JsValue]) -> Result<JsValue, JsValue> {
+    let f: Function = Reflect::get(subtle, &JsValue::from_str(method))?.dyn_into()?;
+    let list = Array::new();
+    for a in args {
+        list.push(a);
+    }
+    let promise: js_sys::Promise = f.apply(subtle, &list)?.dyn_into()?;
+    JsFuture::from(promise).await
+}
+
+/// `importKey("jwk", jwk, {name: RSASSA-PKCS1-v1_5, hash: SHA-256}, false, ["verify"])`.
+/// Checked against Node's Web Crypto; see the slice notes in the README.
+async fn import_key(jwk: &dto::Jwk) -> Result<JsValue, JsValue> {
+    let key_data = object(&[
+        ("kty", "RSA".into()),
+        ("n", jwk.n.as_str().into()),
+        ("e", jwk.e.as_str().into()),
+        ("alg", "RS256".into()),
+        ("ext", JsValue::TRUE),
+    ])?;
+    let algorithm = object(&[
+        ("name", "RSASSA-PKCS1-v1_5".into()),
+        ("hash", "SHA-256".into()),
+    ])?;
+    let usages = Array::of1(&JsValue::from_str("verify"));
+    let args = [
+        "jwk".into(),
+        key_data.into(),
+        algorithm.into(),
+        JsValue::FALSE,
+        usages.into(),
+    ];
+    call(&subtle()?, "importKey", &args).await
+}

@@ -26,6 +26,17 @@ pub struct KeyCache<K> {
     last_fetch: Option<i64>,
 }
 
+impl<K> KeyCache<K> {
+    /// A `const` constructor, for a `thread_local!` initialiser.
+    pub const fn new_const() -> Self {
+        Self {
+            keys: Vec::new(),
+            loaded_at: None,
+            last_fetch: None,
+        }
+    }
+}
+
 impl<K: Clone> Default for KeyCache<K> {
     fn default() -> Self {
         Self::new()
@@ -34,11 +45,7 @@ impl<K: Clone> Default for KeyCache<K> {
 
 impl<K: Clone> KeyCache<K> {
     pub fn new() -> Self {
-        Self {
-            keys: Vec::new(),
-            loaded_at: None,
-            last_fetch: None,
-        }
+        Self::new_const()
     }
 
     /// `now` is unix seconds.

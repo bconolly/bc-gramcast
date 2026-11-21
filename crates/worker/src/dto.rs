@@ -337,6 +337,26 @@ pub fn auth_error_status(e: &AuthError) -> (u16, &'static str) {
     }
 }
 
+/// A fixed code for the log line when sign-in is refused. It names the check
+/// that failed and nothing from the request: never the token, claims or email.
+pub fn auth_reason_code(e: &AuthError) -> &'static str {
+    match e {
+        AuthError::MissingToken => "missing_token",
+        AuthError::Malformed => "malformed",
+        AuthError::UnsupportedAlg => "unsupported_alg",
+        AuthError::BadKeyId => "bad_key_id",
+        AuthError::UnknownKey => "unknown_key",
+        AuthError::BadSignature => "bad_signature",
+        AuthError::WrongIssuer => "wrong_issuer",
+        AuthError::WrongAudience => "wrong_audience",
+        AuthError::Expired => "expired",
+        AuthError::NotYetValid => "not_yet_valid",
+        AuthError::NotOwner => "not_owner",
+        AuthError::NotConfigured => "not_configured",
+        AuthError::KeysUnavailable => "keys_unavailable",
+    }
+}
+
 /// Headers added to every response the Worker returns, denials included.
 pub const API_SECURITY_HEADERS: [(&str, &str); 4] = [
     ("X-Content-Type-Options", "nosniff"),
@@ -1162,5 +1182,34 @@ mod tests {
             " ".repeat(MAX_JWKS_BYTES)
         );
         assert_eq!(parse_jwks(&padded), Err(JwksError));
+    }
+
+    #[test]
+    fn reason_codes_are_fixed_and_distinct() {
+        let all = [
+            AuthError::MissingToken,
+            AuthError::Malformed,
+            AuthError::UnsupportedAlg,
+            AuthError::BadKeyId,
+            AuthError::UnknownKey,
+            AuthError::BadSignature,
+            AuthError::WrongIssuer,
+            AuthError::WrongAudience,
+            AuthError::Expired,
+            AuthError::NotYetValid,
+            AuthError::NotOwner,
+            AuthError::NotConfigured,
+            AuthError::KeysUnavailable,
+        ];
+        let codes: Vec<&str> = all.iter().map(auth_reason_code).collect();
+        assert_eq!(codes[0], "missing_token");
+        assert_eq!(codes[10], "not_owner");
+        let mut unique = codes.clone();
+        unique.sort_unstable();
+        unique.dedup();
+        assert_eq!(unique.len(), all.len());
+        assert!(codes
+            .iter()
+            .all(|c| c.bytes().all(|b| b.is_ascii_lowercase() || b == b'_')));
     }
 }
