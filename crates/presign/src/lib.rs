@@ -332,6 +332,24 @@ mod tests {
     }
 
     #[test]
+    fn matches_an_independently_derived_content_type_signature() {
+        // Expected value computed by a separate SigV4 implementation in Python
+        // (hashlib and hmac only), following the AWS spec, not this crate's code.
+        let mut req = aws_doc_request();
+        req.method = Method::Put;
+        req.path = "/videos/abc.mp4";
+        req.expires_secs = 900;
+        req.content_type = Some("video/mp4");
+        let url = presign(&CREDS, &req).unwrap();
+        assert!(
+            url.ends_with(
+                "X-Amz-Signature=886385b94058556b02980d522f3f4ec53d73e5c7f9e1d096e29fa10946889c59"
+            ),
+            "{url}"
+        );
+    }
+
+    #[test]
     fn rejects_content_type_with_line_breaks() {
         let mut req = aws_doc_request();
         req.content_type = Some("video/mp4\nx-evil: 1");
