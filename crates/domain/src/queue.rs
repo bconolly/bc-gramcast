@@ -1,5 +1,10 @@
 //! Scheduling domain: the queue of posts waiting for a slot.
 
+/// YouTube title limit. Confirm against YouTube's current docs before release.
+pub const MAX_TITLE_CHARS: usize = 100;
+/// Instagram caption limit. Confirm against Meta's current docs before release.
+pub const MAX_CAPTION_CHARS: usize = 2_200;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Platform {
     Instagram,
@@ -28,6 +33,8 @@ pub enum QueueError {
     NoPlatforms,
     EmptyTitle,
     SlotTaken { slot_at: i64 },
+    BadVideoKey,
+    TooLong,
 }
 
 impl QueuedPost {
@@ -46,8 +53,13 @@ pub struct Queue {
 }
 
 impl Queue {
-    pub fn from_posts(posts: Vec<QueuedPost>) -> Self {
-        Self { posts }
+    /// Rebuilds a queue from storage, applying the same rules as `add`.
+    pub fn from_posts(posts: Vec<QueuedPost>) -> Result<Self, QueueError> {
+        let mut q = Self::default();
+        for p in posts {
+            q.add(p)?;
+        }
+        Ok(q)
     }
 
     pub fn add(&mut self, post: QueuedPost) -> Result<(), QueueError> {
@@ -56,6 +68,14 @@ impl Queue {
         }
         if post.title.trim().is_empty() {
             return Err(QueueError::EmptyTitle);
+        }
+        if post.title.chars().count() > MAX_TITLE_CHARS
+            || post.caption.chars().count() > MAX_CAPTION_CHARS
+        {
+            return Err(QueueError::TooLong);
+        }
+        if !post.video_key.starts_with("videos/") || post.video_key.contains("..") {
+            return Err(QueueError::BadVideoKey);
         }
         if self.posts.iter().any(|p| p.slot_at == post.slot_at) {
             return Err(QueueError::SlotTaken {
@@ -112,7 +132,7 @@ mod tests {
 
     #[test]
     fn one_post_per_slot() {
-        let mut q = Queue::from_posts(vec![post("a", 100)]);
+        let mut q = Queue::from_posts(vec![post("a", 100)]).unwrap();
         assert_eq!(
             q.add(post("b", 100)),
             Err(QueueError::SlotTaken { slot_at: 100 })
@@ -121,9 +141,33 @@ mod tests {
 
     #[test]
     fn upcoming_is_in_slot_order_and_skips_the_past() {
-        let q = Queue::from_posts(vec![post("late", 300), post("past", 50), post("soon", 200)]);
+        let q = Queue::from_posts(vec![post("late", 300), post("past", 50), post("soon", 200)])
+            .unwrap();
         let ids: Vec<&str> = q.upcoming(100).iter().map(|p| p.id.as_str()).collect();
         assert_eq!(ids, ["soon", "late"]);
+    }
+
+    #[test]
+    fn from_posts_applies_the_same_rules_as_add() {
+        let result = Queue::from_posts(vec![post("a", 100), post("b", 100)]);
+        assert_eq!(result.err(), Some(QueueError::SlotTaken { slot_at: 100 }));
+    }
+
+    #[test]
+    fn video_key_must_be_in_the_videos_prefix() {
+        let mut p = post("a", 100);
+        p.video_key = "secrets/x.mp4".into();
+        assert_eq!(Queue::default().add(p), Err(QueueError::BadVideoKey));
+    }
+
+    #[test]
+    fn caps_title_and_caption_length() {
+        let mut p = post("a", 100);
+        p.title = "t".repeat(MAX_TITLE_CHARS + 1);
+        assert_eq!(Queue::default().add(p), Err(QueueError::TooLong));
+        let mut p = post("b", 200);
+        p.caption = "c".repeat(MAX_CAPTION_CHARS + 1);
+        assert_eq!(Queue::default().add(p), Err(QueueError::TooLong));
     }
 
     #[test]

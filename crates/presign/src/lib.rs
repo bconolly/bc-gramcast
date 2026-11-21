@@ -26,10 +26,19 @@ impl Method {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct Credentials<'a> {
     pub access_key_id: &'a str,
     pub secret_access_key: &'a str,
+}
+
+impl std::fmt::Debug for Credentials<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Credentials")
+            .field("access_key_id", &self.access_key_id)
+            .field("secret_access_key", &"[redacted]")
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -51,6 +60,8 @@ pub enum PresignError {
     ExpiryOutOfRange(u32),
     BadDate,
     BadPath,
+    BadHost,
+    BadRegion,
 }
 
 /// Returns a full `https://` presigned URL.
@@ -58,11 +69,28 @@ pub fn presign(creds: &Credentials, req: &PresignRequest) -> Result<String, Pres
     if req.expires_secs == 0 || req.expires_secs > MAX_EXPIRES_SECS {
         return Err(PresignError::ExpiryOutOfRange(req.expires_secs));
     }
-    if req.amz_date.len() != 16 || !req.amz_date.ends_with('Z') {
+    if !is_amz_date(req.amz_date) {
         return Err(PresignError::BadDate);
     }
-    if !req.path.starts_with('/') {
+    if !req.path.starts_with('/')
+        || req.path.split('/').any(|seg| seg == ".." || seg == ".")
+        || req
+            .path
+            .bytes()
+            .any(|b| b.is_ascii_control() || b == b'?' || b == b'#')
+    {
         return Err(PresignError::BadPath);
+    }
+    if !is_host(req.host) {
+        return Err(PresignError::BadHost);
+    }
+    if req.region.is_empty()
+        || !req
+            .region
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+    {
+        return Err(PresignError::BadRegion);
     }
     let date = &req.amz_date[..8];
     let scope = format!("{date}/{}/s3/aws4_request", req.region);
@@ -92,6 +120,23 @@ pub fn presign(creds: &Credentials, req: &PresignRequest) -> Result<String, Pres
         "https://{}{canonical_path}?{query}&X-Amz-Signature={signature}",
         req.host
     ))
+}
+
+/// Exactly `YYYYMMDDTHHMMSSZ`, ASCII digits only.
+fn is_amz_date(d: &str) -> bool {
+    let b = d.as_bytes();
+    b.len() == 16
+        && b[8] == b'T'
+        && b[15] == b'Z'
+        && b[..8].iter().chain(&b[9..15]).all(u8::is_ascii_digit)
+}
+
+/// A DNS host name: letters, digits, dots and hyphens only.
+fn is_host(h: &str) -> bool {
+    !h.is_empty()
+        && h.len() <= 253
+        && h.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'-')
 }
 
 fn signing_key(secret: &str, date: &str, region: &str) -> Vec<u8> {
@@ -187,6 +232,43 @@ mod tests {
         req.path = "/bucket/my reel.mp4";
         let url = presign(&CREDS, &req).unwrap();
         assert!(url.contains("/bucket/my%20reel.mp4?"), "{url}");
+    }
+
+    #[test]
+    fn debug_output_redacts_the_secret() {
+        let shown = format!("{CREDS:?}");
+        assert!(!shown.contains("wJalrXUtnFEMI"), "{shown}");
+        assert!(shown.contains("AKIAIOSFODNN7EXAMPLE"));
+    }
+
+    #[test]
+    fn rejects_dates_that_are_not_strict_digits() {
+        for bad in [
+            "2013052&T00000Z",
+            "20130524T00000\u{e9}Z",
+            "2013052400000000Z",
+        ] {
+            let mut req = aws_doc_request();
+            req.amz_date = bad;
+            assert_eq!(presign(&CREDS, &req), Err(PresignError::BadDate), "{bad}");
+        }
+    }
+
+    #[test]
+    fn rejects_hosts_and_regions_with_url_characters() {
+        let mut req = aws_doc_request();
+        req.host = "evil.com/x?";
+        assert_eq!(presign(&CREDS, &req), Err(PresignError::BadHost));
+        let mut req = aws_doc_request();
+        req.region = "auto&x=1";
+        assert_eq!(presign(&CREDS, &req), Err(PresignError::BadRegion));
+    }
+
+    #[test]
+    fn rejects_dot_dot_path_segments() {
+        let mut req = aws_doc_request();
+        req.path = "/bucket/../other/key.mp4";
+        assert_eq!(presign(&CREDS, &req), Err(PresignError::BadPath));
     }
 
     #[test]
