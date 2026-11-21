@@ -49,7 +49,7 @@ export function App() {
       </header>
       <main>
         {screen === "queue" && <Queue />}
-        {screen === "upload" && <Upload onQueued={() => setScreen("queue")} />}
+        {screen === "upload" && <Upload onQueued={() => setScreen("queue")} onOpenSlots={() => setScreen("slots")} />}
         {screen === "slots" && <Slots />}
       </main>
       <footer className="border-border mt-10 border-t pt-4">
