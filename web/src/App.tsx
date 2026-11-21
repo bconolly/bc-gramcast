@@ -2,6 +2,7 @@ import { useState } from "react";
 import { Button } from "@/components/ui/button";
 import { Queue } from "@/screens/Queue";
 import { Upload } from "@/screens/Upload";
+import { PAYHIP_URL } from "@/lib/brand";
 
 type Screen = "queue" | "upload";
 
@@ -10,12 +11,18 @@ export function App() {
   return (
     <div className="mx-auto min-h-screen max-w-2xl px-4 py-6">
       <header className="mb-6 flex items-center justify-between gap-4">
-        <div className="flex items-center gap-3">
-          <img src="/brand/bc-monogram.png" alt="" width={40} height={40} className="size-10" />
-          <div>
-            <h1 className="text-xl leading-tight font-semibold">Gramcast</h1>
-            <p className="text-muted-foreground text-xs">by BC Guides</p>
-          </div>
+        <div>
+          <h1 className="text-xl leading-tight font-semibold">Gramcast</h1>
+          <a
+            href={PAYHIP_URL}
+            target="_blank"
+            rel="noopener noreferrer"
+            aria-label="BC Guides on Payhip"
+            className="text-muted-foreground mt-1 flex items-center gap-2 text-xs hover:underline"
+          >
+            <img src="/brand/bc-monogram.png" alt="" width={24} height={24} className="size-6" />
+            <span>by BC Guides</span>
+          </a>
         </div>
         <nav className="flex gap-1" aria-label="Screens">
           <Button
@@ -37,8 +44,19 @@ export function App() {
       <main>
         {screen === "queue" ? <Queue /> : <Upload onQueued={() => setScreen("queue")} />}
       </main>
-      <footer className="border-border mt-10 border-t pt-4">
-        <img src="/brand/bc-guides-logo-h.png" alt="BC Guides" width={206} height={64} className="h-16 w-auto" />
+      <footer className="border-border mt-10 flex flex-col items-start justify-between gap-1 border-t pt-4 sm:flex-row sm:items-center">
+        <div className="flex items-center gap-2 text-[13px] text-[#52525b]">
+          <img src="/brand/bc-monogram.png" alt="" width={24} height={24} className="size-6" />
+          <span>Made by BC Guides</span>
+        </div>
+        <a
+          href={PAYHIP_URL}
+          target="_blank"
+          rel="noopener noreferrer"
+          className="inline-flex min-h-11 items-center text-[13px] font-medium text-[#2b7363] hover:underline"
+        >
+          Shop the guides →
+        </a>
       </footer>
     </div>
   );

@@ -2,6 +2,7 @@ import { render, screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { App } from "@/App";
+import { PAYHIP_URL } from "@/lib/brand";
 
 afterEach(() => vi.unstubAllGlobals());
 
@@ -17,19 +18,29 @@ describe("App", () => {
     expect(await screen.findByText("Nothing queued yet.")).toBeInTheDocument();
   });
 
-  it("shows a decorative header logo, the visible byline and an accessible footer logo on both screens", async () => {
+  it("links the header brand and the footer shop link to Payhip on both screens", async () => {
     vi.stubGlobal("fetch", vi.fn().mockImplementation(() => Promise.resolve(new Response("[]"))));
     const user = userEvent.setup();
     render(<App />);
     expect(await screen.findByText("Nothing queued yet.")).toBeInTheDocument();
+    const expectLink = (link: HTMLElement) => {
+      expect(link).toHaveAttribute("href", PAYHIP_URL);
+      expect(link).toHaveAttribute("target", "_blank");
+      expect(link.getAttribute("rel")).toContain("noopener");
+      expect(link.getAttribute("rel")).toContain("noreferrer");
+    };
     const expectBranding = () => {
       const banner = screen.getByRole("banner");
-      expect(within(banner).getByText("by BC Guides")).toBeInTheDocument();
-      expect(within(banner).getByRole("presentation")).toHaveAttribute("src", "/brand/bc-monogram.png");
-      expect(within(banner).queryByAltText("BC Guides")).not.toBeInTheDocument();
-      expect(within(screen.getByRole("contentinfo")).getByAltText("BC Guides")).toBeInTheDocument();
-      expect(screen.getAllByAltText("BC Guides")).toHaveLength(1);
-      expect(screen.queryByText("A BC Guides tool")).not.toBeInTheDocument();
+      const headerLink = within(banner).getByRole("link", { name: "BC Guides on Payhip" });
+      expectLink(headerLink);
+      expect(within(headerLink).getByText("by BC Guides")).toBeInTheDocument();
+      expect(within(headerLink).getByRole("presentation")).toHaveAttribute("src", "/brand/bc-monogram.png");
+      expect(within(banner).getByRole("heading", { name: "Gramcast" }).closest("a")).toBeNull();
+      const footer = screen.getByRole("contentinfo");
+      expect(within(footer).getByText("Made by BC Guides")).toBeInTheDocument();
+      expect(within(footer).getByRole("presentation")).toHaveAttribute("src", "/brand/bc-monogram.png");
+      expectLink(within(footer).getByRole("link", { name: "Shop the guides →" }));
+      expect(screen.queryByAltText("BC Guides")).not.toBeInTheDocument();
     };
     expectBranding();
     await user.click(screen.getByRole("button", { name: "Upload" }));
