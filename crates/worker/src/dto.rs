@@ -3,7 +3,7 @@
 use domain::app::{AppError, InsertError, PortError};
 use domain::media::UploadError;
 use domain::queue::{Platform, QueueError, QueuedPost};
-use domain::slots::SlotError;
+use domain::slots::{SlotError, SlotPattern, SlotRule, Weekday};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Deserialize)]
@@ -84,6 +84,81 @@ pub fn to_json(p: &QueuedPost) -> PostJson {
             domain::queue::PostStatus::NeedsCaption => "needs_caption".into(),
         },
     }
+}
+
+/// Brisbane, which has no daylight saving. Shown until the owner saves a pattern.
+pub const DEFAULT_UTC_OFFSET_MINUTES: i32 = 600;
+pub const DEFAULT_NEXT_COUNT: usize = 5;
+
+#[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct RuleJson {
+    pub weekday: String,
+    pub time: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct PatternJson {
+    pub utc_offset_minutes: i32,
+    pub rules: Vec<RuleJson>,
+}
+
+/// Splits the body into what `app::set_pattern` takes. An unknown weekday or a
+/// badly formed time is `BadTime`.
+pub fn pattern_from_json(body: PatternJson) -> Result<(i32, Vec<SlotRule>), SlotError> {
+    let rules = body
+        .rules
+        .iter()
+        .map(|r| {
+            Ok(SlotRule {
+                weekday: Weekday::parse(&r.weekday).ok_or(SlotError::BadTime)?,
+                minute_of_day: domain::slots::parse_hhmm(&r.time)?,
+            })
+        })
+        .collect::<Result<Vec<_>, SlotError>>()?;
+    Ok((body.utc_offset_minutes, rules))
+}
+
+pub fn pattern_to_json(p: &SlotPattern) -> PatternJson {
+    PatternJson {
+        utc_offset_minutes: p.utc_offset_minutes,
+        rules: p
+            .rules
+            .iter()
+            .map(|r| RuleJson {
+                weekday: r.weekday.as_str().into(),
+                time: domain::slots::format_hhmm(r.minute_of_day),
+            })
+            .collect(),
+    }
+}
+
+pub fn default_pattern_json() -> PatternJson {
+    PatternJson {
+        utc_offset_minutes: DEFAULT_UTC_OFFSET_MINUTES,
+        rules: Vec::new(),
+    }
+}
+
+/// Reads `count` from a raw query string: absent means 5, otherwise plain
+/// ASCII digits in 1..=20. Anything else (repeated, empty, signed, encoded,
+/// non-numeric) is `None`. Never echoed back.
+pub fn parse_next_count(query: Option<&str>) -> Option<usize> {
+    let mut values = query
+        .unwrap_or("")
+        .split('&')
+        .filter_map(|pair| pair.strip_prefix("count="));
+    let Some(value) = values.next() else {
+        return Some(DEFAULT_NEXT_COUNT);
+    };
+    if values.next().is_some() || value.is_empty() || !value.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    value
+        .parse::<usize>()
+        .ok()
+        .filter(|n| (1..=domain::slots::MAX_NEXT_SLOTS).contains(n))
 }
 
 /// Maps the text of a D1 failure to an `InsertError`. UNIQUE violations on the
@@ -380,5 +455,93 @@ mod tests {
         )));
         assert!(!is_json_content_type(Some("application/jsonp")));
         assert!(!is_json_content_type(Some("")));
+    }
+
+    fn rule_json(weekday: &str, time: &str) -> RuleJson {
+        RuleJson {
+            weekday: weekday.into(),
+            time: time.into(),
+        }
+    }
+
+    #[test]
+    fn pattern_json_maps_to_domain_and_back() {
+        let body = PatternJson {
+            utc_offset_minutes: 600,
+            rules: vec![rule_json("wed", "19:00"), rule_json("mon", "06:05")],
+        };
+        let (offset, rules) = pattern_from_json(body).unwrap();
+        let pattern = SlotPattern::new(offset, rules).unwrap();
+        assert_eq!(
+            pattern_to_json(&pattern),
+            PatternJson {
+                utc_offset_minutes: 600,
+                rules: vec![rule_json("mon", "06:05"), rule_json("wed", "19:00")],
+            }
+        );
+    }
+
+    #[test]
+    fn pattern_json_rejects_bad_weekdays_and_times() {
+        for (day, time) in [
+            ("Mon", "06:00"),
+            ("monday", "06:00"),
+            ("mon", "6:00"),
+            ("mon", "24:00"),
+            ("mon", ""),
+        ] {
+            let body = PatternJson {
+                utc_offset_minutes: 0,
+                rules: vec![rule_json(day, time)],
+            };
+            assert_eq!(
+                pattern_from_json(body),
+                Err(SlotError::BadTime),
+                "{day} {time}"
+            );
+        }
+    }
+
+    #[test]
+    fn pattern_json_rejects_unknown_fields() {
+        let r: Result<PatternJson, _> =
+            serde_json::from_str(r#"{"utc_offset_minutes":0,"rules":[],"x":1}"#);
+        assert!(r.is_err());
+        let r: Result<PatternJson, _> = serde_json::from_str(
+            r#"{"utc_offset_minutes":0,"rules":[{"weekday":"mon","time":"06:00","x":1}]}"#,
+        );
+        assert!(r.is_err());
+    }
+
+    #[test]
+    fn the_default_pattern_is_brisbane_with_no_rules() {
+        let json = serde_json::to_string(&default_pattern_json()).unwrap();
+        assert_eq!(json, r#"{"utc_offset_minutes":600,"rules":[]}"#);
+    }
+
+    #[test]
+    fn next_count_is_a_plain_integer_from_one_to_twenty() {
+        assert_eq!(parse_next_count(None), Some(5));
+        assert_eq!(parse_next_count(Some("")), Some(5));
+        assert_eq!(parse_next_count(Some("other=1")), Some(5));
+        assert_eq!(parse_next_count(Some("count=1")), Some(1));
+        assert_eq!(parse_next_count(Some("count=20")), Some(20));
+        assert_eq!(parse_next_count(Some("x=1&count=7")), Some(7));
+        for bad in [
+            "count=0",
+            "count=21",
+            "count=",
+            "count=-1",
+            "count=+3",
+            "count=3.0",
+            "count=abc",
+            "count=%33",
+            "count=1&count=2",
+            "count=99999999999999999999",
+            "count= 3",
+            "count=003x",
+        ] {
+            assert_eq!(parse_next_count(Some(bad)), None, "{bad:?}");
+        }
     }
 }
