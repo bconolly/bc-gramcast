@@ -249,6 +249,35 @@ pub fn local_dev_bypass(
     flag == Some("true") && team_domain.is_none_or(str::is_empty) && host_is_loopback
 }
 
+/// CSRF guard for requests that change state. A browser always sends `Origin`
+/// on these, so when it is there it must be this site: `https://<host>`, or
+/// `http://<host>` only when the Host is loopback (local dev). A request with no
+/// `Origin` does not come from a browser page, so it cannot be cross-site forgery.
+pub fn check_origin(
+    method: &str,
+    origin: Option<&str>,
+    sec_fetch_site: Option<&str>,
+    host: Option<&str>,
+) -> bool {
+    let mutating = ["POST", "PUT", "PATCH", "DELETE"]
+        .iter()
+        .any(|m| method.eq_ignore_ascii_case(m));
+    if !mutating {
+        return true;
+    }
+    if sec_fetch_site.is_some_and(|v| v.eq_ignore_ascii_case("cross-site")) {
+        return false;
+    }
+    let Some(origin) = origin else {
+        return true;
+    };
+    let Some(host) = host.filter(|h| !h.is_empty()) else {
+        return false;
+    };
+    origin.eq_ignore_ascii_case(&format!("https://{host}"))
+        || (is_loopback_host(Some(host)) && origin.eq_ignore_ascii_case(&format!("http://{host}")))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -616,5 +645,139 @@ mod tests {
         ] {
             assert!(!local_dev_bypass(flag, None, true), "{flag:?}");
         }
+    }
+    #[test]
+    fn origin_allows_safe_methods_whatever_the_headers() {
+        for m in ["GET", "HEAD", "OPTIONS"] {
+            assert!(check_origin(
+                m,
+                Some("https://evil.example"),
+                Some("cross-site"),
+                Some("a.example")
+            ));
+        }
+    }
+
+    #[test]
+    fn origin_allows_a_matching_origin_on_mutating_methods() {
+        for m in ["POST", "PUT", "PATCH", "DELETE"] {
+            assert!(
+                check_origin(
+                    m,
+                    Some("https://app.example"),
+                    Some("same-origin"),
+                    Some("app.example")
+                ),
+                "{m}"
+            );
+            assert!(
+                check_origin(
+                    m,
+                    Some("http://127.0.0.1:8787"),
+                    None,
+                    Some("127.0.0.1:8787")
+                ),
+                "{m}"
+            );
+            assert!(
+                check_origin(m, Some("HTTPS://APP.example"), None, Some("app.EXAMPLE")),
+                "{m}"
+            );
+        }
+    }
+
+    #[test]
+    fn origin_allows_a_missing_origin() {
+        assert!(check_origin("POST", None, None, Some("app.example")));
+        assert!(check_origin(
+            "POST",
+            None,
+            Some("same-origin"),
+            Some("app.example")
+        ));
+        assert!(check_origin("POST", None, Some("none"), None));
+    }
+
+    #[test]
+    fn origin_refuses_cross_site_fetches() {
+        assert!(!check_origin(
+            "POST",
+            None,
+            Some("cross-site"),
+            Some("app.example")
+        ));
+        assert!(!check_origin(
+            "POST",
+            None,
+            Some("Cross-Site"),
+            Some("app.example")
+        ));
+        // Even a matching Origin does not rescue a cross-site fetch.
+        assert!(!check_origin(
+            "POST",
+            Some("https://app.example"),
+            Some("cross-site"),
+            Some("app.example")
+        ));
+    }
+
+    #[test]
+    fn origin_refuses_other_origins_and_odd_values() {
+        for origin in [
+            "null",
+            "",
+            "https://evil.example",
+            "https://app.example.evil.example",
+            "https://evil.example/app.example",
+            "https://app.example/",
+            "https://app.example:8443",
+            "ftp://app.example",
+            "app.example",
+            "https://app.example@evil.example",
+            "https://app.example ",
+        ] {
+            assert!(
+                !check_origin("POST", Some(origin), None, Some("app.example")),
+                "{origin:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn origin_refuses_an_origin_when_the_host_is_missing() {
+        assert!(!check_origin(
+            "POST",
+            Some("https://app.example"),
+            None,
+            None
+        ));
+    }
+
+    #[test]
+    fn origin_accepts_http_only_for_a_loopback_host() {
+        assert!(check_origin(
+            "POST",
+            Some("http://localhost:8787"),
+            None,
+            Some("localhost:8787")
+        ));
+        assert!(!check_origin(
+            "POST",
+            Some("http://app.example"),
+            None,
+            Some("app.example")
+        ));
+        assert!(!check_origin(
+            "PUT",
+            Some("http://app.example:8443"),
+            None,
+            Some("app.example:8443")
+        ));
+        assert!(check_origin(
+            "PUT",
+            Some("https://localhost:8787"),
+            None,
+            Some("localhost:8787")
+        ));
     }
 }

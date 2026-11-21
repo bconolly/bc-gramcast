@@ -25,7 +25,7 @@ mod entry {
     async fn require_owner(req: &Request, env: &Env) -> Result<Option<Response>> {
         let header = |name: &str| req.headers().get(name).ok().flatten();
         let method = req.method().to_string();
-        let origin_ok = dto::is_same_origin(
+        let origin_ok = auth::check_origin(
             &method,
             header("Origin").as_deref(),
             header("Sec-Fetch-Site").as_deref(),
