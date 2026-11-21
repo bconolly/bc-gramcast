@@ -1,9 +1,13 @@
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { Upload } from "@/screens/Upload";
 
 const PUT_URL = "https://acct.r2.cloudflarestorage.com/b/videos/x.mp4?X-Amz-Signature=topsecret";
+// Brisbane (+10:00) slots. Labels worked out independently with Python datetime.
+const SLOT_A = 4076298000; // Wed 04/03/2099 19:00
+const SLOT_B = 4076433000; // Fri 06/03/2099 08:30
+const SLOT_C = 4076902800; // Wed 11/03/2099 19:00
 
 afterEach(() => vi.unstubAllGlobals());
 
@@ -193,5 +197,164 @@ describe("Upload", () => {
     expect(screen.getByRole("button", { name: "Queueing…" })).toBeDisabled();
     release(new Response("nope", { status: 500 }));
     await screen.findByRole("alert");
+  });
+});
+
+async function fillWithoutWhen(user: ReturnType<typeof userEvent.setup>) {
+  await user.upload(
+    screen.getByLabelText("Video (MP4)"),
+    new File(["abc"], "reel.mp4", { type: "video/mp4" }),
+  );
+  await user.type(screen.getByLabelText("Title"), "Sunday reel");
+  await user.click(screen.getByLabelText("Instagram"));
+}
+
+const slotsReply = (...slots: number[]) => json({ slots });
+const queuedBody = (fn: ReturnType<typeof stubApi>) =>
+  JSON.parse((apiCalls(fn).at(-1) as [string, RequestInit])[1].body as string);
+
+describe("Upload slot picker", () => {
+  it("fetches the pattern and the next five slots together on mount", async () => {
+    const fn = stubApi({ slotReplies: [slotsReply(SLOT_A)] });
+    render(<Upload onQueued={vi.fn()} onOpenSlots={vi.fn()} />);
+    await screen.findByRole("radio", { name: "Wed 04/03/2099 19:00" });
+    const urls = fn.mock.calls.map((c) => c[0]);
+    expect(urls).toHaveLength(2);
+    expect(urls).toContain("/api/slots/pattern");
+    expect(urls).toContain("/api/slots/next?count=5");
+  });
+
+  it("lists the slots in the pattern's offset with the first preselected", async () => {
+    stubApi({ slotReplies: [slotsReply(SLOT_A, SLOT_B, SLOT_C)] });
+    render(<Upload onQueued={vi.fn()} onOpenSlots={vi.fn()} />);
+    const group = await screen.findByRole("group", { name: "When" });
+    const radios = within(group).getAllByRole("radio");
+    expect(radios.map((r) => r.closest("label")?.textContent)).toEqual([
+      "Wed 04/03/2099 19:00",
+      "Fri 06/03/2099 08:30",
+      "Wed 11/03/2099 19:00",
+      "Pick another time",
+    ]);
+    expect(radios[0]).toBeChecked();
+    expect(screen.queryByLabelText("Date and time")).not.toBeInTheDocument();
+  });
+
+  it("queues with the first slot's Unix seconds by default", async () => {
+    const fn = stubApi({
+      slotReplies: [slotsReply(SLOT_A, SLOT_B)],
+      api: [ticket(), new Response(""), new Response("{}", { status: 201 })],
+    });
+    const onQueued = vi.fn();
+    const user = userEvent.setup();
+    render(<Upload onQueued={onQueued} onOpenSlots={vi.fn()} />);
+    await screen.findByRole("radio", { name: "Wed 04/03/2099 19:00" });
+    await fillWithoutWhen(user);
+    await user.click(screen.getByRole("button", { name: "Queue post" }));
+    await waitFor(() => expect(onQueued).toHaveBeenCalledTimes(1));
+    expect(queuedBody(fn).slot_at).toBe(SLOT_A);
+  });
+
+  it("queues with another listed slot when it is chosen", async () => {
+    const fn = stubApi({
+      slotReplies: [slotsReply(SLOT_A, SLOT_B)],
+      api: [ticket(), new Response(""), new Response("{}", { status: 201 })],
+    });
+    const onQueued = vi.fn();
+    const user = userEvent.setup();
+    render(<Upload onQueued={onQueued} onOpenSlots={vi.fn()} />);
+    await user.click(await screen.findByRole("radio", { name: "Fri 06/03/2099 08:30" }));
+    await fillWithoutWhen(user);
+    await user.click(screen.getByRole("button", { name: "Queue post" }));
+    await waitFor(() => expect(onQueued).toHaveBeenCalledTimes(1));
+    expect(queuedBody(fn).slot_at).toBe(SLOT_B);
+  });
+
+  it("reveals the date and time input for Pick another time and uses it", async () => {
+    const fn = stubApi({
+      slotReplies: [slotsReply(SLOT_A)],
+      api: [ticket(), new Response(""), new Response("{}", { status: 201 })],
+    });
+    const onQueued = vi.fn();
+    const user = userEvent.setup();
+    render(<Upload onQueued={onQueued} onOpenSlots={vi.fn()} />);
+    await user.click(await screen.findByRole("radio", { name: "Pick another time" }));
+    fireEvent.change(screen.getByLabelText("Date and time"), { target: { value: "2099-03-05T07:04" } });
+    await fillWithoutWhen(user);
+    await user.click(screen.getByRole("button", { name: "Queue post" }));
+    await waitFor(() => expect(onQueued).toHaveBeenCalledTimes(1));
+    expect(queuedBody(fn).slot_at).toBe(new Date(2099, 2, 5, 7, 4).getTime() / 1000);
+  });
+
+  it("asks for a time when Pick another time is chosen but left empty", async () => {
+    stubApi({ slotReplies: [slotsReply(SLOT_A)] });
+    const user = userEvent.setup();
+    render(<Upload onQueued={vi.fn()} onOpenSlots={vi.fn()} />);
+    await user.click(await screen.findByRole("radio", { name: "Pick another time" }));
+    await user.click(screen.getByRole("button", { name: "Queue post" }));
+    expect(await screen.findByRole("alert")).toHaveTextContent("Choose when to publish.");
+  });
+
+  it("falls back to the date and time input with a link to the Slots screen when there are no slots", async () => {
+    stubApi({ slotReplies: [slotsReply()] });
+    const onOpenSlots = vi.fn();
+    const user = userEvent.setup();
+    render(<Upload onQueued={vi.fn()} onOpenSlots={onOpenSlots} />);
+    expect(await screen.findByLabelText("When")).toHaveAttribute("type", "datetime-local");
+    expect(screen.queryByRole("radio")).not.toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "Set your weekly slots" }));
+    expect(onOpenSlots).toHaveBeenCalledTimes(1);
+  });
+
+  it("falls back the same way when the slots cannot be fetched", async () => {
+    stubApi({ slotReplies: [new Response("storage error", { status: 500 })] });
+    render(<Upload onQueued={vi.fn()} onOpenSlots={vi.fn()} />);
+    expect(await screen.findByLabelText("When")).toHaveAttribute("type", "datetime-local");
+    expect(screen.getByRole("button", { name: "Set your weekly slots" })).toBeInTheDocument();
+    expect(screen.queryByRole("radio")).not.toBeInTheDocument();
+  });
+
+  it("refreshes the slots after a taken-slot error, preselects the first and does not upload again", async () => {
+    const fn = stubApi({
+      slotReplies: [slotsReply(SLOT_A, SLOT_B), slotsReply(SLOT_B, SLOT_C)],
+      api: [
+        ticket(),
+        new Response(""),
+        new Response("slot is already taken", { status: 409 }),
+        new Response("{}", { status: 201 }),
+      ],
+    });
+    const onQueued = vi.fn();
+    const user = userEvent.setup();
+    render(<Upload onQueued={onQueued} onOpenSlots={vi.fn()} />);
+    await screen.findByRole("radio", { name: "Wed 04/03/2099 19:00" });
+    await fillWithoutWhen(user);
+    await user.click(screen.getByRole("button", { name: "Queue post" }));
+    expect(await screen.findByRole("alert")).toHaveTextContent("slot is already taken");
+    expect(screen.queryByRole("radio", { name: "Wed 04/03/2099 19:00" })).not.toBeInTheDocument();
+    expect(screen.getByRole("radio", { name: "Fri 06/03/2099 08:30" })).toBeChecked();
+    expect(fn.mock.calls.filter((c) => String(c[0]).startsWith("/api/slots/next"))).toHaveLength(2);
+    await user.click(screen.getByRole("button", { name: "Queue post" }));
+    await waitFor(() => expect(onQueued).toHaveBeenCalledTimes(1));
+    expect(apiCalls(fn).map((c) => c[0])).toEqual([
+      "/api/uploads",
+      PUT_URL,
+      "/api/posts",
+      "/api/posts",
+    ]);
+    expect(queuedBody(fn)).toMatchObject({ video_key: "videos/x.mp4", slot_at: SLOT_B });
+  });
+
+  it("does not refresh the slots after other queue errors", async () => {
+    const fn = stubApi({
+      slotReplies: [slotsReply(SLOT_A)],
+      api: [ticket(), new Response(""), new Response("storage error", { status: 500 })],
+    });
+    const user = userEvent.setup();
+    render(<Upload onQueued={vi.fn()} onOpenSlots={vi.fn()} />);
+    await screen.findByRole("radio", { name: "Wed 04/03/2099 19:00" });
+    await fillWithoutWhen(user);
+    await user.click(screen.getByRole("button", { name: "Queue post" }));
+    expect(await screen.findByRole("alert")).toHaveTextContent("storage error");
+    expect(fn.mock.calls.filter((c) => String(c[0]).startsWith("/api/slots/next"))).toHaveLength(1);
   });
 });
