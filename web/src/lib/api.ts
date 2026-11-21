@@ -69,12 +69,27 @@ async function call(path: string, init?: RequestInit): Promise<Response> {
   return res;
 }
 
-function postJson(path: string, body: unknown): Promise<Response> {
+function sendJson(method: "POST" | "PUT", path: string, body: unknown): Promise<Response> {
   return call(path, {
-    method: "POST",
+    method,
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body),
   });
+}
+
+const postJson = (path: string, body: unknown) => sendJson("POST", path, body);
+
+export type WeekdayId = "mon" | "tue" | "wed" | "thu" | "fri" | "sat" | "sun";
+
+export interface PatternRule {
+  weekday: WeekdayId;
+  /** 24-hour HH:MM. */
+  time: string;
+}
+
+export interface PatternJson {
+  utc_offset_minutes: number;
+  rules: PatternRule[];
 }
 
 export async function getQueue(): Promise<PostJson[]> {
@@ -133,4 +148,19 @@ export async function submitPost(
     platforms: input.platforms,
     slot_at: input.slot_at,
   });
+}
+
+export async function getPattern(): Promise<PatternJson> {
+  return (await call("/api/slots/pattern")).json();
+}
+
+/** Saves the weekly pattern. Resolves to the pattern as the server normalised it. */
+export async function savePattern(pattern: PatternJson): Promise<PatternJson> {
+  return (await sendJson("PUT", "/api/slots/pattern", pattern)).json();
+}
+
+/** The next free pattern slots, as Unix seconds in ascending order. */
+export async function getNextSlots(count: number): Promise<number[]> {
+  const body: { slots: number[] } = await (await call(`/api/slots/next?count=${count}`)).json();
+  return body.slots;
 }
