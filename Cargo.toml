@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/domain", "crates/presign"]
+members = ["crates/domain", "crates/presign", "crates/worker"]
 exclude = ["spike/cpu"]
 
 [workspace.package]
