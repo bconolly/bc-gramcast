@@ -9,7 +9,8 @@ export const DEFAULT_OFFSET_MINUTES = 600;
 export const UTC_OFFSET_OPTIONS: { minutes: number; label: string }[] = [
   { minutes: 480, label: "Perth UTC+8" },
   { minutes: 570, label: "Adelaide/Darwin UTC+9:30" },
-  { minutes: 600, label: "Brisbane UTC+10" },
+  { minutes: 600, label: "Brisbane, Sydney/Melbourne standard UTC+10" },
+  { minutes: 630, label: "Adelaide daylight saving UTC+10:30" },
   { minutes: 660, label: "Sydney/Melbourne daylight saving UTC+11" },
   { minutes: 720, label: "Auckland UTC+12" },
   { minutes: 780, label: "Auckland daylight saving UTC+13" },
@@ -43,6 +44,11 @@ export function offsetLabel(minutes: number): string {
   const abs = Math.abs(minutes);
   const mins = abs % 60 === 0 ? "" : `:${pad(abs % 60)}`;
   return `UTC${minutes < 0 ? "-" : "+"}${Math.floor(abs / 60)}${mins}`;
+}
+
+/** The table's label for an offset, or "UTC+HH:MM" when it is not one of the options. */
+export function offsetName(minutes: number): string {
+  return UTC_OFFSET_OPTIONS.find((o) => o.minutes === minutes)?.label ?? offsetLabel(minutes);
 }
 
 export function weekdayName(id: WeekdayId): string {

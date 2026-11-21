@@ -41,7 +41,7 @@ describe("App", () => {
     expect(await screen.findByLabelText("UTC offset")).toBeInTheDocument();
   });
 
-  it("links the header brand and the footer promo link to Payhip on both screens", async () => {
+  it("links the header brand and the footer promo link to Payhip on all three screens", async () => {
     stubEmptyApi();
     const user = userEvent.setup();
     render(<App />);

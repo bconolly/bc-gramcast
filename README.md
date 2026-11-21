@@ -67,6 +67,11 @@ All endpoints answer only to the owner (see Run locally). Request bodies are JSO
 
 ## Known gaps for later slices
 - The slot pattern's UTC offset is fixed, so daylight saving is not adjusted (Brisbane has none). Change the offset by hand when your clocks change.
+- The Upload screen gets the offset and the slots from two separate calls, so saving the pattern between them can show a stale offset. Fix later by returning the offset with the slots.
+- The Slots screen has no retry after a load error and does not warn about unsaved edits.
+- The time input follows the browser's locale for 12 or 24 hour display.
+- Carry-over from review: add `nosniff` and `no-store` headers on `/api` responses, and re-check the object size at publish (see below).
+- `next_slots` reads all posts. Later, query only posts with a future `slot_at`.
 - Re-check the object's size and type with `head()` in the publish use case: the 15 minute upload link can still overwrite the object after the post is queued.
 - Delete rejected and orphaned uploads (add an R2 lifecycle rule as a backstop).
 - In the sign-in slice, put Cloudflare Access in front of every hostname, or set `workers_dev = false` and `preview_urls = false`, and validate the Access JWT in `require_owner`.

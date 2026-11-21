@@ -24,7 +24,7 @@ function RuleList({ rules, onRemove }: { rules: PatternRule[]; onRemove: (r: Pat
         return (
           <li key={`${r.weekday}@${r.time}`} className="flex items-center justify-between gap-3 py-1 pr-1 pl-3">
             <span className="tabular-nums">{text}</span>
-            <Button type="button" variant="ghost" aria-label={`Remove ${text}`} onClick={() => onRemove(r)}>
+            <Button type="button" variant="ghost" className="min-h-11" aria-label={`Remove ${text}`} onClick={() => onRemove(r)}>
               Remove
             </Button>
           </li>

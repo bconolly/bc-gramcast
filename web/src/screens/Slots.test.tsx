@@ -36,12 +36,12 @@ describe("Slots", () => {
     expect(screen.getByLabelText("UTC offset")).toHaveValue("600");
   });
 
-  it("offers the six offsets", async () => {
+  it("offers the seven offsets", async () => {
     stub({ utc_offset_minutes: 600, rules: [] });
     render(<Slots />);
     const select = await screen.findByLabelText("UTC offset");
     expect(within(select).getAllByRole("option").map((o) => (o as HTMLOptionElement).value)).toEqual([
-      "480", "570", "600", "660", "720", "780",
+      "480", "570", "600", "630", "660", "720", "780",
     ]);
   });
 
@@ -78,6 +78,12 @@ describe("Slots", () => {
     await user.click(screen.getByRole("button", { name: "Add slot" }));
     expect(screen.getAllByRole("listitem")).toHaveLength(1);
     expect(screen.getByRole("alert")).toHaveTextContent("Choose a time.");
+  });
+
+  it("makes the Remove buttons at least 44px tall", async () => {
+    stub({ utc_offset_minutes: 600, rules: [WED] });
+    render(<Slots />);
+    expect(await screen.findByRole("button", { name: "Remove Wednesday 19:00" })).toHaveClass("min-h-11");
   });
 
   it("removes a rule", async () => {
