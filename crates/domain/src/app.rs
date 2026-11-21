@@ -3,6 +3,7 @@
 
 use crate::media::{UploadError, VideoUpload, MAX_UPLOAD_BYTES};
 use crate::queue::{validate_slot, Queue, QueueError, QueuedPost};
+use crate::slots::{next_free_slots, SlotError, SlotPattern};
 
 /// How long an upload link stays valid.
 pub const UPLOAD_LINK_SECS: u32 = 15 * 60;
@@ -38,6 +39,14 @@ pub trait PostRepository {
     async fn insert(&self, post: &QueuedPost) -> Result<(), InsertError>;
 }
 
+/// Persistence port for the owner's weekly slot pattern (one per account).
+#[allow(async_fn_in_trait)]
+pub trait SlotPatternRepository {
+    /// `None` until the owner has saved a pattern.
+    async fn get(&self) -> Result<Option<SlotPattern>, PortError>;
+    async fn save(&self, pattern: &SlotPattern) -> Result<(), PortError>;
+}
+
 /// Storage port: what is actually in the bucket. The signed upload link can't
 /// enforce a size, so we check after the upload.
 #[allow(async_fn_in_trait)]
@@ -52,6 +61,7 @@ pub enum AppError {
     VideoNotUploaded,
     Upload(UploadError),
     Queue(QueueError),
+    Slots(SlotError),
     Port(PortError),
 }
 
@@ -112,11 +122,49 @@ pub async fn upcoming(repo: &impl PostRepository, now: i64) -> Result<Vec<Queued
     Ok(queue.upcoming(now).into_iter().cloned().collect())
 }
 
+pub async fn get_pattern(
+    repo: &impl SlotPatternRepository,
+) -> Result<Option<SlotPattern>, AppError> {
+    repo.get().await.map_err(AppError::Port)
+}
+
+/// Validates through `SlotPattern::new`, saves, and returns the normalised pattern.
+pub async fn set_pattern(
+    repo: &impl SlotPatternRepository,
+    utc_offset_minutes: i32,
+    rules: Vec<crate::slots::SlotRule>,
+) -> Result<SlotPattern, AppError> {
+    let pattern = SlotPattern::new(utc_offset_minutes, rules).map_err(AppError::Slots)?;
+    repo.save(&pattern).await.map_err(AppError::Port)?;
+    Ok(pattern)
+}
+
+/// The next free slots after the queued posts. No saved pattern means none.
+pub async fn next_slots(
+    patterns: &impl SlotPatternRepository,
+    posts: &impl PostRepository,
+    now: i64,
+    count: usize,
+) -> Result<Vec<i64>, AppError> {
+    let Some(pattern) = patterns.get().await.map_err(AppError::Port)? else {
+        return Ok(Vec::new());
+    };
+    let taken: Vec<i64> = posts
+        .all()
+        .await
+        .map_err(AppError::Port)?
+        .iter()
+        .map(|p| p.slot_at)
+        .collect();
+    Ok(next_free_slots(&pattern, &taken, now, count))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::media::MAX_UPLOAD_BYTES;
     use crate::queue::Platform;
+    use crate::slots::{SlotRule, Weekday};
     use std::cell::RefCell;
 
     struct FakeSigner;
@@ -365,5 +413,97 @@ mod tests {
         let e = pollster::block_on(queue_post(&repo, &BrokenStore, 0, post("a", 100)));
         assert_eq!(e, Err(AppError::Port(PortError("r2 down".into()))));
         assert!(repo.posts.borrow().is_empty());
+    }
+
+    #[derive(Default)]
+    struct FakePatterns {
+        stored: RefCell<Option<SlotPattern>>,
+        fail: bool,
+    }
+    impl SlotPatternRepository for FakePatterns {
+        async fn get(&self) -> Result<Option<SlotPattern>, PortError> {
+            if self.fail {
+                return Err(PortError("d1 down".into()));
+            }
+            Ok(self.stored.borrow().clone())
+        }
+        async fn save(&self, p: &SlotPattern) -> Result<(), PortError> {
+            if self.fail {
+                return Err(PortError("d1 down".into()));
+            }
+            *self.stored.borrow_mut() = Some(p.clone());
+            Ok(())
+        }
+    }
+
+    fn rule(weekday: Weekday, h: u16) -> SlotRule {
+        SlotRule {
+            weekday,
+            minute_of_day: h * 60,
+        }
+    }
+
+    #[test]
+    fn set_pattern_saves_and_returns_the_sorted_pattern() {
+        let repo = FakePatterns::default();
+        let rules = vec![rule(Weekday::Wed, 19), rule(Weekday::Mon, 6)];
+        let saved = pollster::block_on(set_pattern(&repo, 600, rules)).unwrap();
+        assert_eq!(saved.rules[0], rule(Weekday::Mon, 6));
+        assert_eq!(pollster::block_on(get_pattern(&repo)), Ok(Some(saved)));
+    }
+
+    #[test]
+    fn set_pattern_maps_validation_errors_and_saves_nothing() {
+        let repo = FakePatterns::default();
+        let e = pollster::block_on(set_pattern(&repo, 900, vec![]));
+        assert_eq!(e, Err(AppError::Slots(SlotError::OffsetOutOfRange)));
+        let dup = vec![rule(Weekday::Mon, 6), rule(Weekday::Mon, 6)];
+        let e = pollster::block_on(set_pattern(&repo, 0, dup));
+        assert_eq!(e, Err(AppError::Slots(SlotError::DuplicateRule)));
+        assert!(repo.stored.borrow().is_none());
+    }
+
+    #[test]
+    fn set_pattern_surfaces_a_storage_failure() {
+        let repo = FakePatterns {
+            fail: true,
+            ..Default::default()
+        };
+        let e = pollster::block_on(set_pattern(&repo, 0, vec![]));
+        assert_eq!(e, Err(AppError::Port(PortError("d1 down".into()))));
+        let e = pollster::block_on(get_pattern(&repo));
+        assert_eq!(e, Err(AppError::Port(PortError("d1 down".into()))));
+    }
+
+    #[test]
+    fn next_slots_skips_slots_already_queued() {
+        let patterns = FakePatterns::default();
+        // 1970-01-01 is a Thursday: Thursday 00:00 UTC each week.
+        pollster::block_on(set_pattern(&patterns, 0, vec![rule(Weekday::Thu, 0)])).unwrap();
+        let posts = FakeRepo::default();
+        posts.posts.borrow_mut().push(post("a", 604_800));
+        let got = pollster::block_on(next_slots(&patterns, &posts, 0, 2)).unwrap();
+        assert_eq!(got, vec![1_209_600, 1_814_400]);
+    }
+
+    #[test]
+    fn next_slots_is_empty_without_a_pattern() {
+        let got = pollster::block_on(next_slots(
+            &FakePatterns::default(),
+            &FakeRepo::default(),
+            0,
+            5,
+        ));
+        assert_eq!(got, Ok(vec![]));
+    }
+
+    #[test]
+    fn next_slots_surfaces_storage_failures() {
+        let broken = FakePatterns {
+            fail: true,
+            ..Default::default()
+        };
+        let e = pollster::block_on(next_slots(&broken, &FakeRepo::default(), 0, 5));
+        assert_eq!(e, Err(AppError::Port(PortError("d1 down".into()))));
     }
 }

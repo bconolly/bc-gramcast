@@ -3,6 +3,7 @@
 use domain::app::{AppError, InsertError, PortError};
 use domain::media::UploadError;
 use domain::queue::{Platform, QueueError, QueuedPost};
+use domain::slots::SlotError;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Deserialize)]
@@ -150,6 +151,15 @@ pub fn error_status(e: &AppError) -> (u16, &'static str) {
             QueueError::SlotInPast => (422, "slot must be in the future"),
             QueueError::SlotOutOfRange => (422, "slot is out of range"),
         },
+        AppError::Slots(s) => (
+            422,
+            match s {
+                SlotError::OffsetOutOfRange => "UTC offset is out of range",
+                SlotError::TooManyRules => "too many slot rules",
+                SlotError::DuplicateRule => "each slot can be set once",
+                SlotError::BadTime => "weekday or time is not valid",
+            },
+        ),
         AppError::Port(_) => (500, "storage error"),
     }
 }
@@ -274,6 +284,26 @@ mod tests {
                 AppError::Queue(QueueError::SlotOutOfRange),
                 422,
                 "slot is out of range",
+            ),
+            (
+                AppError::Slots(SlotError::OffsetOutOfRange),
+                422,
+                "UTC offset is out of range",
+            ),
+            (
+                AppError::Slots(SlotError::TooManyRules),
+                422,
+                "too many slot rules",
+            ),
+            (
+                AppError::Slots(SlotError::DuplicateRule),
+                422,
+                "each slot can be set once",
+            ),
+            (
+                AppError::Slots(SlotError::BadTime),
+                422,
+                "weekday or time is not valid",
             ),
         ];
         for (err, code, msg) in cases {
