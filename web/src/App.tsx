@@ -10,7 +10,13 @@ export function App() {
   return (
     <div className="mx-auto min-h-screen max-w-2xl px-4 py-6">
       <header className="mb-6 flex items-center justify-between gap-4">
-        <h1 className="text-xl font-semibold">Gramcast</h1>
+        <div className="flex items-center gap-3">
+          <img src="/brand/bc-monogram.png" alt="BC Guides" width={40} height={40} className="size-10" />
+          <div>
+            <h1 className="text-xl leading-tight font-semibold">Gramcast</h1>
+            <p className="text-muted-foreground text-xs">by BC Guides</p>
+          </div>
+        </div>
         <nav className="flex gap-1" aria-label="Screens">
           <Button
             variant={screen === "queue" ? "default" : "ghost"}
@@ -31,6 +37,10 @@ export function App() {
       <main>
         {screen === "queue" ? <Queue /> : <Upload onQueued={() => setScreen("queue")} />}
       </main>
+      <footer className="border-border text-muted-foreground mt-10 flex items-center gap-3 border-t pt-4 text-sm">
+        <img src="/brand/bc-guides-logo-h.png" alt="" width={131} height={40} className="h-10 w-auto" />
+        <span>A BC Guides tool</span>
+      </footer>
     </div>
   );
 }
