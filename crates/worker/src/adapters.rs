@@ -257,12 +257,25 @@ thread_local! {
     static KEYS: RefCell<KeyCache<JsValue>> = const { RefCell::new(KeyCache::new_const()) };
 }
 
-/// How many times a request waits for another request's key fetch, and for how long each time.
-const WAIT_POLLS: u32 = 8;
-const WAIT_STEP_MS: u64 = 250;
-
 fn now_secs() -> i64 {
     (worker::Date::now().as_millis() / 1000) as i64
+}
+
+/// If the request that is fetching the keys is dropped (the client went away),
+/// this marks the fetch as failed so the cache is not left "fetching" until the
+/// timeout. It cannot be unit tested natively (it needs the wasm runtime); the
+/// logic it calls, `KeyCache::fetch_failed`, is tested in the domain.
+struct FetchGuard {
+    started: i64,
+    finished: bool,
+}
+
+impl Drop for FetchGuard {
+    fn drop(&mut self) {
+        if !self.finished {
+            KEYS.with(|c| c.borrow_mut().fetch_failed(self.started, now_secs()));
+        }
+    }
 }
 
 pub struct AccessVerifier {
@@ -275,18 +288,17 @@ impl AccessVerifier {
         Self { certs_url }
     }
 
-    fn lookup(kid: &str) -> KeyLookup<JsValue> {
-        KEYS.with(|c| c.borrow_mut().lookup(kid, now_secs()))
-    }
-
-    /// Asks the cache, and waits a little while another request is fetching.
+    /// Asks the cache and sleeps while another request is fetching. All the
+    /// decisions are the domain's (`KeyCache`).
     async fn key_for(&self, kid: &str) -> Result<JsValue, VerifyError> {
-        for _ in 0..WAIT_POLLS {
-            match Self::lookup(kid) {
+        for _ in 0..keycache::WAIT_POLLS {
+            let now = now_secs();
+            let lookup = KEYS.with(|c| c.borrow_mut().lookup(kid, now));
+            match lookup {
                 KeyLookup::Use(key) => return Ok(key),
-                KeyLookup::Fetch => return self.fetch_and_find(kid).await,
+                KeyLookup::Fetch => return self.fetch_and_find(kid, now).await,
                 KeyLookup::Wait => {
-                    Delay::from(Duration::from_millis(WAIT_STEP_MS)).await;
+                    Delay::from(Duration::from_millis(keycache::WAIT_STEP_MS)).await;
                 }
                 other => return Err(failure(&other)),
             }
@@ -294,25 +306,15 @@ impl AccessVerifier {
         Err(unavailable("keys still loading"))
     }
 
-    /// This request does the fetch. After a good fetch a missing key id is
-    /// definitely unknown (401). After a failed one, any stale key still serves.
-    async fn fetch_and_find(&self, kid: &str) -> Result<JsValue, VerifyError> {
-        match self.refresh().await {
-            Ok(keys) => {
-                KEYS.with(|c| c.borrow_mut().store(keys, now_secs()));
-                match Self::lookup(kid) {
-                    KeyLookup::Use(key) => Ok(key),
-                    _ => Err(VerifyError::UnknownKey),
-                }
-            }
-            Err(_) => {
-                KEYS.with(|c| c.borrow_mut().fetch_failed(now_secs()));
-                match Self::lookup(kid) {
-                    KeyLookup::Use(key) => Ok(key),
-                    other => Err(failure(&other)),
-                }
-            }
-        }
+    /// This request does the fetch (begun at `started`).
+    async fn fetch_and_find(&self, kid: &str, started: i64) -> Result<JsValue, VerifyError> {
+        let mut guard = FetchGuard {
+            started,
+            finished: false,
+        };
+        let keys = self.refresh().await.ok();
+        guard.finished = true;
+        KEYS.with(|c| c.borrow_mut().fetched(kid, started, keys, now_secs()))
     }
 
     async fn refresh(&self) -> Result<Vec<(String, JsValue)>, PortError> {

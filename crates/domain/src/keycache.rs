@@ -5,6 +5,9 @@ use crate::app::{PortError, VerifyError};
 
 /// How long fetched keys are used without a refresh.
 pub const KEY_TTL_SECS: i64 = 3600;
+/// How many times a request waits for another request's fetch, and for how long each time.
+pub const WAIT_POLLS: u32 = 8;
+pub const WAIT_STEP_MS: u64 = 250;
 /// Past this age, cached keys are no longer used even when a refresh keeps failing.
 pub const MAX_STALE_SECS: i64 = 24 * 3600;
 /// A fetch with no answer after this long is treated as lost.
@@ -107,19 +110,60 @@ impl<K: Clone> KeyCache<K> {
         }
     }
 
-    /// The fetch that `lookup` asked for failed. Keeps the old keys and the
-    /// one-a-minute gap, and ends the wait for other requests.
-    pub fn fetch_failed(&mut self, now: i64) {
+    /// The fetch that `lookup` asked for (it returned `Fetch` at `started`)
+    /// failed. Keeps the old keys and the one-a-minute gap, and ends the wait
+    /// for other requests. Ignored if a newer fetch has since begun.
+    pub fn fetch_failed(&mut self, started: i64, now: i64) -> bool {
+        if self.fetching_since != Some(started) {
+            return false;
+        }
         self.fetching_since = None;
         self.last_fetch = Some(now);
+        true
     }
 
-    /// Replaces the cached keys after a successful fetch.
-    pub fn store(&mut self, keys: Vec<(String, K)>, now: i64) {
+    /// Replaces the cached keys after a successful fetch begun at `started`.
+    /// Returns false, changing nothing, if that fetch was superseded by a newer one.
+    pub fn store(&mut self, keys: Vec<(String, K)>, started: i64, now: i64) -> bool {
+        if self.fetching_since != Some(started) {
+            return false;
+        }
         self.fetching_since = None;
         self.keys = keys;
         self.loaded_at = Some(now);
+        true
     }
+
+    /// Records the outcome of the fetch begun at `started` (`None` if it
+    /// failed) and answers the request that did the fetch. After a good fetch
+    /// a missing key id is definitely unknown (401). After a failed one a
+    /// stale key still serves, and otherwise the lookup's failure applies (503).
+    /// A fetch that was superseded by a newer one changes nothing and answers 503.
+    pub fn fetched(
+        &mut self,
+        kid: &str,
+        started: i64,
+        keys: Option<Vec<(String, K)>>,
+        now: i64,
+    ) -> Result<K, VerifyError> {
+        let good = keys.is_some();
+        let applied = match keys {
+            Some(keys) => self.store(keys, started, now),
+            None => self.fetch_failed(started, now),
+        };
+        if !applied {
+            return Err(unavailable("fetch superseded"));
+        }
+        match self.lookup(kid, now) {
+            KeyLookup::Use(key) => Ok(key),
+            _ if good => Err(VerifyError::UnknownKey),
+            other => Err(lookup_failure(&other).unwrap_or_else(|| unavailable("keys unavailable"))),
+        }
+    }
+}
+
+fn unavailable(text: &str) -> VerifyError {
+    VerifyError::Unavailable(PortError(text.into()))
 }
 
 #[cfg(test)]
@@ -129,7 +173,7 @@ mod tests {
     fn loaded(now: i64) -> KeyCache<u32> {
         let mut c = KeyCache::new();
         assert_eq!(c.lookup("a", now), KeyLookup::Fetch);
-        c.store(vec![("a".into(), 1), ("b".into(), 2)], now);
+        c.store(vec![("a".into(), 1), ("b".into(), 2)], now, now);
         c
     }
 
@@ -137,7 +181,7 @@ mod tests {
     fn an_empty_cache_asks_for_a_fetch_once_then_is_unavailable_for_a_minute() {
         let mut c: KeyCache<u32> = KeyCache::new();
         assert_eq!(c.lookup("a", 1000), KeyLookup::Fetch);
-        c.fetch_failed(1000);
+        c.fetch_failed(1000, 1000);
         assert_eq!(
             c.lookup("a", 1000 + MIN_FETCH_GAP_SECS - 1),
             KeyLookup::Unavailable
@@ -151,7 +195,7 @@ mod tests {
         assert_eq!(c.lookup("a", 1000), KeyLookup::Fetch);
         assert_eq!(c.lookup("a", 1001), KeyLookup::Wait);
         assert_eq!(c.lookup("zzz", 1002), KeyLookup::Wait);
-        c.store(vec![("a".into(), 1)], 1002);
+        c.store(vec![("a".into(), 1)], 1000, 1002);
         assert_eq!(c.lookup("a", 1003), KeyLookup::Use(1));
     }
 
@@ -159,7 +203,7 @@ mod tests {
     fn a_failed_fetch_ends_the_wait() {
         let mut c: KeyCache<u32> = KeyCache::new();
         assert_eq!(c.lookup("a", 1000), KeyLookup::Fetch);
-        c.fetch_failed(1001);
+        c.fetch_failed(1000, 1001);
         assert_eq!(c.lookup("a", 1002), KeyLookup::Unavailable);
     }
 
@@ -200,7 +244,7 @@ mod tests {
         let mut c = loaded(1000);
         assert_eq!(c.lookup("zzz", 1030), KeyLookup::Throttled);
         assert_eq!(c.lookup("zzz", 1000 + MIN_FETCH_GAP_SECS), KeyLookup::Fetch);
-        c.fetch_failed(1060);
+        c.fetch_failed(1060, 1060);
         for t in 0..MIN_FETCH_GAP_SECS {
             assert_eq!(c.lookup("zzz", 1060 + t), KeyLookup::Throttled, "t={t}");
         }
@@ -212,7 +256,7 @@ mod tests {
         let mut c = loaded(1000);
         let t = 1000 + KEY_TTL_SECS;
         assert_eq!(c.lookup("a", t), KeyLookup::Fetch);
-        c.store(vec![("c".into(), 3)], t);
+        c.store(vec![("c".into(), 3)], t, t);
         // Rotation: the old ids are gone, the new one is used.
         assert_eq!(c.lookup("c", t + 1), KeyLookup::Use(3));
         assert_eq!(c.lookup("a", t + 1), KeyLookup::Throttled);
@@ -223,7 +267,7 @@ mod tests {
         let mut c = loaded(1000);
         let stale = 1000 + KEY_TTL_SECS + 5;
         assert_eq!(c.lookup("a", stale), KeyLookup::Fetch);
-        c.fetch_failed(stale);
+        c.fetch_failed(stale, stale);
         assert_eq!(c.lookup("a", stale + 1), KeyLookup::Use(1));
         assert_eq!(c.lookup("a", stale + MIN_FETCH_GAP_SECS), KeyLookup::Fetch);
     }
@@ -233,13 +277,13 @@ mod tests {
         let mut c = loaded(1000);
         let last_ok = 1000 + MAX_STALE_SECS - 1;
         assert_eq!(c.lookup("a", last_ok), KeyLookup::Fetch);
-        c.fetch_failed(last_ok);
+        c.fetch_failed(last_ok, last_ok);
         assert_eq!(c.lookup("a", last_ok + 1), KeyLookup::Unavailable);
         // One second earlier the key would still have served.
         let mut c = loaded(1000);
         let t = 1000 + MAX_STALE_SECS - 2;
         assert_eq!(c.lookup("a", t), KeyLookup::Fetch);
-        c.fetch_failed(t);
+        c.fetch_failed(t, t);
         assert_eq!(c.lookup("a", t + 1), KeyLookup::Use(1));
     }
 
@@ -263,5 +307,72 @@ mod tests {
                 "{l:?}"
             );
         }
+    }
+
+    #[test]
+    fn a_cached_kid_older_than_a_day_waits_during_a_refresh() {
+        let mut c = loaded(1000);
+        let t = 1000 + MAX_STALE_SECS + 10;
+        assert_eq!(c.lookup("a", t), KeyLookup::Fetch);
+        assert_eq!(c.lookup("a", t + 1), KeyLookup::Wait);
+    }
+
+    #[test]
+    fn a_slow_old_fetch_cannot_disturb_a_newer_one() {
+        let mut c: KeyCache<u32> = KeyCache::new();
+        assert_eq!(c.lookup("a", 1000), KeyLookup::Fetch); // fetch A, then it hangs
+        assert_eq!(c.lookup("a", 1060), KeyLookup::Fetch); // fetch B starts
+                                                           // A fails late: B's marker stays, so requests still wait for B.
+        c.fetch_failed(1000, 1070);
+        assert_eq!(c.lookup("a", 1071), KeyLookup::Wait);
+        // B lands, then A's late result must not overwrite B's keys.
+        assert!(c.store(vec![("new".into(), 2)], 1060, 1075));
+        assert!(!c.store(vec![("old".into(), 1)], 1000, 1080));
+        assert_eq!(c.lookup("new", 1081), KeyLookup::Use(2));
+        assert_eq!(c.lookup("old", 1081), KeyLookup::Throttled);
+    }
+
+    #[test]
+    fn fetched_with_the_kid_present_returns_the_key() {
+        let mut c: KeyCache<u32> = KeyCache::new();
+        assert_eq!(c.lookup("a", 1000), KeyLookup::Fetch);
+        let keys = vec![("a".to_string(), 1), ("b".to_string(), 2)];
+        assert_eq!(c.fetched("a", 1000, Some(keys), 1001), Ok(1));
+    }
+
+    #[test]
+    fn fetched_with_the_kid_missing_is_an_unknown_key() {
+        let mut c: KeyCache<u32> = KeyCache::new();
+        assert_eq!(c.lookup("zzz", 1000), KeyLookup::Fetch);
+        let keys = vec![("a".to_string(), 1)];
+        assert_eq!(
+            c.fetched("zzz", 1000, Some(keys), 1001),
+            Err(VerifyError::UnknownKey)
+        );
+    }
+
+    #[test]
+    fn a_failed_fetch_serves_a_stale_key() {
+        let mut c = loaded(1000);
+        let t = 1000 + KEY_TTL_SECS + 5;
+        assert_eq!(c.lookup("a", t), KeyLookup::Fetch);
+        assert_eq!(c.fetched("a", t, None, t + 1), Ok(1));
+    }
+
+    #[test]
+    fn a_failed_fetch_on_a_cold_cache_is_unavailable() {
+        let mut c: KeyCache<u32> = KeyCache::new();
+        assert_eq!(c.lookup("a", 1000), KeyLookup::Fetch);
+        let r = c.fetched("a", 1000, None, 1001);
+        assert!(matches!(r, Err(VerifyError::Unavailable(_))), "{r:?}");
+    }
+
+    #[test]
+    fn a_failed_fetch_with_an_unknown_kid_is_unavailable_not_unknown() {
+        let mut c = loaded(1000);
+        let t = 1000 + KEY_TTL_SECS + 5;
+        assert_eq!(c.lookup("zzz", t), KeyLookup::Fetch);
+        let r = c.fetched("zzz", t, None, t + 1);
+        assert!(matches!(r, Err(VerifyError::Unavailable(_))), "{r:?}");
     }
 }
