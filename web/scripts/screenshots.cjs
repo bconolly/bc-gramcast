@@ -47,6 +47,22 @@ const QUEUE = [
   { id: "c", video_key: "videos/c.mp4", title: "Weekly wrap-up", caption: "Wrap", platforms: ["instagram"], slot_at: at(2099, 3, 12, 8, 15), status: "ready" },
 ];
 
+// Brisbane (+10:00) pattern and the next free slots it gives.
+const PATTERN = {
+  utc_offset_minutes: 600,
+  rules: [
+    { weekday: "mon", time: "06:30" },
+    { weekday: "wed", time: "19:00" },
+    { weekday: "fri", time: "08:30" },
+  ],
+};
+// 2099-03-04 is a Wednesday. Times below are the UTC instants of the local slots.
+const NEXT_SLOTS = [at(2099, 3, 4, 9, 0), at(2099, 3, 5, 22, 30), at(2099, 3, 8, 20, 30), at(2099, 3, 11, 9, 0), at(2099, 3, 12, 22, 30)];
+
+function json(route, body) {
+  return route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(body) });
+}
+
 function fail(message) {
   console.error(message);
   process.exitCode = 1;
@@ -58,9 +74,17 @@ async function shoot(browser, base, label, viewport) {
   page.on("console", (m) => m.type() === "error" && fail(`console error: ${m.text()}`));
   page.on("pageerror", (e) => fail(`page error: ${e.message}`));
   await page.route("**/api/queue", (r) => r.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(QUEUE) }));
+  await page.route("**/api/slots/pattern", (r) => json(r, PATTERN));
+  await page.route("**/api/slots/next?count=5", (r) => json(r, { slots: NEXT_SLOTS }));
   await page.goto(base);
   await page.getByText("Weekly wrap-up").waitFor();
   await page.screenshot({ path: path.join(outDir, `queue-${label}.png`), fullPage: true });
+
+  await page.getByRole("button", { name: "Slots" }).click();
+  await page.getByText("Wednesday 19:00").waitFor();
+  await page.mouse.move(0, 0);
+  await page.waitForTimeout(500); // let the nav button colour transition finish
+  await page.screenshot({ path: path.join(outDir, `slots-${label}.png`), fullPage: true });
 
   await page.getByRole("button", { name: "Upload" }).click();
   await page.getByLabel("Video (MP4)").setInputFiles({ name: "sunday-reel.mp4", mimeType: "video/mp4", buffer: Buffer.from("demo") });
@@ -68,7 +92,7 @@ async function shoot(browser, base, label, viewport) {
   await page.getByLabel("Caption").fill("Three small habits that keep your edits tidy. Save this for later!");
   await page.getByLabel("Instagram").check();
   await page.getByLabel("YouTube").check();
-  await page.getByLabel("When").fill("2099-03-06T08:30");
+  await page.getByRole("radio", { name: "Fri 06/03/2099 08:30" }).waitFor();
   await page.screenshot({ path: path.join(outDir, `upload-${label}.png`), fullPage: true });
   await ctx.close();
 }
