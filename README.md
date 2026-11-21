@@ -64,9 +64,9 @@ Only the owner can use the API. Cloudflare Access sits in front of the site and 
 What the Worker checks on every `/api/*` request:
 - The token is in the `Cf-Access-Jwt-Assertion` header (the cookie is not used), at most 8192 bytes.
 - The header says `RS256` (anything else, including `none` and `HS256`, is refused) and a plain `kid`.
-- The signature verifies against the public key with that `kid`, fetched from `https://<team-name>.cloudflareaccess.com/cdn-cgi/access/certs` (only that URL, never one from the token). Keys are cached for an hour in the isolate; an unknown `kid` refetches at most once a minute. At most 10 keys and 64 KB are read, only RSA keys of 2048 bits or more.
+- The signature verifies against the public key with that `kid`, fetched from `https://<team-name>.cloudflareaccess.com/cdn-cgi/access/certs` (only that URL, never one from the token). Keys are cached for an hour in the isolate; an unknown `kid` refetches at most once a minute (a key id not found while a refetch is throttled answers 503, since a retry may work), and keys that cannot be refreshed stop being used after 24 hours. At most 10 keys and 64 KB are read, only RSA keys of 2048 bits or more.
 - Then the claims: `iss` is exactly `https://<team-name>.cloudflareaccess.com`, `aud` contains the application's AUD tag, `exp` is in the future and `nbf` not in the future (30 seconds of clock leeway), and `email` equals `OWNER_EMAIL` (ignoring case). The signature is checked before the claims.
-- For POST, PUT, PATCH and DELETE: `Sec-Fetch-Site` is not `cross-site`, and an `Origin` header, when present, matches the request's Host.
+- For POST, PUT, PATCH and DELETE: `Sec-Fetch-Site` is not `cross-site`, and an `Origin` header, when present, is `https://<Host>` (`http://<Host>` only for a loopback Host).
 - Every response carries `X-Content-Type-Options: nosniff`, `Cache-Control: no-store`, `Referrer-Policy: no-referrer` and a `default-src 'none'` CSP. Denials use fixed messages (401 "sign-in required" for every token problem, 403 "not allowed" for a different user, 503 if sign-in is not set up or the keys cannot be fetched). Tokens, claims and emails are never logged.
 
 Setup, to do in the Cloudflare dashboard (not done yet):
@@ -91,7 +91,7 @@ All endpoints answer only to the owner (see Run locally). Request bodies are JSO
 - The Upload screen gets the offset and the slots from two separate calls, so saving the pattern between them can show a stale offset. Fix later by returning the offset with the slots.
 - The Slots screen has no retry after a load error and does not warn about unsaved edits.
 - The time input follows the browser's locale for 12 or 24 hour display.
-- Sign-in is built but untested on Cloudflare (see Sign-in above).
+- Sign-in is built but untested on Cloudflare (see Sign-in above). Add a Miniflare or `wrangler dev` smoke test of the sign-in path with a fake key endpoint.
 - Static assets are served without the Worker, so Access must cover the whole hostname; the assets contain no data.
 - `next_slots` reads all posts. Later, query only posts with a future `slot_at`.
 - Re-check the object's size and type with `head()` in the publish use case: the 15 minute upload link can still overwrite the object after the post is queued.
