@@ -38,11 +38,19 @@ export interface FormValues {
   now: number;
 }
 
+/** Mirrors VideoUpload::new in crates/domain/src/media.rs (\p{Cc} is Rust's char::is_control). */
+function badFileName(name: string): boolean {
+  return (
+    new TextEncoder().encode(name).length > MAX_FILE_NAME_BYTES ||
+    /[/\\]/.test(name) ||
+    name === ".." ||
+    /\p{Cc}/u.test(name)
+  );
+}
+
 function fileProblem(file: File | null): string | null {
   if (!file) return "Choose an MP4 video.";
-  const badName =
-    new TextEncoder().encode(file.name).length > MAX_FILE_NAME_BYTES || /[/\\]/.test(file.name);
-  if (badName) return "The file name is not allowed.";
+  if (badFileName(file.name)) return "The file name is not allowed.";
   if (!file.name.toLowerCase().endsWith(".mp4")) return "The video must be an MP4 file.";
   if (file.size === 0) return "The video file is empty.";
   if (file.size > MAX_UPLOAD_BYTES) return "The video is too large (100 MB limit).";

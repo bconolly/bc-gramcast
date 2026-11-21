@@ -63,6 +63,15 @@ describe("validateForm", () => {
       "The video is too large (100 MB limit).",
     );
   });
+  it("rejects file names the server rejects", () => {
+    const bad = ["..", "a\u0000b.mp4", "a\nb.mp4", "a\u007f.mp4", "a\u0085.mp4", "a/b.mp4", "a\\b.mp4", "x".repeat(252) + ".mp4"];
+    for (const name of bad) {
+      expect(validateForm({ ...ok, file: mp4(name) }), JSON.stringify(name)).toContain(
+        "The file name is not allowed.",
+      );
+    }
+    expect(validateForm({ ...ok, file: mp4("my..reel.mp4") })).toEqual([]);
+  });
   it("requires a title within the limit", () => {
     expect(validateForm({ ...ok, title: "   " })).toContain("Title is required.");
     expect(validateForm({ ...ok, title: "t".repeat(MAX_TITLE_CHARS) })).toEqual([]);
