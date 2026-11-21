@@ -122,10 +122,10 @@ pub async fn upcoming(repo: &impl PostRepository, now: i64) -> Result<Vec<Queued
     Ok(queue.upcoming(now).into_iter().cloned().collect())
 }
 
-pub async fn get_pattern(
-    repo: &impl SlotPatternRepository,
-) -> Result<Option<SlotPattern>, AppError> {
-    repo.get().await.map_err(AppError::Port)
+/// The saved pattern, or the default (Brisbane, no rules) before one is saved.
+pub async fn get_pattern(repo: &impl SlotPatternRepository) -> Result<SlotPattern, AppError> {
+    let stored = repo.get().await.map_err(AppError::Port)?;
+    Ok(stored.unwrap_or_default())
 }
 
 /// Validates through `SlotPattern::new`, saves, and returns the normalised pattern.
@@ -449,7 +449,15 @@ mod tests {
         let rules = vec![rule(Weekday::Wed, 19), rule(Weekday::Mon, 6)];
         let saved = pollster::block_on(set_pattern(&repo, 600, rules)).unwrap();
         assert_eq!(saved.rules[0], rule(Weekday::Mon, 6));
-        assert_eq!(pollster::block_on(get_pattern(&repo)), Ok(Some(saved)));
+        assert_eq!(pollster::block_on(get_pattern(&repo)), Ok(saved));
+    }
+
+    #[test]
+    fn get_pattern_is_the_brisbane_default_until_one_is_saved() {
+        let got = pollster::block_on(get_pattern(&FakePatterns::default())).unwrap();
+        assert_eq!(got, SlotPattern::default());
+        assert_eq!(got.utc_offset_minutes, 600);
+        assert!(got.rules.is_empty());
     }
 
     #[test]

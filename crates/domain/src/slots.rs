@@ -4,6 +4,8 @@ use crate::queue::MAX_SLOT_SECS;
 
 pub const MAX_RULES: usize = 14;
 pub const MAX_NEXT_SLOTS: usize = 20;
+/// Brisbane (+10:00), which has no daylight saving. Used until the owner saves a pattern.
+pub const DEFAULT_UTC_OFFSET_MINUTES: i32 = 600;
 const MIN_OFFSET: i32 = -720;
 const MAX_OFFSET: i32 = 840;
 const MINUTES_PER_DAY: u16 = 1440;
@@ -69,6 +71,16 @@ pub enum SlotError {
     DuplicateRule,
     /// A time of day or weekday that does not parse or is out of range.
     BadTime,
+}
+
+impl Default for SlotPattern {
+    /// Brisbane with no rules.
+    fn default() -> Self {
+        Self {
+            utc_offset_minutes: DEFAULT_UTC_OFFSET_MINUTES,
+            rules: Vec::new(),
+        }
+    }
 }
 
 impl SlotPattern {
@@ -323,6 +335,15 @@ mod tests {
             SlotPattern::from_stored(900, ""),
             Err(SlotError::OffsetOutOfRange)
         );
+    }
+
+    #[test]
+    fn the_default_pattern_is_brisbane_with_no_rules() {
+        let p = SlotPattern::default();
+        assert_eq!(p.utc_offset_minutes, DEFAULT_UTC_OFFSET_MINUTES);
+        assert_eq!(DEFAULT_UTC_OFFSET_MINUTES, 600);
+        assert!(p.rules.is_empty());
+        assert_eq!(SlotPattern::new(600, vec![]), Ok(p));
     }
 
     #[test]

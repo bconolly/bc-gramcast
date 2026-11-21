@@ -112,8 +112,7 @@ mod entry {
             .get_async("/api/slots/pattern", |_req, ctx| async move {
                 let repo = D1SlotPatternRepository::new(ctx.env.d1("DB")?);
                 match app::get_pattern(&repo).await {
-                    Ok(Some(p)) => Response::from_json(&dto::pattern_to_json(&p)),
-                    Ok(None) => Response::from_json(&dto::default_pattern_json()),
+                    Ok(p) => Response::from_json(&dto::pattern_to_json(&p)),
                     Err(e) => app_error(&e),
                 }
             })

@@ -86,8 +86,6 @@ pub fn to_json(p: &QueuedPost) -> PostJson {
     }
 }
 
-/// Brisbane, which has no daylight saving. Shown until the owner saves a pattern.
-pub const DEFAULT_UTC_OFFSET_MINUTES: i32 = 600;
 pub const DEFAULT_NEXT_COUNT: usize = 5;
 
 #[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -131,13 +129,6 @@ pub fn pattern_to_json(p: &SlotPattern) -> PatternJson {
                 time: domain::slots::format_hhmm(r.minute_of_day),
             })
             .collect(),
-    }
-}
-
-pub fn default_pattern_json() -> PatternJson {
-    PatternJson {
-        utc_offset_minutes: DEFAULT_UTC_OFFSET_MINUTES,
-        rules: Vec::new(),
     }
 }
 
@@ -515,7 +506,7 @@ mod tests {
 
     #[test]
     fn the_default_pattern_is_brisbane_with_no_rules() {
-        let json = serde_json::to_string(&default_pattern_json()).unwrap();
+        let json = serde_json::to_string(&pattern_to_json(&SlotPattern::default())).unwrap();
         assert_eq!(json, r#"{"utc_offset_minutes":600,"rules":[]}"#);
     }
 
