@@ -1,6 +1,7 @@
 //! JSON shapes for the API, and mapping to and from the domain. No logic here.
 
 use domain::app::{AppError, InsertError, PortError};
+use domain::auth::{self, AuthError, Claims, JwtHeader};
 use domain::media::UploadError;
 use domain::queue::{Platform, QueueError, QueuedPost};
 use domain::slots::{SlotError, SlotPattern, SlotRule, Weekday};
@@ -177,23 +178,6 @@ pub fn classify_insert_error(text: &str) -> InsertError {
     }
 }
 
-/// DNS-rebinding guard for local dev: only a Host of exactly `localhost` or
-/// `127.0.0.1`, with an optional port (1 to 65535), may use the no-auth mode.
-pub fn is_local_host(host_header: Option<&str>) -> bool {
-    let Some(value) = host_header else {
-        return false;
-    };
-    let (host, port) = match value.split_once(':') {
-        Some((host, port)) => (host, Some(port)),
-        None => (value, None),
-    };
-    // 1..=65535: digits only (parse alone would accept a leading `+`), and never port 0.
-    let port_ok = port.is_none_or(|p| {
-        p.bytes().all(|b| b.is_ascii_digit()) && p.parse::<u16>().is_ok_and(|n| n != 0)
-    });
-    port_ok && (host.eq_ignore_ascii_case("localhost") || host == "127.0.0.1")
-}
-
 /// CSRF guard: a cross-site form cannot send `application/json`, so POSTs must.
 pub fn is_json_content_type(header: Option<&str>) -> bool {
     let Some(value) = header else {
@@ -240,6 +224,210 @@ pub fn error_status(e: &AppError) -> (u16, &'static str) {
         ),
         AppError::Port(_) => (500, "storage error"),
     }
+}
+
+/// A token split into what the domain checks, plus the bytes the signature covers.
+#[derive(Debug, PartialEq, Eq)]
+pub struct TokenParts {
+    pub header: JwtHeader,
+    pub claims: Claims,
+    /// `header.payload` exactly as sent, which is what the signature covers.
+    pub signing_input: Vec<u8>,
+    pub signature: Vec<u8>,
+}
+
+/// Splits and decodes a token. Nothing is trusted yet: the signature is checked
+/// later, by the domain. Every failure is `Malformed`.
+pub fn parse_token(token: &str) -> Result<TokenParts, AuthError> {
+    let (h, p, sig) = domain::auth::split_token(token)?;
+    let header: HeaderWire = decode_object(h)?;
+    let payload: ClaimsWire = decode_object(p)?;
+    let signature = domain::auth::decode_b64url(sig).ok_or(AuthError::Malformed)?;
+    // `h` and `p` are slices of `token` that run up to the last dot.
+    let signing_input = token.as_bytes()[..h.len() + 1 + p.len()].to_vec();
+    Ok(TokenParts {
+        header: JwtHeader {
+            alg: header.alg,
+            kid: header.kid,
+        },
+        claims: Claims {
+            iss: payload.iss,
+            aud: match payload.aud {
+                Audience::One(a) => vec![a],
+                Audience::Many(a) => a,
+            },
+            exp: payload.exp,
+            nbf: payload.nbf,
+            email: payload.email,
+        },
+        signing_input,
+        signature,
+    })
+}
+
+#[derive(Deserialize)]
+struct HeaderWire {
+    alg: String,
+    kid: String,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum Audience {
+    One(String),
+    Many(Vec<String>),
+}
+
+/// Unknown fields are ignored on purpose: real Access tokens carry many.
+#[derive(Deserialize)]
+struct ClaimsWire {
+    iss: String,
+    aud: Audience,
+    exp: i64,
+    nbf: Option<i64>,
+    email: Option<String>,
+}
+
+/// Decodes one base64url part as a JSON object. Going through `Value` stops
+/// serde reading a JSON array as a struct.
+fn decode_object<T: serde::de::DeserializeOwned>(part: &str) -> Result<T, AuthError> {
+    let bytes = domain::auth::decode_b64url(part).ok_or(AuthError::Malformed)?;
+    let value: serde_json::Value =
+        serde_json::from_slice(&bytes).map_err(|_| AuthError::Malformed)?;
+    if !value.is_object() {
+        return Err(AuthError::Malformed);
+    }
+    serde_json::from_value(value).map_err(|_| AuthError::Malformed)
+}
+
+/// HTTP status and a fixed message per sign-in error. Every token problem shares
+/// one message, so a response never says which check failed.
+pub fn auth_error_status(e: &AuthError) -> (u16, &'static str) {
+    match e {
+        AuthError::NotOwner => (403, "not allowed"),
+        AuthError::NotConfigured => (503, "sign-in not configured yet"),
+        AuthError::KeysUnavailable => (503, "sign-in unavailable"),
+        AuthError::MissingToken
+        | AuthError::Malformed
+        | AuthError::UnsupportedAlg
+        | AuthError::BadKeyId
+        | AuthError::UnknownKey
+        | AuthError::BadSignature
+        | AuthError::WrongIssuer
+        | AuthError::WrongAudience
+        | AuthError::Expired
+        | AuthError::NotYetValid => (401, "sign-in required"),
+    }
+}
+
+/// A fixed code for the log line when sign-in is refused. It names the check
+/// that failed and nothing from the request: never the token, claims or email.
+pub fn auth_reason_code(e: &AuthError) -> &'static str {
+    match e {
+        AuthError::MissingToken => "missing_token",
+        AuthError::Malformed => "malformed",
+        AuthError::UnsupportedAlg => "unsupported_alg",
+        AuthError::BadKeyId => "bad_key_id",
+        AuthError::UnknownKey => "unknown_key",
+        AuthError::BadSignature => "bad_signature",
+        AuthError::WrongIssuer => "wrong_issuer",
+        AuthError::WrongAudience => "wrong_audience",
+        AuthError::Expired => "expired",
+        AuthError::NotYetValid => "not_yet_valid",
+        AuthError::NotOwner => "not_owner",
+        AuthError::NotConfigured => "not_configured",
+        AuthError::KeysUnavailable => "keys_unavailable",
+    }
+}
+
+/// Headers added to every response the Worker returns, denials included.
+pub const API_SECURITY_HEADERS: [(&str, &str); 4] = [
+    ("X-Content-Type-Options", "nosniff"),
+    ("Cache-Control", "no-store"),
+    ("Referrer-Policy", "no-referrer"),
+    (
+        "Content-Security-Policy",
+        "default-src 'none'; frame-ancestors 'none'",
+    ),
+];
+
+/// Largest key-set response we will read, in bytes.
+pub const MAX_JWKS_BYTES: usize = 64 * 1024;
+/// Most keys a key set may list. Access publishes two at a time.
+pub const MAX_JWKS_KEYS: usize = 10;
+
+/// Whether a key-set response may be read, judging by its `Content-Length`
+/// header alone. No header is fine (the size is checked again once read); an
+/// unreadable or too-large one is not.
+pub fn jwks_length_ok(content_length: Option<&str>) -> bool {
+    content_length.is_none_or(|v| {
+        v.bytes().all(|b| b.is_ascii_digit())
+            && v.parse::<usize>().is_ok_and(|n| n <= MAX_JWKS_BYTES)
+    })
+}
+
+/// An RSA public key from the key set, ready for Web Crypto.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Jwk {
+    pub kid: String,
+    /// base64url modulus (at least 2048 bits).
+    pub n: String,
+    /// base64url exponent.
+    pub e: String,
+}
+
+/// The key set could not be used at all.
+#[derive(Debug, PartialEq, Eq)]
+pub struct JwksError;
+
+#[derive(Deserialize)]
+struct JwkWire {
+    kty: String,
+    kid: Option<String>,
+    n: Option<String>,
+    e: Option<String>,
+    alg: Option<String>,
+}
+
+/// Reads the key set from `/cdn-cgi/access/certs`. Keys that are not usable RSA
+/// signing keys are skipped one by one; the whole set is refused when it is too
+/// big, too long, not the expected shape, or has no usable key.
+pub fn parse_jwks(body: &str) -> Result<Vec<Jwk>, JwksError> {
+    if body.len() > MAX_JWKS_BYTES {
+        return Err(JwksError);
+    }
+    let value: serde_json::Value = serde_json::from_str(body).map_err(|_| JwksError)?;
+    let listed = value
+        .get("keys")
+        .and_then(serde_json::Value::as_array)
+        .filter(|k| k.len() <= MAX_JWKS_KEYS)
+        .ok_or(JwksError)?;
+    let mut keys: Vec<Jwk> = Vec::new();
+    for item in listed {
+        let Some(jwk) = usable_key(item) else {
+            continue;
+        };
+        if !keys.iter().any(|k| k.kid == jwk.kid) {
+            keys.push(jwk);
+        }
+    }
+    if keys.is_empty() {
+        Err(JwksError)
+    } else {
+        Ok(keys)
+    }
+}
+
+fn usable_key(item: &serde_json::Value) -> Option<Jwk> {
+    let wire: JwkWire = serde_json::from_value(item.clone()).ok()?;
+    let (kid, n, e) = (wire.kid?, wire.n?, wire.e?);
+    let n_bytes = auth::decode_b64url(&n)?;
+    let e_bytes = auth::decode_b64url(&e)?;
+    auth::accept_jwk(&wire.kty, wire.alg.as_deref(), &kid, &n_bytes, &e_bytes).then_some(Jwk {
+        kid,
+        n,
+        e,
+    })
 }
 
 #[cfg(test)]
@@ -408,41 +596,6 @@ mod tests {
     }
 
     #[test]
-    fn local_dev_only_answers_to_loopback_hosts() {
-        for ok in [
-            "localhost",
-            "localhost:8787",
-            "127.0.0.1",
-            "127.0.0.1:8787",
-            "LOCALHOST:8787",
-        ] {
-            assert!(is_local_host(Some(ok)), "{ok}");
-        }
-        for bad in [
-            "",
-            "evil.com",
-            "localhost.evil.com",
-            "evil.com:8787",
-            "localhost:",
-            "localhost:abc",
-            "localhost:8787@evil.com",
-            "user@localhost",
-            "127.0.0.1.evil.com",
-            "127.0.0.2",
-            "[::1]",
-            "localhost:8787:1",
-            "localhost:0",
-            "localhost:00000",
-            "localhost:65536",
-            "127.0.0.1:99999",
-            " localhost",
-        ] {
-            assert!(!is_local_host(Some(bad)), "{bad:?}");
-        }
-        assert!(!is_local_host(None));
-    }
-
-    #[test]
     fn only_json_content_types_pass_the_csrf_check() {
         assert!(is_json_content_type(Some("application/json")));
         assert!(is_json_content_type(Some(
@@ -569,6 +722,333 @@ mod tests {
             "count=003x",
         ] {
             assert_eq!(parse_next_count(Some(bad)), None, "{bad:?}");
+        }
+    }
+
+    fn b64(bytes: &[u8]) -> String {
+        const A: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+        let mut out = String::new();
+        for chunk in bytes.chunks(3) {
+            let n =
+                chunk.iter().fold(0u32, |a, &b| (a << 8) | u32::from(b)) << (8 * (3 - chunk.len()));
+            for i in 0..=chunk.len() {
+                out.push(A[((n >> (18 - 6 * i)) & 63) as usize] as char);
+            }
+        }
+        out
+    }
+
+    /// A synthetic payload shaped like a real Access token: many extra fields.
+    fn payload(aud: &str, extra: &str) -> String {
+        format!(
+            r#"{{"aud":{aud},"email":"owner@example.com","exp":1800000600,"iat":1800000000,"nbf":1799999995,"iss":"https://team-x.cloudflareaccess.com","type":"app","identity_nonce":"n0nce","sub":"00000000-0000-0000-0000-000000000000","country":"AU"{extra}}}"#
+        )
+    }
+
+    fn token(header: &str, payload: &str) -> String {
+        format!(
+            "{}.{}.{}",
+            b64(header.as_bytes()),
+            b64(payload.as_bytes()),
+            b64(b"sig-bytes")
+        )
+    }
+
+    const HDR: &str = r#"{"alg":"RS256","kid":"key1","typ":"JWT"}"#;
+
+    #[test]
+    fn parse_token_reads_a_realistic_access_token() {
+        let t = token(HDR, &payload(r#"["abc123"]"#, ""));
+        let parts = parse_token(&t).unwrap();
+        assert_eq!(
+            parts.header,
+            JwtHeader {
+                alg: "RS256".into(),
+                kid: "key1".into()
+            }
+        );
+        assert_eq!(
+            parts.claims,
+            Claims {
+                iss: "https://team-x.cloudflareaccess.com".into(),
+                aud: vec!["abc123".into()],
+                exp: 1_800_000_600,
+                nbf: Some(1_799_999_995),
+                email: Some("owner@example.com".into()),
+            }
+        );
+        assert_eq!(parts.signature, b"sig-bytes");
+        let cut = t.rfind('.').unwrap();
+        assert_eq!(parts.signing_input, t.as_bytes()[..cut]);
+    }
+
+    #[test]
+    fn parse_token_accepts_aud_as_a_string_or_an_array() {
+        let one = parse_token(&token(HDR, &payload(r#""abc123""#, ""))).unwrap();
+        assert_eq!(one.claims.aud, vec!["abc123".to_string()]);
+        let two = parse_token(&token(HDR, &payload(r#"["a","b"]"#, ""))).unwrap();
+        assert_eq!(two.claims.aud, vec!["a".to_string(), "b".to_string()]);
+    }
+
+    #[test]
+    fn parse_token_allows_a_missing_nbf_and_email() {
+        let p = r#"{"aud":["a"],"iss":"i","exp":5}"#;
+        let parts = parse_token(&token(HDR, p)).unwrap();
+        assert_eq!((parts.claims.nbf, parts.claims.email), (None, None));
+    }
+
+    #[test]
+    fn parse_token_refuses_bad_shapes_as_malformed() {
+        let good_p = payload(r#"["a"]"#, "");
+        let bad_payloads = [
+            r#"{"aud":["a"],"iss":"i"}"#.to_string(),
+            r#"{"aud":["a"],"iss":"i","exp":"5"}"#.to_string(),
+            r#"{"aud":["a"],"iss":"i","exp":5.5}"#.to_string(),
+            r#"{"aud":["a"],"iss":"i","exp":5,"nbf":"1"}"#.to_string(),
+            r#"{"aud":["a"],"iss":"i","exp":5,"email":7}"#.to_string(),
+            r#"{"aud":[1],"iss":"i","exp":5}"#.to_string(),
+            r#"{"aud":7,"iss":"i","exp":5}"#.to_string(),
+            r#"{"aud":["a"],"exp":5}"#.to_string(),
+            r#"{"iss":"i","exp":5}"#.to_string(),
+            r#"["not","an","object"]"#.to_string(),
+            r#"[["a"],"i",5]"#.to_string(),
+            "null".to_string(),
+            "not json".to_string(),
+        ];
+        for p in &bad_payloads {
+            assert_eq!(
+                parse_token(&token(HDR, p)),
+                Err(AuthError::Malformed),
+                "{p}"
+            );
+        }
+        for h in [
+            r#"{"kid":"k"}"#,
+            r#"{"alg":"RS256"}"#,
+            r#"{"alg":5,"kid":"k"}"#,
+            r#"{"alg":"RS256","kid":5}"#,
+            r#"["RS256","k"]"#,
+            "nope",
+        ] {
+            assert_eq!(
+                parse_token(&token(h, &good_p)),
+                Err(AuthError::Malformed),
+                "{h}"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_token_refuses_bad_encoding_and_structure() {
+        let good = token(HDR, &payload(r#"["a"]"#, ""));
+        let (h, rest) = good.split_once('.').unwrap();
+        let (p, _) = rest.split_once('.').unwrap();
+        for bad in [
+            String::new(),
+            "a.b".to_string(),
+            format!("{h}.{p}"),
+            format!("{h}.{p}.***"),
+            format!("{h}.{p}.Zg=="),
+            format!("{h}.{p}.{}", "A".repeat(9000)),
+            format!("{h}!.{p}.c2ln"),
+            format!("{h}.{p}.c2ln.extra"),
+        ] {
+            assert_eq!(parse_token(&bad), Err(AuthError::Malformed), "{bad:.40}");
+        }
+    }
+
+    #[test]
+    fn auth_errors_map_to_fixed_statuses_and_messages() {
+        let token_problems = [
+            AuthError::MissingToken,
+            AuthError::Malformed,
+            AuthError::UnsupportedAlg,
+            AuthError::BadKeyId,
+            AuthError::UnknownKey,
+            AuthError::BadSignature,
+            AuthError::WrongIssuer,
+            AuthError::WrongAudience,
+            AuthError::Expired,
+            AuthError::NotYetValid,
+        ];
+        for e in token_problems {
+            assert_eq!(auth_error_status(&e), (401, "sign-in required"), "{e:?}");
+        }
+        assert_eq!(
+            auth_error_status(&AuthError::NotOwner),
+            (403, "not allowed")
+        );
+        assert_eq!(
+            auth_error_status(&AuthError::NotConfigured),
+            (503, "sign-in not configured yet")
+        );
+        assert_eq!(
+            auth_error_status(&AuthError::KeysUnavailable),
+            (503, "sign-in unavailable")
+        );
+    }
+
+    #[test]
+    fn security_headers_are_the_expected_set() {
+        let find = |n: &str| {
+            API_SECURITY_HEADERS
+                .iter()
+                .find(|(k, _)| *k == n)
+                .map(|(_, v)| *v)
+        };
+        assert_eq!(find("X-Content-Type-Options"), Some("nosniff"));
+        assert_eq!(find("Cache-Control"), Some("no-store"));
+        assert_eq!(find("Referrer-Policy"), Some("no-referrer"));
+        assert_eq!(
+            find("Content-Security-Policy"),
+            Some("default-src 'none'; frame-ancestors 'none'")
+        );
+        assert_eq!(API_SECURITY_HEADERS.len(), 4);
+    }
+
+    fn key_json(kid: &str, n_bytes: usize, extra: &str) -> String {
+        format!(
+            r#"{{"kid":"{kid}","kty":"RSA","alg":"RS256","use":"sig","e":"AQAB","n":"{}"{extra}}}"#,
+            b64(&vec![0xAB; n_bytes])
+        )
+    }
+
+    fn jwks(keys: &[String]) -> String {
+        format!(
+            r#"{{"keys":[{}],"public_cert":{{"kid":"x","cert":"-----BEGIN CERTIFICATE-----"}},"public_certs":[]}}"#,
+            keys.join(",")
+        )
+    }
+
+    #[test]
+    fn parse_jwks_reads_a_realistic_key_set() {
+        let body = jwks(&[key_json("k1", 256, ""), key_json("k2", 384, "")]);
+        let keys = parse_jwks(&body).unwrap();
+        assert_eq!(keys.len(), 2);
+        assert_eq!(keys[0].kid, "k1");
+        assert_eq!(keys[0].e, "AQAB");
+        assert_eq!(keys[0].n, b64(&[0xAB; 256]));
+        assert_eq!(keys[1].kid, "k2");
+    }
+
+    #[test]
+    fn parse_jwks_skips_each_unusable_key_and_keeps_the_good_one() {
+        let bad = [
+            key_json("short", 255, ""),
+            key_json("bad kid", 256, ""),
+            key_json("hs", 256, "").replace("RS256", "HS256"),
+            key_json("ec", 256, "").replace("RSA", "EC"),
+            key_json("nokid", 256, "").replace(r#""kid":"nokid","#, ""),
+            key_json("badn", 256, "").replace(&b64(&[0xAB; 256]), "***"),
+            key_json("bade", 256, "").replace("AQAB", "A+B="),
+            key_json("nile", 256, "").replace(r#""e":"AQAB""#, r#""e":"""#),
+            key_json("bige", 256, "").replace("AQAB", "AQABAQABAQAB"),
+            "7".to_string(),
+            "null".to_string(),
+        ];
+        for b in bad {
+            let keys = parse_jwks(&jwks(&[b.clone(), key_json("good", 256, "")])).unwrap();
+            assert_eq!(keys.len(), 1, "{b}");
+            assert_eq!(keys[0].kid, "good");
+        }
+    }
+
+    #[test]
+    fn parse_jwks_accepts_a_key_without_alg_and_keeps_the_first_of_a_repeated_kid() {
+        let no_alg = key_json("k", 256, "").replace(r#""alg":"RS256","#, "");
+        let other = key_json("k", 300, "");
+        let keys = parse_jwks(&jwks(&[no_alg, other])).unwrap();
+        assert_eq!(keys.len(), 1);
+        assert_eq!(keys[0].n, b64(&[0xAB; 256]));
+    }
+
+    #[test]
+    fn parse_jwks_refuses_a_set_with_no_usable_key() {
+        assert_eq!(
+            parse_jwks(&jwks(&[key_json("short", 128, "")])),
+            Err(JwksError)
+        );
+        assert_eq!(parse_jwks(&jwks(&[])), Err(JwksError));
+    }
+
+    #[test]
+    fn parse_jwks_refuses_wrong_shapes() {
+        for body in [
+            "",
+            "null",
+            "[]",
+            r#"{"keys":7}"#,
+            r#"{"keys":{}}"#,
+            r#"{"public_cert":{}}"#,
+            "not json",
+        ] {
+            assert_eq!(parse_jwks(body), Err(JwksError), "{body}");
+        }
+    }
+
+    #[test]
+    fn parse_jwks_caps_the_key_count_and_the_body_size() {
+        let ten: Vec<String> = (0..MAX_JWKS_KEYS)
+            .map(|i| key_json(&format!("k{i}"), 256, ""))
+            .collect();
+        assert_eq!(parse_jwks(&jwks(&ten)).unwrap().len(), MAX_JWKS_KEYS);
+        let eleven: Vec<String> = (0..=MAX_JWKS_KEYS)
+            .map(|i| key_json(&format!("k{i}"), 256, ""))
+            .collect();
+        assert_eq!(parse_jwks(&jwks(&eleven)), Err(JwksError));
+        let padded = format!(
+            "{}{}",
+            jwks(&[key_json("k", 256, "")]),
+            " ".repeat(MAX_JWKS_BYTES)
+        );
+        assert_eq!(parse_jwks(&padded), Err(JwksError));
+    }
+
+    #[test]
+    fn reason_codes_are_fixed_and_distinct() {
+        let all = [
+            AuthError::MissingToken,
+            AuthError::Malformed,
+            AuthError::UnsupportedAlg,
+            AuthError::BadKeyId,
+            AuthError::UnknownKey,
+            AuthError::BadSignature,
+            AuthError::WrongIssuer,
+            AuthError::WrongAudience,
+            AuthError::Expired,
+            AuthError::NotYetValid,
+            AuthError::NotOwner,
+            AuthError::NotConfigured,
+            AuthError::KeysUnavailable,
+        ];
+        let codes: Vec<&str> = all.iter().map(auth_reason_code).collect();
+        assert_eq!(codes[0], "missing_token");
+        assert_eq!(codes[10], "not_owner");
+        let mut unique = codes.clone();
+        unique.sort_unstable();
+        unique.dedup();
+        assert_eq!(unique.len(), all.len());
+        assert!(codes
+            .iter()
+            .all(|c| c.bytes().all(|b| b.is_ascii_lowercase() || b == b'_')));
+    }
+
+    #[test]
+    fn jwks_content_length_is_checked_early() {
+        assert!(jwks_length_ok(None));
+        assert!(jwks_length_ok(Some("0")));
+        assert!(jwks_length_ok(Some("65536")));
+        assert!(!jwks_length_ok(Some("65537")));
+        for bad in [
+            "",
+            "-1",
+            "abc",
+            "1e3",
+            " 10",
+            "+5",
+            "99999999999999999999999",
+        ] {
+            assert!(!jwks_length_ok(Some(bad)), "{bad:?}");
         }
     }
 }

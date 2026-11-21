@@ -23,9 +23,16 @@ binding = "VIDEOS"
 # bucket_name here and the R2_BUCKET var below must name the SAME bucket.
 bucket_name = "REPLACE_WITH_BUCKET_NAME"
 
-# Placeholders only. Secrets (R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY) are set with
-# `wrangler secret put`. Never add LOCAL_DEV_NO_AUTH here: it goes in .dev.vars.
+# Placeholders only. Secrets (R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY, OWNER_EMAIL) are
+# set with `wrangler secret put`. Never add LOCAL_DEV_NO_AUTH here: it goes in .dev.vars.
+# OWNER_EMAIL is the one email allowed to use the API. It is a SECRET, never a var and
+# never in this file (the repo is public): `wrangler secret put OWNER_EMAIL`.
 [vars]
+# Owner sign-in (Cloudflare Access). Empty means not configured, so the API answers 503.
+# TEAM_DOMAIN is your Zero Trust team domain, like "<team-name>.cloudflareaccess.com".
+TEAM_DOMAIN = ""
+# POLICY_AUD is the Access application's Audience (AUD) tag. See the README.
+POLICY_AUD = ""
 # Must match the VIDEOS binding's bucket_name above.
 R2_BUCKET = "REPLACE_WITH_BUCKET_NAME"
 R2_ACCOUNT_ID = "REPLACE_WITH_ACCOUNT_ID"

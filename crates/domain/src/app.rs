@@ -1,6 +1,7 @@
 //! Use cases. They talk to the outside world only through the ports below,
 //! so the Worker (and later an AWS adapter) plugs in without changing them.
 
+use crate::auth::{AccessConfig, AuthError, Claims, JwtHeader};
 use crate::media::{UploadError, VideoUpload, MAX_UPLOAD_BYTES};
 use crate::queue::{validate_slot, Queue, QueueError, QueuedPost};
 use crate::slots::{next_free_slots, SlotError, SlotPattern};
@@ -157,6 +158,49 @@ pub async fn next_slots(
         .map(|p| p.slot_at)
         .collect();
     Ok(next_free_slots(&pattern, &taken, now, count))
+}
+
+/// Why a signature could not be checked.
+#[derive(Debug, PartialEq, Eq)]
+pub enum VerifyError {
+    /// No published key has this id (after any allowed refresh).
+    UnknownKey,
+    /// The keys could not be fetched or used. The text is for logs, never sent out.
+    Unavailable(PortError),
+}
+
+/// Crypto port: checks an RS256 signature against the published key with this id.
+#[allow(async_fn_in_trait)]
+pub trait SignatureVerifier {
+    /// `Ok(true)` only for a valid signature.
+    async fn verify(
+        &self,
+        kid: &str,
+        signing_input: &[u8],
+        signature: &[u8],
+    ) -> Result<bool, VerifyError>;
+}
+
+/// Accepts a token for the owner. Order matters: the header is checked first,
+/// the signature next, and the claims only for a token whose signature is good,
+/// so nothing in an unsigned payload is ever trusted.
+pub async fn authenticate_owner(
+    verifier: &impl SignatureVerifier,
+    config: &AccessConfig,
+    header: JwtHeader,
+    claims: Claims,
+    signing_input: &[u8],
+    signature: &[u8],
+    now: i64,
+) -> Result<(), AuthError> {
+    crate::auth::check_header(&header)?;
+    match verifier.verify(&header.kid, signing_input, signature).await {
+        Ok(true) => {}
+        Ok(false) => return Err(AuthError::BadSignature),
+        Err(VerifyError::UnknownKey) => return Err(AuthError::UnknownKey),
+        Err(VerifyError::Unavailable(_)) => return Err(AuthError::KeysUnavailable),
+    }
+    crate::auth::check_claims(&claims, config, now)
 }
 
 #[cfg(test)]
@@ -513,5 +557,143 @@ mod tests {
         };
         let e = pollster::block_on(next_slots(&broken, &FakeRepo::default(), 0, 5));
         assert_eq!(e, Err(AppError::Port(PortError("d1 down".into()))));
+    }
+
+    type Call = (String, Vec<u8>, Vec<u8>);
+
+    struct FakeVerifier {
+        outcome: Result<bool, VerifyError>,
+        calls: RefCell<Vec<Call>>,
+    }
+
+    impl FakeVerifier {
+        fn new(outcome: Result<bool, VerifyError>) -> Self {
+            Self {
+                outcome,
+                calls: RefCell::new(vec![]),
+            }
+        }
+    }
+
+    impl SignatureVerifier for FakeVerifier {
+        async fn verify(&self, kid: &str, input: &[u8], sig: &[u8]) -> Result<bool, VerifyError> {
+            self.calls
+                .borrow_mut()
+                .push((kid.into(), input.to_vec(), sig.to_vec()));
+            match &self.outcome {
+                Ok(b) => Ok(*b),
+                Err(VerifyError::UnknownKey) => Err(VerifyError::UnknownKey),
+                Err(VerifyError::Unavailable(p)) => {
+                    Err(VerifyError::Unavailable(PortError(p.0.clone())))
+                }
+            }
+        }
+    }
+
+    const NOW: i64 = 1_800_000_000;
+
+    fn access() -> AccessConfig {
+        AccessConfig::new("t.cloudflareaccess.com", "aud1", "owner@example.com").unwrap()
+    }
+
+    fn good_header() -> JwtHeader {
+        JwtHeader {
+            alg: "RS256".into(),
+            kid: "key1".into(),
+        }
+    }
+
+    fn good_claims() -> Claims {
+        Claims {
+            iss: "https://t.cloudflareaccess.com".into(),
+            aud: vec!["aud1".into()],
+            exp: NOW + 60,
+            nbf: None,
+            email: Some("owner@example.com".into()),
+        }
+    }
+
+    fn auth(v: &FakeVerifier, header: JwtHeader, claims: Claims) -> Result<(), AuthError> {
+        pollster::block_on(authenticate_owner(
+            v,
+            &access(),
+            header,
+            claims,
+            b"h.p",
+            b"sig",
+            NOW,
+        ))
+    }
+
+    #[test]
+    fn authenticate_owner_accepts_a_good_token_and_passes_the_exact_bytes() {
+        let v = FakeVerifier::new(Ok(true));
+        assert_eq!(auth(&v, good_header(), good_claims()), Ok(()));
+        assert_eq!(
+            *v.calls.borrow(),
+            vec![("key1".to_string(), b"h.p".to_vec(), b"sig".to_vec())]
+        );
+    }
+
+    #[test]
+    fn authenticate_owner_refuses_a_bad_header_without_asking_the_verifier() {
+        let v = FakeVerifier::new(Ok(true));
+        let mut h = good_header();
+        h.alg = "none".into();
+        assert_eq!(auth(&v, h, good_claims()), Err(AuthError::UnsupportedAlg));
+        let mut h = good_header();
+        h.kid = "bad kid".into();
+        assert_eq!(auth(&v, h, good_claims()), Err(AuthError::BadKeyId));
+        assert!(v.calls.borrow().is_empty());
+    }
+
+    #[test]
+    fn authenticate_owner_maps_signature_outcomes() {
+        let v = FakeVerifier::new(Ok(false));
+        assert_eq!(
+            auth(&v, good_header(), good_claims()),
+            Err(AuthError::BadSignature)
+        );
+        let v = FakeVerifier::new(Err(VerifyError::UnknownKey));
+        assert_eq!(
+            auth(&v, good_header(), good_claims()),
+            Err(AuthError::UnknownKey)
+        );
+    }
+
+    #[test]
+    fn authenticate_owner_turns_a_port_failure_into_keys_unavailable() {
+        let v = FakeVerifier::new(Err(VerifyError::Unavailable(PortError("boom".into()))));
+        assert_eq!(
+            auth(&v, good_header(), good_claims()),
+            Err(AuthError::KeysUnavailable)
+        );
+    }
+
+    #[test]
+    fn authenticate_owner_checks_the_signature_before_the_claims() {
+        // Every claim is wrong too, but the bad signature is what is reported.
+        let mut c = good_claims();
+        c.iss = "x".into();
+        c.exp = 0;
+        let v = FakeVerifier::new(Ok(false));
+        assert_eq!(
+            auth(&v, good_header(), c.clone()),
+            Err(AuthError::BadSignature)
+        );
+        // An unavailable key service also wins over bad claims.
+        let v = FakeVerifier::new(Err(VerifyError::Unavailable(PortError("x".into()))));
+        assert_eq!(auth(&v, good_header(), c), Err(AuthError::KeysUnavailable));
+    }
+
+    #[test]
+    fn authenticate_owner_checks_claims_once_the_signature_is_good() {
+        let v = FakeVerifier::new(Ok(true));
+        let mut c = good_claims();
+        c.email = Some("someone@else.com".into());
+        assert_eq!(auth(&v, good_header(), c), Err(AuthError::NotOwner));
+        let mut c = good_claims();
+        c.exp = NOW - 3600;
+        assert_eq!(auth(&v, good_header(), c), Err(AuthError::Expired));
     }
 }
