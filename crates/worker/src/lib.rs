@@ -38,7 +38,7 @@ mod entry {
         Response::error(msg, code)
     }
 
-    /// Rejects non-JSON POSTs (415) before the body is read.
+    /// Rejects non-JSON POST and PUT requests (415) before the body is read.
     fn require_json(req: &Request) -> Result<Option<Response>> {
         let header = req.headers().get("Content-Type").ok().flatten();
         if dto::is_json_content_type(header.as_deref()) {

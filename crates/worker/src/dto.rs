@@ -103,8 +103,13 @@ pub struct PatternJson {
 }
 
 /// Splits the body into what `app::set_pattern` takes. An unknown weekday or a
-/// badly formed time is `BadTime`.
+/// badly formed time is `BadTime`, and more than `MAX_RULES` rules is
+/// `TooManyRules`, checked first.
 pub fn pattern_from_json(body: PatternJson) -> Result<(i32, Vec<SlotRule>), SlotError> {
+    // Refuse an oversized list before doing any work per rule.
+    if body.rules.len() > domain::slots::MAX_RULES {
+        return Err(SlotError::TooManyRules);
+    }
     let rules = body
         .rules
         .iter()
@@ -498,6 +503,27 @@ mod tests {
                 "{day} {time}"
             );
         }
+    }
+
+    #[test]
+    fn pattern_json_rejects_too_many_rules_before_mapping_them() {
+        // The rules are not valid weekdays: if they were mapped first the error
+        // would be BadTime, so TooManyRules proves the count is checked first.
+        let rules = (0..=domain::slots::MAX_RULES)
+            .map(|_| rule_json("nope", "zz"))
+            .collect();
+        let body = PatternJson {
+            utc_offset_minutes: 0,
+            rules,
+        };
+        assert_eq!(pattern_from_json(body), Err(SlotError::TooManyRules));
+        let at_limit = PatternJson {
+            utc_offset_minutes: 0,
+            rules: (0..domain::slots::MAX_RULES)
+                .map(|_| rule_json("mon", "06:00"))
+                .collect(),
+        };
+        assert!(pattern_from_json(at_limit).is_ok());
     }
 
     #[test]
