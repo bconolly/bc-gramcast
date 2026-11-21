@@ -1,4 +1,4 @@
-import { useState, type FormEvent } from "react";
+import { useRef, useState, type FormEvent, type ReactNode } from "react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
@@ -26,6 +26,59 @@ function Counter({ n, max }: { n: number; max: number }) {
   );
 }
 
+function CountedField({
+  id,
+  label,
+  n,
+  max,
+  children,
+}: {
+  id: string;
+  label: string;
+  n: number;
+  max: number;
+  children: ReactNode;
+}) {
+  return (
+    <div className="space-y-2">
+      <div className="flex items-baseline justify-between">
+        <Label htmlFor={id}>{label}</Label>
+        <small>
+          <Counter n={n} max={max} />
+        </small>
+      </div>
+      {children}
+    </div>
+  );
+}
+
+function PlatformPicker({
+  selected,
+  onToggle,
+}: {
+  selected: Platform[];
+  onToggle: (id: Platform, on: boolean) => void;
+}) {
+  return (
+    <fieldset className="space-y-2">
+      <legend className="text-sm font-medium">Platforms</legend>
+      <div className="flex gap-6">
+        {PLATFORMS.map((p) => (
+          <label key={p.id} className="flex items-center gap-2 text-sm">
+            <input
+              type="checkbox"
+              className="size-4 accent-primary"
+              checked={selected.includes(p.id)}
+              onChange={(e) => onToggle(p.id, e.target.checked)}
+            />
+            {p.name}
+          </label>
+        ))}
+      </div>
+    </fieldset>
+  );
+}
+
 export function Upload({ onQueued }: { onQueued: () => void }) {
   const [file, setFile] = useState<File | null>(null);
   const [title, setTitle] = useState("");
@@ -34,6 +87,10 @@ export function Upload({ onQueued }: { onQueued: () => void }) {
   const [when, setWhen] = useState("");
   const [problems, setProblems] = useState<string[]>([]);
   const [busy, setBusy] = useState(false);
+  // Key of the video already in storage for the chosen file, so a failed queue
+  // call retries without uploading again. A new file clears it. The upload link
+  // itself is never kept.
+  const uploadedKey = useRef<string | undefined>(undefined);
 
   function toggle(id: Platform, on: boolean) {
     setPlatforms((cur) => (on ? [...cur, id] : cur.filter((p) => p !== id)));
@@ -55,7 +112,10 @@ export function Upload({ onQueued }: { onQueued: () => void }) {
     if (found.length > 0 || !file || slotAt === null) return;
     setBusy(true);
     try {
-      await submitPost({ file, title, caption, platforms, slot_at: slotAt });
+      await submitPost(
+        { file, title, caption, platforms, slot_at: slotAt },
+        { videoKey: uploadedKey.current, onUploaded: (k) => (uploadedKey.current = k) },
+      );
       onQueued();
     } catch (err) {
       setProblems([err instanceof Error ? err.message : "Something went wrong."]);
@@ -71,43 +131,19 @@ export function Upload({ onQueued }: { onQueued: () => void }) {
           id="video"
           type="file"
           accept=".mp4,video/mp4"
-          onChange={(e) => setFile(e.target.files?.[0] ?? null)}
+          onChange={(e) => {
+            uploadedKey.current = undefined;
+            setFile(e.target.files?.[0] ?? null);
+          }}
         />
       </div>
-      <div className="space-y-2">
-        <div className="flex items-baseline justify-between">
-          <Label htmlFor="title">Title</Label>
-          <small>
-            <Counter n={charCount(title)} max={MAX_TITLE_CHARS} />
-          </small>
-        </div>
+      <CountedField id="title" label="Title" n={charCount(title)} max={MAX_TITLE_CHARS}>
         <Input id="title" value={title} onChange={(e) => setTitle(e.target.value)} />
-      </div>
-      <div className="space-y-2">
-        <div className="flex items-baseline justify-between">
-          <Label htmlFor="caption">Caption</Label>
-          <small>
-            <Counter n={charCount(caption)} max={MAX_CAPTION_CHARS} />
-          </small>
-        </div>
+      </CountedField>
+      <CountedField id="caption" label="Caption" n={charCount(caption)} max={MAX_CAPTION_CHARS}>
         <Textarea id="caption" value={caption} onChange={(e) => setCaption(e.target.value)} />
-      </div>
-      <fieldset className="space-y-2">
-        <legend className="text-sm font-medium">Platforms</legend>
-        <div className="flex gap-6">
-          {PLATFORMS.map((p) => (
-            <label key={p.id} className="flex items-center gap-2 text-sm">
-              <input
-                type="checkbox"
-                className="size-4 accent-primary"
-                checked={platforms.includes(p.id)}
-                onChange={(e) => toggle(p.id, e.target.checked)}
-              />
-              {p.name}
-            </label>
-          ))}
-        </div>
-      </fieldset>
+      </CountedField>
+      <PlatformPicker selected={platforms} onToggle={toggle} />
       <div className="space-y-2">
         <Label htmlFor="when">When</Label>
         <Input

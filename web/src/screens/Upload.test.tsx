@@ -98,6 +98,67 @@ describe("Upload", () => {
     expect(screen.getByLabelText("Title")).toHaveValue("Sunday reel");
   });
 
+  it("retries only the queue call after a queue failure, without uploading again", async () => {
+    const fn = vi
+      .fn()
+      .mockResolvedValueOnce(new Response(JSON.stringify({ video_key: "videos/x.mp4", put_url: PUT_URL })))
+      .mockResolvedValueOnce(new Response(""))
+      .mockResolvedValueOnce(new Response("that slot is already taken", { status: 409 }))
+      .mockResolvedValueOnce(new Response("{}", { status: 201 }));
+    vi.stubGlobal("fetch", fn);
+    const onQueued = vi.fn();
+    const user = userEvent.setup();
+    render(<Upload onQueued={onQueued} />);
+    await fillValid(user);
+    await user.click(screen.getByRole("button", { name: "Queue post" }));
+    await screen.findByRole("alert");
+    fireEvent.change(screen.getByLabelText("When"), { target: { value: "2099-03-06T07:04" } });
+    await user.click(screen.getByRole("button", { name: "Queue post" }));
+    await waitFor(() => expect(onQueued).toHaveBeenCalledTimes(1));
+    expect(fn.mock.calls.map((c) => (c as [string])[0])).toEqual([
+      "/api/uploads",
+      PUT_URL,
+      "/api/posts",
+      "/api/posts",
+    ]);
+    const retry = JSON.parse((fn.mock.calls[3] as [string, RequestInit])[1].body as string);
+    expect(retry.video_key).toBe("videos/x.mp4");
+  });
+
+  it("uploads again when a different file is chosen after a failure", async () => {
+    const fn = vi
+      .fn()
+      .mockResolvedValueOnce(new Response(JSON.stringify({ video_key: "videos/x.mp4", put_url: PUT_URL })))
+      .mockResolvedValueOnce(new Response(""))
+      .mockResolvedValueOnce(new Response("that slot is already taken", { status: 409 }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ video_key: "videos/y.mp4", put_url: PUT_URL })))
+      .mockResolvedValueOnce(new Response(""))
+      .mockResolvedValueOnce(new Response("{}", { status: 201 }));
+    vi.stubGlobal("fetch", fn);
+    const onQueued = vi.fn();
+    const user = userEvent.setup();
+    render(<Upload onQueued={onQueued} />);
+    await fillValid(user);
+    await user.click(screen.getByRole("button", { name: "Queue post" }));
+    await screen.findByRole("alert");
+    await user.upload(
+      screen.getByLabelText("Video (MP4)"),
+      new File(["def"], "other.mp4", { type: "video/mp4" }),
+    );
+    await user.click(screen.getByRole("button", { name: "Queue post" }));
+    await waitFor(() => expect(onQueued).toHaveBeenCalledTimes(1));
+    expect(fn.mock.calls.map((c) => (c as [string])[0])).toEqual([
+      "/api/uploads",
+      PUT_URL,
+      "/api/posts",
+      "/api/uploads",
+      PUT_URL,
+      "/api/posts",
+    ]);
+    const body = JSON.parse((fn.mock.calls[5] as [string, RequestInit])[1].body as string);
+    expect(body.video_key).toBe("videos/y.mp4");
+  });
+
   it("never puts the upload link in the page", async () => {
     vi.stubGlobal(
       "fetch",

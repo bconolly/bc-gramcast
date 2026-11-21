@@ -106,16 +106,28 @@ export async function queuePost(body: QueuePostBody): Promise<void> {
   await postJson("/api/posts", body);
 }
 
-/** Upload, PUT, then queue. Stops at the first failure. */
-export async function submitPost(input: SubmitInput): Promise<void> {
-  const ticket = await startUpload({
-    file_name: input.file.name,
-    content_type: "video/mp4",
-    size_bytes: input.file.size,
-  });
-  await putVideo(ticket.put_url, input.file);
+/**
+ * Upload, PUT, then queue. Stops at the first failure. When `resume.videoKey` is
+ * set the video is already in storage, so only the queue call runs. `onUploaded`
+ * gets the key (never the upload link) once the PUT has succeeded.
+ */
+export async function submitPost(
+  input: SubmitInput,
+  resume: { videoKey?: string; onUploaded?: (videoKey: string) => void } = {},
+): Promise<void> {
+  let videoKey = resume.videoKey;
+  if (videoKey === undefined) {
+    const ticket = await startUpload({
+      file_name: input.file.name,
+      content_type: "video/mp4",
+      size_bytes: input.file.size,
+    });
+    await putVideo(ticket.put_url, input.file);
+    videoKey = ticket.video_key;
+    resume.onUploaded?.(videoKey);
+  }
   await queuePost({
-    video_key: ticket.video_key,
+    video_key: videoKey,
     title: input.title,
     caption: input.caption,
     platforms: input.platforms,
