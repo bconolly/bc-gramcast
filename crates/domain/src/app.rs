@@ -20,12 +20,20 @@ pub trait UploadSigner {
     ) -> Result<String, PortError>;
 }
 
+/// Why an insert failed. `SlotTaken` is the lost-race case: another request
+/// took the slot between our check and the insert.
+#[derive(Debug, PartialEq, Eq)]
+pub enum InsertError {
+    SlotTaken,
+    Port(PortError),
+}
+
 /// Persistence port for queued posts.
 #[allow(async_fn_in_trait)]
 pub trait PostRepository {
     async fn all(&self) -> Result<Vec<QueuedPost>, PortError>;
     /// Must fail if the slot is already taken, so two requests can't race.
-    async fn insert(&self, post: &QueuedPost) -> Result<(), PortError>;
+    async fn insert(&self, post: &QueuedPost) -> Result<(), InsertError>;
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -60,7 +68,11 @@ pub async fn queue_post(repo: &impl PostRepository, post: QueuedPost) -> Result<
     let existing = repo.all().await.map_err(AppError::Port)?;
     let mut queue = Queue::from_posts(existing).map_err(AppError::Queue)?;
     queue.add(post.clone()).map_err(AppError::Queue)?;
-    repo.insert(&post).await.map_err(AppError::Port)
+    let slot_at = post.slot_at;
+    repo.insert(&post).await.map_err(|e| match e {
+        InsertError::SlotTaken => AppError::Queue(QueueError::SlotTaken { slot_at }),
+        InsertError::Port(p) => AppError::Port(p),
+    })
 }
 
 pub async fn upcoming(repo: &impl PostRepository, now: i64) -> Result<Vec<QueuedPost>, AppError> {
@@ -90,9 +102,20 @@ mod tests {
         async fn all(&self) -> Result<Vec<QueuedPost>, PortError> {
             Ok(self.posts.borrow().clone())
         }
-        async fn insert(&self, post: &QueuedPost) -> Result<(), PortError> {
+        async fn insert(&self, post: &QueuedPost) -> Result<(), InsertError> {
             self.posts.borrow_mut().push(post.clone());
             Ok(())
+        }
+    }
+
+    /// Passes the `all()` check, then loses the race at insert time.
+    struct RacingRepo;
+    impl PostRepository for RacingRepo {
+        async fn all(&self) -> Result<Vec<QueuedPost>, PortError> {
+            Ok(vec![])
+        }
+        async fn insert(&self, _post: &QueuedPost) -> Result<(), InsertError> {
+            Err(InsertError::SlotTaken)
         }
     }
 
@@ -140,6 +163,15 @@ mod tests {
             Err(AppError::Queue(QueueError::SlotTaken { slot_at: 100 }))
         );
         assert_eq!(repo.posts.borrow().len(), 1);
+    }
+
+    #[test]
+    fn queue_post_maps_a_lost_slot_race_to_slot_taken() {
+        let e = pollster::block_on(queue_post(&RacingRepo, post("a", 100)));
+        assert_eq!(
+            e,
+            Err(AppError::Queue(QueueError::SlotTaken { slot_at: 100 }))
+        );
     }
 
     #[test]

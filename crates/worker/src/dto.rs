@@ -1,7 +1,7 @@
 //! JSON shapes for the API, and mapping to and from the domain. No logic here.
 
 use domain::app::AppError;
-use domain::queue::{Platform, QueuedPost};
+use domain::queue::{Platform, QueueError, QueuedPost};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Deserialize)]
@@ -84,10 +84,16 @@ pub fn to_json(p: &QueuedPost) -> PostJson {
     }
 }
 
+/// True when D1's error text says the slot's UNIQUE constraint failed.
+pub fn is_slot_conflict(text: &str) -> bool {
+    text.contains("UNIQUE constraint failed: posts.slot_at")
+}
+
 /// HTTP status and a safe message. Port errors never leak their detail.
 pub fn error_status(e: &AppError) -> (u16, String) {
     match e {
         AppError::Upload(u) => (422, format!("upload rejected: {u:?}")),
+        AppError::Queue(QueueError::SlotTaken { .. }) => (409, "slot already taken".into()),
         AppError::Queue(q) => (422, format!("post rejected: {q:?}")),
         AppError::Port(_) => (500, "storage error".into()),
     }
@@ -97,7 +103,6 @@ pub fn error_status(e: &AppError) -> (u16, String) {
 mod tests {
     use super::*;
     use domain::app::PortError;
-    use domain::queue::QueueError;
 
     fn body() -> QueuePostBody {
         QueuePostBody {
@@ -136,6 +141,23 @@ mod tests {
     fn port_errors_do_not_leak_detail() {
         let (code, msg) = error_status(&AppError::Port(PortError("D1: secret table".into())));
         assert_eq!((code, msg.as_str()), (500, "storage error"));
+    }
+
+    #[test]
+    fn slot_taken_is_409() {
+        let (code, _) = error_status(&AppError::Queue(QueueError::SlotTaken { slot_at: 5 }));
+        assert_eq!(code, 409);
+    }
+
+    #[test]
+    fn detects_a_d1_slot_conflict_by_its_text() {
+        assert!(is_slot_conflict(
+            "D1_ERROR: UNIQUE constraint failed: posts.slot_at: SQLITE_CONSTRAINT"
+        ));
+        assert!(!is_slot_conflict(
+            "UNIQUE constraint failed: posts.video_key"
+        ));
+        assert!(!is_slot_conflict("network down"));
     }
 
     #[test]

@@ -1,7 +1,7 @@
 //! Cloudflare adapters for the domain ports: D1 for posts, R2 presigning for uploads.
 
 use crate::dto;
-use domain::app::{PortError, PostRepository, UploadSigner};
+use domain::app::{InsertError, PortError, PostRepository, UploadSigner};
 use domain::queue::QueuedPost;
 use serde::Deserialize;
 use worker::{D1Database, Env};
@@ -28,6 +28,15 @@ struct PostRow {
 
 fn port_err(e: impl std::fmt::Debug) -> PortError {
     PortError(format!("{e:?}"))
+}
+
+/// Maps D1's text for a UNIQUE violation on the slot to `SlotTaken`.
+fn insert_err(text: &str) -> InsertError {
+    if dto::is_slot_conflict(text) {
+        InsertError::SlotTaken
+    } else {
+        InsertError::Port(PortError(text.to_string()))
+    }
 }
 
 impl PostRepository for D1PostRepository {
@@ -60,7 +69,7 @@ impl PostRepository for D1PostRepository {
             .collect()
     }
 
-    async fn insert(&self, post: &QueuedPost) -> Result<(), PortError> {
+    async fn insert(&self, post: &QueuedPost) -> Result<(), InsertError> {
         let platforms: Vec<&str> = post
             .platforms
             .iter()
@@ -79,10 +88,10 @@ impl PostRepository for D1PostRepository {
                 platforms.join(",").into(),
                 (post.slot_at as f64).into(),
             ])
-            .map_err(port_err)?
+            .map_err(|e| InsertError::Port(port_err(e)))?
             .run()
             .await
-            .map_err(port_err)?;
+            .map_err(|e| insert_err(&e.to_string()))?;
         Ok(())
     }
 }
