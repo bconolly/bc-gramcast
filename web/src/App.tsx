@@ -17,11 +17,13 @@ export function App() {
             href={PAYHIP_URL}
             target="_blank"
             rel="noopener noreferrer"
-            aria-label="BC Guides on Payhip"
-            className="text-muted-foreground mt-1 flex items-center gap-2 text-xs hover:underline"
+            className="text-muted-foreground -my-2.5 flex min-h-11 items-center gap-2 py-2.5 text-xs hover:underline"
           >
             <img src="/brand/bc-monogram.png" alt="" width={24} height={24} className="size-6" />
-            <span>by BC Guides</span>
+            <span>
+              by BC Guides{" "}
+              <span className="sr-only">on Payhip (opens in new tab)</span>
+            </span>
           </a>
         </div>
         <nav className="flex gap-1" aria-label="Screens">
@@ -44,8 +46,8 @@ export function App() {
       <main>
         {screen === "queue" ? <Queue /> : <Upload onQueued={() => setScreen("queue")} />}
       </main>
-      <footer className="border-border mt-10 flex flex-col items-start justify-between gap-1 border-t pt-4 sm:flex-row sm:items-center">
-        <div className="flex items-center gap-2 text-[13px] text-[#52525b]">
+      <footer className="border-border mt-10 flex flex-wrap items-center justify-between gap-x-4 gap-y-1 border-t pt-4">
+        <div className="flex items-center gap-2 text-muted-foreground text-[13px]">
           <img src="/brand/bc-monogram.png" alt="" width={24} height={24} className="size-6" />
           <span>Made by BC Guides</span>
         </div>
@@ -53,9 +55,12 @@ export function App() {
           href={PAYHIP_URL}
           target="_blank"
           rel="noopener noreferrer"
-          className="inline-flex min-h-11 items-center text-[13px] font-medium text-[#2b7363] hover:underline"
+          className="inline-flex min-h-11 items-center text-[13px] font-medium text-brand-accent hover:underline"
         >
-          Shop the guides →
+          <span>
+            Shop the guides <span aria-hidden="true">→</span>{" "}
+            <span className="sr-only">(opens in new tab)</span>
+          </span>
         </a>
       </footer>
     </div>

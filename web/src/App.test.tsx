@@ -31,7 +31,7 @@ describe("App", () => {
     };
     const expectBranding = () => {
       const banner = screen.getByRole("banner");
-      const headerLink = within(banner).getByRole("link", { name: "BC Guides on Payhip" });
+      const headerLink = within(banner).getByRole("link", { name: /^by BC Guides on Payhip \(opens in new tab\)$/ });
       expectLink(headerLink);
       expect(within(headerLink).getByText("by BC Guides")).toBeInTheDocument();
       expect(within(headerLink).getByRole("presentation")).toHaveAttribute("src", "/brand/bc-monogram.png");
@@ -39,7 +39,10 @@ describe("App", () => {
       const footer = screen.getByRole("contentinfo");
       expect(within(footer).getByText("Made by BC Guides")).toBeInTheDocument();
       expect(within(footer).getByRole("presentation")).toHaveAttribute("src", "/brand/bc-monogram.png");
-      expectLink(within(footer).getByRole("link", { name: "Shop the guides →" }));
+      const shop = within(footer).getByRole("link", { name: /Shop the guides/ });
+      expectLink(shop);
+      expect(shop).toHaveAccessibleName("Shop the guides (opens in new tab)");
+      expect(shop.querySelector('[aria-hidden="true"]')).toHaveTextContent("→");
       expect(screen.queryByAltText("BC Guides")).not.toBeInTheDocument();
     };
     expectBranding();
