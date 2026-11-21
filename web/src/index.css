@@ -41,3 +41,12 @@ body {
   color: var(--foreground);
   font-family: ui-sans-serif, system-ui, sans-serif;
 }
+
+/* Tailwind 4 borders default to currentColor; use the theme border colour. */
+@layer base {
+  *,
+  ::before,
+  ::after {
+    border-color: var(--border);
+  }
+}
