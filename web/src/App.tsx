@@ -2,7 +2,7 @@ import { useState } from "react";
 import { Button } from "@/components/ui/button";
 import { Queue } from "@/screens/Queue";
 import { Upload } from "@/screens/Upload";
-import { PAYHIP_URL } from "@/lib/brand";
+import { PAYHIP_URL, PROMO_CTA } from "@/lib/brand";
 
 type Screen = "queue" | "upload";
 
@@ -46,22 +46,24 @@ export function App() {
       <main>
         {screen === "queue" ? <Queue /> : <Upload onQueued={() => setScreen("queue")} />}
       </main>
-      <footer className="border-border mt-10 flex flex-wrap items-center justify-between gap-x-4 gap-y-1 border-t pt-4">
-        <div className="flex items-center gap-2 text-muted-foreground text-[13px]">
-          <img src="/brand/bc-monogram.png" alt="" width={24} height={24} className="size-6" />
-          <span>Made by BC Guides</span>
-        </div>
-        <a
-          href={PAYHIP_URL}
-          target="_blank"
-          rel="noopener noreferrer"
-          className="inline-flex min-h-11 items-center text-[13px] font-medium text-brand-accent hover:underline"
-        >
-          <span>
-            Shop the guides <span aria-hidden="true">→</span>{" "}
+      <footer className="border-border mt-10 border-t pt-4">
+        <div className="border-border bg-card flex items-center gap-3 rounded-xl border p-3">
+          <img src="/brand/bc-monogram.png" alt="" width={36} height={36} className="size-9 shrink-0" />
+          <p className="text-muted-foreground min-w-0 flex-1 text-[13px]">
+            Built with the <strong className="text-foreground font-semibold">Beyond vibe coding</strong> guide by BC
+            Guides.
+          </p>
+          <a
+            href={PAYHIP_URL}
+            target="_blank"
+            rel="noopener noreferrer"
+            className="bg-brand-navy inline-flex min-h-11 shrink-0 items-center rounded-md px-3 text-[13px] font-medium text-white hover:opacity-90"
+          >
+            {PROMO_CTA}
+            {" "}
             <span className="sr-only">(opens in new tab)</span>
-          </span>
-        </a>
+          </a>
+        </div>
       </footer>
     </div>
   );

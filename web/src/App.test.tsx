@@ -2,7 +2,7 @@ import { render, screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { App } from "@/App";
-import { PAYHIP_URL } from "@/lib/brand";
+import { PAYHIP_URL, PROMO_CTA } from "@/lib/brand";
 
 afterEach(() => vi.unstubAllGlobals());
 
@@ -18,7 +18,7 @@ describe("App", () => {
     expect(await screen.findByText("Nothing queued yet.")).toBeInTheDocument();
   });
 
-  it("links the header brand and the footer shop link to Payhip on both screens", async () => {
+  it("links the header brand and the footer promo link to Payhip on both screens", async () => {
     vi.stubGlobal("fetch", vi.fn().mockImplementation(() => Promise.resolve(new Response("[]"))));
     const user = userEvent.setup();
     render(<App />);
@@ -37,12 +37,14 @@ describe("App", () => {
       expect(within(headerLink).getByRole("presentation")).toHaveAttribute("src", "/brand/bc-monogram.png");
       expect(within(banner).getByRole("heading", { name: "Gramcast" }).closest("a")).toBeNull();
       const footer = screen.getByRole("contentinfo");
-      expect(within(footer).getByText("Made by BC Guides")).toBeInTheDocument();
+      expect(footer).toHaveTextContent("Built with the Beyond vibe coding guide by BC Guides.");
+      expect(within(footer).getByText("Beyond vibe coding").tagName).toBe("STRONG");
       expect(within(footer).getByRole("presentation")).toHaveAttribute("src", "/brand/bc-monogram.png");
-      const shop = within(footer).getByRole("link", { name: /Shop the guides/ });
-      expectLink(shop);
-      expect(shop).toHaveAccessibleName("Shop the guides (opens in new tab)");
-      expect(shop.querySelector('[aria-hidden="true"]')).toHaveTextContent("→");
+      const cta = within(footer).getByRole("link", { name: /See the guide/ });
+      expectLink(cta);
+      expect(PROMO_CTA).toBe("See the guide");
+      expect(cta).toHaveAccessibleName("See the guide (opens in new tab)");
+      expect(within(footer).queryByText(/Shop the guides|Made by BC Guides/)).not.toBeInTheDocument();
       expect(screen.queryByAltText("BC Guides")).not.toBeInTheDocument();
     };
     expectBranding();
