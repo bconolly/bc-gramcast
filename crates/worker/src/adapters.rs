@@ -2,8 +2,11 @@
 //! the R2 binding for uploads.
 
 use crate::dto;
-use domain::app::{InsertError, PortError, PostRepository, UploadSigner, UploadStore};
+use domain::app::{
+    InsertError, PortError, PostRepository, SlotPatternRepository, UploadSigner, UploadStore,
+};
 use domain::queue::QueuedPost;
+use domain::slots::SlotPattern;
 use serde::Deserialize;
 use worker::{Bucket, D1Database, Env};
 
@@ -110,6 +113,58 @@ impl PostRepository for D1PostRepository {
             .run()
             .await
             .map_err(|e| dto::classify_insert_error(&d1_error_text(&e)))?;
+        Ok(())
+    }
+}
+
+pub struct D1SlotPatternRepository {
+    db: D1Database,
+}
+
+impl D1SlotPatternRepository {
+    pub fn new(db: D1Database) -> Self {
+        Self { db }
+    }
+}
+
+#[derive(Deserialize)]
+struct PatternRow {
+    utc_offset_minutes: f64,
+    rules: String,
+}
+
+impl SlotPatternRepository for D1SlotPatternRepository {
+    async fn get(&self) -> Result<Option<SlotPattern>, PortError> {
+        let row = self
+            .db
+            .prepare("SELECT utc_offset_minutes, rules FROM slot_pattern WHERE id = 1")
+            .first::<PatternRow>(None)
+            .await
+            .map_err(port_err)?;
+        row.map(|r| {
+            // The row text is never logged or returned, only that it was bad.
+            SlotPattern::from_stored(r.utc_offset_minutes as i32, &r.rules).map_err(|_| {
+                worker::console_error!("bad slot_pattern row");
+                PortError("bad slot_pattern row".into())
+            })
+        })
+        .transpose()
+    }
+
+    async fn save(&self, p: &SlotPattern) -> Result<(), PortError> {
+        self.db
+            .prepare(
+                "INSERT INTO slot_pattern (id, utc_offset_minutes, rules) VALUES (1, ?1, ?2) \
+                 ON CONFLICT(id) DO UPDATE SET utc_offset_minutes = excluded.utc_offset_minutes, rules = excluded.rules",
+            )
+            .bind(&[
+                f64::from(p.utc_offset_minutes).into(),
+                p.rules_to_stored().into(),
+            ])
+            .map_err(port_err)?
+            .run()
+            .await
+            .map_err(port_err)?;
         Ok(())
     }
 }

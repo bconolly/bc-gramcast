@@ -7,8 +7,8 @@ mod adapters;
 
 #[cfg(target_arch = "wasm32")]
 mod entry {
-    use crate::adapters::{D1PostRepository, R2Signer, R2Store};
-    use crate::dto::{self, QueuePostBody, StartUploadBody};
+    use crate::adapters::{D1PostRepository, D1SlotPatternRepository, R2Signer, R2Store};
+    use crate::dto::{self, PatternJson, QueuePostBody, StartUploadBody};
     use domain::app;
     use worker::*;
 
@@ -106,6 +106,43 @@ mod entry {
                         let out: Vec<_> = posts.iter().map(dto::to_json).collect();
                         Response::from_json(&out)
                     }
+                    Err(e) => app_error(&e),
+                }
+            })
+            .get_async("/api/slots/pattern", |_req, ctx| async move {
+                let repo = D1SlotPatternRepository::new(ctx.env.d1("DB")?);
+                match app::get_pattern(&repo).await {
+                    Ok(Some(p)) => Response::from_json(&dto::pattern_to_json(&p)),
+                    Ok(None) => Response::from_json(&dto::default_pattern_json()),
+                    Err(e) => app_error(&e),
+                }
+            })
+            .put_async("/api/slots/pattern", |mut req, ctx| async move {
+                if let Some(rejected) = require_json(&req)? {
+                    return Ok(rejected);
+                }
+                let Ok(body) = req.json::<PatternJson>().await else {
+                    return Response::error("bad request", 400);
+                };
+                let (offset, rules) = match dto::pattern_from_json(body) {
+                    Ok(parts) => parts,
+                    Err(e) => return app_error(&app::AppError::Slots(e)),
+                };
+                let repo = D1SlotPatternRepository::new(ctx.env.d1("DB")?);
+                match app::set_pattern(&repo, offset, rules).await {
+                    Ok(p) => Response::from_json(&dto::pattern_to_json(&p)),
+                    Err(e) => app_error(&e),
+                }
+            })
+            .get_async("/api/slots/next", |req, ctx| async move {
+                let url = req.url()?;
+                let Some(count) = dto::parse_next_count(url.query()) else {
+                    return Response::error("count must be a whole number from 1 to 20", 422);
+                };
+                let patterns = D1SlotPatternRepository::new(ctx.env.d1("DB")?);
+                let posts = D1PostRepository::new(ctx.env.d1("DB")?);
+                match app::next_slots(&patterns, &posts, now_secs(), count).await {
+                    Ok(slots) => Response::from_json(&serde_json::json!({ "slots": slots })),
                     Err(e) => app_error(&e),
                 }
             })
