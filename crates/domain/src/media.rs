@@ -19,6 +19,15 @@ pub enum UploadError {
     BadId,
 }
 
+/// The one safe id shape, `[A-Za-z0-9_-]{1,64}`, shared by storage keys and the
+/// queue's video key check so the two can never drift apart.
+pub fn is_safe_id(id: &str) -> bool {
+    (1..=64).contains(&id.len())
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+}
+
 impl VideoUpload {
     pub fn new(file_name: &str, content_type: &str, size_bytes: u64) -> Result<Self, UploadError> {
         if file_name.len() > MAX_FILE_NAME_BYTES
@@ -48,12 +57,7 @@ impl VideoUpload {
 
     /// Storage key for R2. Never uses the raw file name, so it can't escape the prefix.
     pub fn storage_key(&self, id: &str) -> Result<String, UploadError> {
-        let safe = !id.is_empty()
-            && id.len() <= 64
-            && id
-                .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_');
-        if !safe {
+        if !is_safe_id(id) {
             return Err(UploadError::BadId);
         }
         Ok(format!("videos/{id}.mp4"))
@@ -120,6 +124,16 @@ mod tests {
         let v = VideoUpload::new("reel.mp4", "video/mp4", 10).unwrap();
         assert_eq!(v.storage_key("../secrets/x"), Err(UploadError::BadId));
         assert_eq!(v.storage_key(""), Err(UploadError::BadId));
+    }
+
+    #[test]
+    fn safe_id_shape_is_one_to_64_url_safe_chars() {
+        assert!(is_safe_id("a"));
+        assert!(is_safe_id("A-z_9"));
+        assert!(is_safe_id(&"a".repeat(64)));
+        for bad in ["", "a b", "a/b", "a.b", "é", "a\n", &"a".repeat(65)] {
+            assert!(!is_safe_id(bad), "{bad:?}");
+        }
     }
 
     #[test]

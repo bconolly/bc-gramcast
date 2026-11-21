@@ -20,11 +20,13 @@ pub trait UploadSigner {
     ) -> Result<String, PortError>;
 }
 
-/// Why an insert failed. `SlotTaken` is the lost-race case: another request
-/// took the slot between our check and the insert.
+/// Why an insert failed. `SlotTaken` and `VideoAlreadyQueued` are the
+/// lost-race cases: another request took the slot or video between our check
+/// and the insert.
 #[derive(Debug, PartialEq, Eq)]
 pub enum InsertError {
     SlotTaken,
+    VideoAlreadyQueued,
     Port(PortError),
 }
 
@@ -32,7 +34,7 @@ pub enum InsertError {
 #[allow(async_fn_in_trait)]
 pub trait PostRepository {
     async fn all(&self) -> Result<Vec<QueuedPost>, PortError>;
-    /// Must fail if the slot is already taken, so two requests can't race.
+    /// Must fail if the slot or video is already taken, so two requests can't race.
     async fn insert(&self, post: &QueuedPost) -> Result<(), InsertError>;
 }
 
@@ -71,18 +73,18 @@ pub async fn queue_post(
 ) -> Result<(), AppError> {
     validate_slot(post.slot_at, now).map_err(AppError::Queue)?;
     let existing = repo.all().await.map_err(AppError::Port)?;
-    let mut queue = Queue::from_posts(existing).map_err(AppError::Queue)?;
+    let mut queue = Queue::from_stored(existing);
     queue.add(post.clone()).map_err(AppError::Queue)?;
     let slot_at = post.slot_at;
     repo.insert(&post).await.map_err(|e| match e {
         InsertError::SlotTaken => AppError::Queue(QueueError::SlotTaken { slot_at }),
+        InsertError::VideoAlreadyQueued => AppError::Queue(QueueError::VideoAlreadyQueued),
         InsertError::Port(p) => AppError::Port(p),
     })
 }
 
 pub async fn upcoming(repo: &impl PostRepository, now: i64) -> Result<Vec<QueuedPost>, AppError> {
-    let queue =
-        Queue::from_posts(repo.all().await.map_err(AppError::Port)?).map_err(AppError::Queue)?;
+    let queue = Queue::from_stored(repo.all().await.map_err(AppError::Port)?);
     Ok(queue.upcoming(now).into_iter().cloned().collect())
 }
 
@@ -178,6 +180,54 @@ mod tests {
         let far = pollster::block_on(queue_post(&repo, 500, post("b", 4_102_444_801)));
         assert_eq!(far, Err(AppError::Queue(QueueError::SlotOutOfRange)));
         assert!(repo.posts.borrow().is_empty());
+    }
+
+    #[test]
+    fn queue_post_refuses_a_video_already_queued_without_storing() {
+        let repo = FakeRepo::default();
+        repo.posts.borrow_mut().push(post("a", 100));
+        let mut dup = post("b", 200);
+        dup.video_key = "videos/a.mp4".into();
+        let e = pollster::block_on(queue_post(&repo, 0, dup));
+        assert_eq!(e, Err(AppError::Queue(QueueError::VideoAlreadyQueued)));
+        assert_eq!(repo.posts.borrow().len(), 1);
+    }
+
+    #[test]
+    fn queue_post_is_not_blocked_by_odd_stored_rows() {
+        let repo = FakeRepo::default();
+        let mut old = post("old", 50);
+        old.video_key = "legacy/odd key".into();
+        old.title.clear();
+        repo.posts.borrow_mut().push(old);
+        pollster::block_on(queue_post(&repo, 0, post("a", 100))).unwrap();
+        assert_eq!(repo.posts.borrow().len(), 2);
+    }
+
+    #[test]
+    fn upcoming_lists_odd_stored_rows_instead_of_failing() {
+        let repo = FakeRepo::default();
+        let mut old = post("old", 150);
+        old.platforms.clear();
+        repo.posts.borrow_mut().push(old);
+        assert_eq!(pollster::block_on(upcoming(&repo, 100)).unwrap().len(), 1);
+    }
+
+    /// Passes the `all()` check, then loses a video race at insert time.
+    struct VideoRacingRepo;
+    impl PostRepository for VideoRacingRepo {
+        async fn all(&self) -> Result<Vec<QueuedPost>, PortError> {
+            Ok(vec![])
+        }
+        async fn insert(&self, _post: &QueuedPost) -> Result<(), InsertError> {
+            Err(InsertError::VideoAlreadyQueued)
+        }
+    }
+
+    #[test]
+    fn queue_post_maps_a_lost_video_race() {
+        let e = pollster::block_on(queue_post(&VideoRacingRepo, 0, post("a", 100)));
+        assert_eq!(e, Err(AppError::Queue(QueueError::VideoAlreadyQueued)));
     }
 
     #[test]
