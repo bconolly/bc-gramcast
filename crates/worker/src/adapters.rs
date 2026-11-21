@@ -263,8 +263,10 @@ fn now_secs() -> i64 {
 
 /// If the request that is fetching the keys is dropped (the client went away),
 /// this marks the fetch as failed so the cache is not left "fetching" until the
-/// timeout. It cannot be unit tested natively (it needs the wasm runtime); the
-/// logic it calls, `KeyCache::fetch_failed`, is tested in the domain.
+/// timeout. That the runtime drops the future when the client disconnects is
+/// assumed, not verified; the 30 s fetch timeout in `KeyCache` is the backstop.
+/// It cannot be unit tested natively (it needs the wasm runtime); the logic it
+/// calls, `KeyCache::fetch_failed`, is tested in the domain.
 struct FetchGuard {
     started: i64,
     finished: bool,
