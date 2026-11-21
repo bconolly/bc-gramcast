@@ -13,9 +13,11 @@ export type SlotOptions =
  * The next free pattern slots and the one the owner has picked. `choice` is a slot's
  * Unix seconds, or null for "Pick another time".
  *
-XX the first slot is preselected. It resolves to the new choice, or
- * undefined when a newer lookup (or unmounting) made this one stale. The first
- * lookup keeps "Pick another time" when `typed` says the owner already typed a time.
+ * `refresh(keepOther)` looks again; unless `keepOther`, the first slot is preselected.
+ * It resolves to the new choice, or undefined when a newer lookup (or unmounting)
+ * made this one stale. The first lookup keeps "Pick another time" when `typed` says
+ * the owner is already typing a time (focused or has typed something), so nothing
+ * is chosen for them mid-entry.
  */
 export function useSlotOptions(typed: boolean) {
   const [options, setOptions] = useState<SlotOptions>({ status: "loading" });
@@ -48,6 +50,16 @@ export function useSlotOptions(typed: boolean) {
     return picked;
   }, []);
 
+  /**
+   * After a taken-slot error: look again. A chosen "Pick another time" stays as it was.
+   * True when a chosen slot was moved to the first free one.
+   */
+  const refreshAfterTaken = useCallback(async (): Promise<boolean> => {
+    const hadSlot = options.status === "ready" && choice !== null;
+    const picked = await refresh(!hadSlot);
+    return hadSlot && typeof picked === "number";
+  }, [options, choice, refresh]);
+
   useEffect(() => {
     live.current = true;
     void refresh();
@@ -56,5 +68,5 @@ export function useSlotOptions(typed: boolean) {
     };
   }, [refresh]);
 
-  return { options, choice, setChoice, refresh };
+  return { options, choice, setChoice, refresh, refreshAfterTaken };
 }

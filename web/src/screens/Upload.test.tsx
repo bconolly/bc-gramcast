@@ -471,9 +471,49 @@ describe("Upload slot picker: while the slots load", () => {
   it("keeps the typed time under Pick another time when the slots arrive after typing", async () => {
     const { release } = stubHeld();
     render(<Upload onQueued={vi.fn()} onOpenSlots={vi.fn()} />);
-    fireEvent.change(screen.getByLabelText("When"), { target: { value: "2099-03-05T07:04" } });
+    const input = screen.getByLabelText("When");
+    fireEvent.change(input, { target: { value: "2099-03-05T07:04" } });
     release(slotsReply(SLOT_A));
     expect(await screen.findByRole("radio", { name: "Pick another time" })).toBeChecked();
-    expect(screen.getByLabelText("Date and time")).toHaveValue("2099-03-05T07:04");
+    expect(screen.getByLabelText("Date and time")).toBe(input);
+    expect(input).toHaveValue("2099-03-05T07:04");
+  });
+
+  it("keeps the focused, empty input and preselects nothing when the slots arrive", async () => {
+    const { release } = stubHeld();
+    render(<Upload onQueued={vi.fn()} onOpenSlots={vi.fn()} />);
+    const input = screen.getByLabelText("When");
+    input.focus();
+    release(slotsReply(SLOT_A));
+    expect(await screen.findByRole("radio", { name: "Pick another time" })).toBeChecked();
+    expect(screen.getByRole("radio", { name: "Wed 04/03/2099 19:00" })).not.toBeChecked();
+    expect(screen.getByLabelText("Date and time")).toBe(input);
+    expect(input).toHaveFocus();
+  });
+});
+
+describe("Upload slot picker: while busy", () => {
+  it("disables the slot radios while the slots are refreshed after a 409", async () => {
+    let release: (r: Response) => void = () => {};
+    const gate = new Promise<Response>((r) => (release = r));
+    let lookups = 0;
+    const queue = [ticket(), new Response(""), new Response(TAKEN, { status: 409 })];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn<(url: string) => Promise<Response>>((url) => {
+        if (url === "/api/slots/pattern") return Promise.resolve(json({ utc_offset_minutes: 600, rules: [] }));
+        if (url.startsWith("/api/slots/next")) return ++lookups === 1 ? Promise.resolve(slotsReply(SLOT_A, SLOT_B)) : gate;
+        return Promise.resolve(queue.shift() ?? new Response("unexpected", { status: 500 }));
+      }),
+    );
+    const user = userEvent.setup();
+    render(<Upload onQueued={vi.fn()} onOpenSlots={vi.fn()} />);
+    await screen.findByRole("radio", { name: "Wed 04/03/2099 19:00" });
+    await fillWithoutWhen(user);
+    await user.click(screen.getByRole("button", { name: "Queue post" }));
+    await screen.findByRole("alert");
+    expect(screen.getByRole("radio", { name: "Fri 06/03/2099 08:30" })).toBeDisabled();
+    release(slotsReply(SLOT_B, SLOT_C));
+    await waitFor(() => expect(screen.getByRole("radio", { name: "Fri 06/03/2099 08:30" })).toBeEnabled());
   });
 });

@@ -81,6 +81,17 @@ function PlatformPicker({
   );
 }
 
+function Problems({ problems }: { problems: string[] }) {
+  if (problems.length === 0) return null;
+  return (
+    <ul role="alert" className="list-disc space-y-1 pl-5 text-sm text-destructive">
+      {problems.map((m) => (
+        <li key={m}>{m}</li>
+      ))}
+    </ul>
+  );
+}
+
 export function Upload({ onQueued, onOpenSlots }: { onQueued: () => void; onOpenSlots: () => void }) {
   const [file, setFile] = useState<File | null>(null);
   const [title, setTitle] = useState("");
@@ -89,7 +100,8 @@ export function Upload({ onQueued, onOpenSlots }: { onQueued: () => void; onOpen
   const [when, setWhen] = useState("");
   const [problems, setProblems] = useState<string[]>([]);
   const [busy, setBusy] = useState(false);
-  const slotOptions = useSlotOptions(when !== "");
+  const [editing, setEditing] = useState(false);
+  const slotOptions = useSlotOptions(when !== "" || editing);
   // Key of the video already in storage for the chosen file, so a failed queue
   // call retries without uploading again. A new file clears it. The upload link
   // itself is never kept.
@@ -97,16 +109,6 @@ export function Upload({ onQueued, onOpenSlots }: { onQueued: () => void; onOpen
 
   function toggle(id: Platform, on: boolean) {
     setPlatforms((cur) => (on ? [...cur, id] : cur.filter((p) => p !== id)));
-  }
-
-  /**
-   * Someone else took the slot: look again. A chosen "Pick another time" stays as it
-   * was; a chosen slot moves to the first free one, and the owner is told.
-   */
-  async function refreshAfterTaken(message: string) {
-    const hadRadio = slotOptions.options.status === "ready" && slotOptions.choice !== null;
-    const picked = await slotOptions.refresh(!hadRadio);
-    if (hadRadio && typeof picked === "number") setProblems([message, "We have picked the next free slot."]);
   }
 
   async function onSubmit(e: FormEvent) {
@@ -136,7 +138,9 @@ export function Upload({ onQueued, onOpenSlots }: { onQueued: () => void; onOpen
     } catch (err) {
       const message = err instanceof Error ? err.message : "Something went wrong.";
       setProblems([message]);
-      if (isSlotTaken(err)) await refreshAfterTaken(message);
+      if (isSlotTaken(err) && (await slotOptions.refreshAfterTaken())) {
+        setProblems([message, "We have picked the next free slot."]);
+      }
       setBusy(false);
     }
   }
@@ -168,15 +172,11 @@ export function Upload({ onQueued, onOpenSlots }: { onQueued: () => void; onOpen
         onChoice={slotOptions.setChoice}
         when={when}
         onWhen={setWhen}
+        onEditing={setEditing}
+        disabled={busy}
         onOpenSlots={onOpenSlots}
       />
-      {problems.length > 0 && (
-        <ul role="alert" className="list-disc space-y-1 pl-5 text-sm text-destructive">
-          {problems.map((m) => (
-            <li key={m}>{m}</li>
-          ))}
-        </ul>
-      )}
+      <Problems problems={problems} />
       <Button type="submit" disabled={busy} className="w-full sm:w-auto">
         {busy ? "Queueing…" : "Queue post"}
       </Button>

@@ -11,14 +11,31 @@ interface Props {
   onChoice: (slot: number | null) => void;
   when: string;
   onWhen: (value: string) => void;
+  /** True while the date input has focus, so slots arriving do not choose for the owner. */
+  onEditing: (editing: boolean) => void;
+  disabled: boolean;
   onOpenSlots: () => void;
 }
 
-function WhenInput({ id, label, when, onWhen }: { id: string; label: string; when: string; onWhen: (v: string) => void }) {
+function WhenInput(props: {
+  id: string;
+  label: string;
+  when: string;
+  onWhen: (v: string) => void;
+  onEditing: (editing: boolean) => void;
+}) {
   return (
     <div className="space-y-2">
-      <Label htmlFor={id}>{label}</Label>
-      <Input id={id} type="datetime-local" className="min-h-11" value={when} onChange={(e) => onWhen(e.target.value)} />
+      <Label htmlFor={props.id}>{props.label}</Label>
+      <Input
+        id={props.id}
+        type="datetime-local"
+        className="min-h-11"
+        value={props.when}
+        onChange={(e) => props.onWhen(e.target.value)}
+        onFocus={() => props.onEditing(true)}
+        onBlur={() => props.onEditing(false)}
+      />
       <p className="text-muted-foreground text-xs">In your local time.</p>
     </div>
   );
@@ -33,33 +50,40 @@ function Radio({ label, checked, onSelect }: { label: string; checked: boolean; 
   );
 }
 
-export function WhenField({ options, choice, onChoice, when, onWhen, onOpenSlots }: Props) {
-  // While loading, and when there are no slots, the owner can always type a time.
-  if (options.status !== "ready") {
-    return (
-      <div className="space-y-2">
-        <WhenInput id="when" label="When" when={when} onWhen={onWhen} />
-        {options.status === "none" && (
-          <Button type="button" variant="ghost" className="text-primary min-h-11 px-0 underline" onClick={onOpenSlots}>
-            Set your weekly slots
-          </Button>
-        )}
-      </div>
-    );
-  }
+export function WhenField({ options, choice, onChoice, when, onWhen, onEditing, disabled, onOpenSlots }: Props) {
+  const ready = options.status === "ready";
+  // One fieldset in every state, with the date input in a fixed place, so the input
+  // is never remounted (and never loses focus or a half-typed value) when slots arrive.
   return (
-    <fieldset className="space-y-1">
-      <legend className="mb-1 text-sm font-medium">When ({offsetName(options.offset)})</legend>
-      {options.slots.map((slot) => (
-        <Radio
-          key={slot}
-          label={formatSlotInOffset(slot, options.offset)}
-          checked={choice === slot}
-          onSelect={() => onChoice(slot)}
+    <fieldset disabled={disabled} className={ready ? "space-y-1" : "space-y-2"}>
+      {options.status === "ready" && (
+        <>
+          <legend className="mb-1 text-sm font-medium">When ({offsetName(options.offset)})</legend>
+          {options.slots.map((slot) => (
+            <Radio
+              key={slot}
+              label={formatSlotInOffset(slot, options.offset)}
+              checked={choice === slot}
+              onSelect={() => onChoice(slot)}
+            />
+          ))}
+          <Radio label="Pick another time" checked={choice === null} onSelect={() => onChoice(null)} />
+        </>
+      )}
+      {(!ready || choice === null) && (
+        <WhenInput
+          id={ready ? "when-other" : "when"}
+          label={ready ? "Date and time" : "When"}
+          when={when}
+          onWhen={onWhen}
+          onEditing={onEditing}
         />
-      ))}
-      <Radio label="Pick another time" checked={choice === null} onSelect={() => onChoice(null)} />
-      {choice === null && <WhenInput id="when-other" label="Date and time" when={when} onWhen={onWhen} />}
+      )}
+      {options.status === "none" && (
+        <Button type="button" variant="ghost" className="text-primary min-h-11 px-0 underline" onClick={onOpenSlots}>
+          Set your weekly slots
+        </Button>
+      )}
     </fieldset>
   );
 }
