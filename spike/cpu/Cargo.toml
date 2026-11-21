@@ -1,0 +1,16 @@
+[package]
+name = "cpu-spike"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+presign = { path = "../../crates/presign" }
+
+[profile.release]
+opt-level = "s"
+
+[workspace]
