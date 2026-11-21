@@ -12,7 +12,7 @@ mod entry {
     };
     use crate::dto::{self, PatternJson, QueuePostBody, StartUploadBody};
     use domain::app;
-    use domain::auth::{AccessConfig, AuthError};
+    use domain::auth::{self, AccessConfig, AuthError};
     use worker::*;
 
     /// Fails closed. Returns the response that denies the request, or `None` to
@@ -51,13 +51,14 @@ mod entry {
             .filter(|v| !v.is_empty())
     }
 
-    /// Local dev skips sign-in only when the flag is on, the Host is loopback
-    /// and no team domain is configured. If `TEAM_DOMAIN` is set (production),
-    /// the flag is ignored even if it was set by mistake.
+    /// Reads the settings and asks the domain whether local dev applies.
     fn local_dev_allowed(req: &Request, env: &Env) -> bool {
-        var_text(env, "LOCAL_DEV_NO_AUTH").as_deref() == Some("true")
-            && var_text(env, "TEAM_DOMAIN").is_none()
-            && dto::is_local_host(req.headers().get("Host").ok().flatten().as_deref())
+        let host = req.headers().get("Host").ok().flatten();
+        auth::local_dev_bypass(
+            var_text(env, "LOCAL_DEV_NO_AUTH").as_deref(),
+            var_text(env, "TEAM_DOMAIN").as_deref(),
+            auth::is_loopback_host(host.as_deref()),
+        )
     }
 
     /// Reads the settings. Any missing or malformed one means sign-in is not set up.

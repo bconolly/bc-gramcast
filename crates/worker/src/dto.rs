@@ -178,23 +178,6 @@ pub fn classify_insert_error(text: &str) -> InsertError {
     }
 }
 
-/// DNS-rebinding guard for local dev: only a Host of exactly `localhost` or
-/// `127.0.0.1`, with an optional port (1 to 65535), may use the no-auth mode.
-pub fn is_local_host(host_header: Option<&str>) -> bool {
-    let Some(value) = host_header else {
-        return false;
-    };
-    let (host, port) = match value.split_once(':') {
-        Some((host, port)) => (host, Some(port)),
-        None => (value, None),
-    };
-    // 1..=65535: digits only (parse alone would accept a leading `+`), and never port 0.
-    let port_ok = port.is_none_or(|p| {
-        p.bytes().all(|b| b.is_ascii_digit()) && p.parse::<u16>().is_ok_and(|n| n != 0)
-    });
-    port_ok && (host.eq_ignore_ascii_case("localhost") || host == "127.0.0.1")
-}
-
 /// CSRF guard: a cross-site form cannot send `application/json`, so POSTs must.
 pub fn is_json_content_type(header: Option<&str>) -> bool {
     let Some(value) = header else {
@@ -631,41 +614,6 @@ mod tests {
             classify_insert_error("network down"),
             InsertError::Port(PortError("network down".into()))
         );
-    }
-
-    #[test]
-    fn local_dev_only_answers_to_loopback_hosts() {
-        for ok in [
-            "localhost",
-            "localhost:8787",
-            "127.0.0.1",
-            "127.0.0.1:8787",
-            "LOCALHOST:8787",
-        ] {
-            assert!(is_local_host(Some(ok)), "{ok}");
-        }
-        for bad in [
-            "",
-            "evil.com",
-            "localhost.evil.com",
-            "evil.com:8787",
-            "localhost:",
-            "localhost:abc",
-            "localhost:8787@evil.com",
-            "user@localhost",
-            "127.0.0.1.evil.com",
-            "127.0.0.2",
-            "[::1]",
-            "localhost:8787:1",
-            "localhost:0",
-            "localhost:00000",
-            "localhost:65536",
-            "127.0.0.1:99999",
-            " localhost",
-        ] {
-            assert!(!is_local_host(Some(bad)), "{bad:?}");
-        }
-        assert!(!is_local_host(None));
     }
 
     #[test]
