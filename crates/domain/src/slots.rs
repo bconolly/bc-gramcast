@@ -1,10 +1,14 @@
 //! Weekly posting slots. Pure maths on Unix seconds: no clock, no chrono.
 
+use crate::queue::MAX_SLOT_SECS;
+
 pub const MAX_RULES: usize = 14;
 pub const MAX_NEXT_SLOTS: usize = 20;
 const MIN_OFFSET: i32 = -720;
 const MAX_OFFSET: i32 = 840;
 const MINUTES_PER_DAY: u16 = 1440;
+const DAY_SECS: i64 = 86_400;
+const LOOKAHEAD_DAYS: i64 = 52 * 7;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Weekday {
@@ -140,6 +144,38 @@ pub fn format_hhmm(minute_of_day: u16) -> String {
     format!("{:02}:{:02}", minute_of_day / 60, minute_of_day % 60)
 }
 
+/// The next free slots after `now`, as UTC Unix seconds in ascending order.
+/// Skips anything in `taken`, looks at most 52 weeks ahead and never passes
+/// `MAX_SLOT_SECS`. Returns at most `min(count, MAX_NEXT_SLOTS)`.
+pub fn next_free_slots(pattern: &SlotPattern, taken: &[i64], now: i64, count: usize) -> Vec<i64> {
+    let want = count.min(MAX_NEXT_SLOTS);
+    let mut out = Vec::with_capacity(want);
+    if want == 0 || pattern.rules.is_empty() || now >= MAX_SLOT_SECS {
+        return out;
+    }
+    let offset_secs = i64::from(pattern.utc_offset_minutes) * 60;
+    // Whole days since the epoch, in the pattern's local time. 1970-01-01 was
+    // a Thursday, so day 0 is index 3 counting from Monday.
+    let first_day = now.saturating_add(offset_secs).div_euclid(DAY_SECS);
+    let horizon = now
+        .saturating_add(LOOKAHEAD_DAYS * DAY_SECS)
+        .min(MAX_SLOT_SECS);
+    for day in first_day..first_day + LOOKAHEAD_DAYS + 1 {
+        let weekday = Weekday::ALL[(day + 3).rem_euclid(7) as usize];
+        // Rules are sorted by time within a weekday, so output stays ascending.
+        for rule in pattern.rules.iter().filter(|r| r.weekday == weekday) {
+            let at = day * DAY_SECS + i64::from(rule.minute_of_day) * 60 - offset_secs;
+            if at > now && at <= horizon && !taken.contains(&at) {
+                out.push(at);
+                if out.len() == want {
+                    return out;
+                }
+            }
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -273,5 +309,160 @@ mod tests {
             SlotPattern::from_stored(900, ""),
             Err(SlotError::OffsetOutOfRange)
         );
+    }
+
+    /// Unix seconds for a UTC date and time (days-from-civil, test-only).
+    fn ts(y: i64, mo: i64, d: i64, h: i64, mi: i64) -> i64 {
+        let y = if mo <= 2 { y - 1 } else { y };
+        let era = y.div_euclid(400);
+        let yoe = y - era * 400;
+        let doy = (153 * (if mo > 2 { mo - 3 } else { mo + 9 }) + 2) / 5 + d - 1;
+        let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+        let days = era * 146_097 + doe - 719_468;
+        days * 86_400 + h * 3600 + mi * 60
+    }
+
+    fn pat(offset: i32, rules: Vec<SlotRule>) -> SlotPattern {
+        SlotPattern::new(offset, rules).unwrap()
+    }
+
+    fn mon_wed() -> SlotPattern {
+        pat(0, vec![r(Weekday::Mon, 6, 0), r(Weekday::Wed, 19, 0)])
+    }
+
+    // 2024-01-01 was a Monday.
+    #[test]
+    fn lists_upcoming_slots_in_order() {
+        let now = ts(2024, 1, 2, 12, 0); // Tuesday
+        assert_eq!(
+            next_free_slots(&mon_wed(), &[], now, 3),
+            vec![
+                ts(2024, 1, 3, 19, 0),
+                ts(2024, 1, 8, 6, 0),
+                ts(2024, 1, 10, 19, 0)
+            ]
+        );
+    }
+
+    #[test]
+    fn crosses_the_week_boundary() {
+        let now = ts(2024, 1, 7, 23, 0); // Sunday night
+        assert_eq!(
+            next_free_slots(&pat(0, vec![r(Weekday::Mon, 6, 0)]), &[], now, 1),
+            vec![ts(2024, 1, 8, 6, 0)]
+        );
+    }
+
+    #[test]
+    fn a_rule_earlier_today_waits_for_next_week() {
+        let now = ts(2024, 1, 1, 7, 0); // Monday 07:00, rule was 06:00
+        assert_eq!(
+            next_free_slots(&pat(0, vec![r(Weekday::Mon, 6, 0)]), &[], now, 1),
+            vec![ts(2024, 1, 8, 6, 0)]
+        );
+    }
+
+    #[test]
+    fn a_rule_later_today_is_included() {
+        let now = ts(2024, 1, 1, 5, 0);
+        assert_eq!(
+            next_free_slots(&pat(0, vec![r(Weekday::Mon, 6, 0)]), &[], now, 1),
+            vec![ts(2024, 1, 1, 6, 0)]
+        );
+    }
+
+    #[test]
+    fn a_slot_exactly_at_now_is_excluded() {
+        let now = ts(2024, 1, 1, 6, 0);
+        assert_eq!(
+            next_free_slots(&pat(0, vec![r(Weekday::Mon, 6, 0)]), &[], now, 1),
+            vec![ts(2024, 1, 8, 6, 0)]
+        );
+    }
+
+    #[test]
+    fn taken_slots_are_skipped() {
+        let now = ts(2024, 1, 2, 12, 0);
+        let taken = [ts(2024, 1, 3, 19, 0), ts(2024, 1, 10, 19, 0), 5];
+        assert_eq!(
+            next_free_slots(&mon_wed(), &taken, now, 3),
+            vec![
+                ts(2024, 1, 8, 6, 0),
+                ts(2024, 1, 15, 6, 0),
+                ts(2024, 1, 17, 19, 0)
+            ]
+        );
+    }
+
+    #[test]
+    fn positive_offset_can_move_the_slot_to_the_previous_utc_day() {
+        // Brisbane (+10:00) Monday 06:00 is Sunday 20:00 UTC.
+        let now = ts(2024, 1, 6, 0, 0);
+        assert_eq!(
+            next_free_slots(&pat(600, vec![r(Weekday::Mon, 6, 0)]), &[], now, 2),
+            vec![ts(2024, 1, 7, 20, 0), ts(2024, 1, 14, 20, 0)]
+        );
+    }
+
+    #[test]
+    fn negative_offset_can_move_the_slot_to_the_next_utc_day() {
+        // UTC-05:00 Sunday 22:00 is Monday 03:00 UTC.
+        let now = ts(2024, 1, 1, 0, 0);
+        assert_eq!(
+            next_free_slots(&pat(-300, vec![r(Weekday::Sun, 22, 0)]), &[], now, 2),
+            vec![ts(2024, 1, 1, 3, 0), ts(2024, 1, 8, 3, 0)]
+        );
+    }
+
+    #[test]
+    fn handles_a_leap_day() {
+        // 2024-02-29 is a Thursday.
+        let now = ts(2024, 2, 28, 0, 0);
+        assert_eq!(
+            next_free_slots(&pat(0, vec![r(Weekday::Thu, 12, 0)]), &[], now, 2),
+            vec![ts(2024, 2, 29, 12, 0), ts(2024, 3, 7, 12, 0)]
+        );
+    }
+
+    #[test]
+    fn works_before_the_epoch_and_on_the_epoch_thursday() {
+        // 1970-01-01 was a Thursday.
+        let p = pat(0, vec![r(Weekday::Thu, 0, 0)]);
+        assert_eq!(next_free_slots(&p, &[], -1, 1), vec![0]);
+        assert_eq!(next_free_slots(&p, &[], 0, 1), vec![604_800]);
+    }
+
+    #[test]
+    fn count_zero_and_no_rules_give_nothing() {
+        assert!(next_free_slots(&mon_wed(), &[], 0, 0).is_empty());
+        assert!(next_free_slots(&pat(0, vec![]), &[], 0, 5).is_empty());
+    }
+
+    #[test]
+    fn count_is_capped_at_twenty() {
+        let all: Vec<_> = Weekday::ALL.iter().map(|d| r(*d, 12, 0)).collect();
+        let got = next_free_slots(&pat(0, all), &[], 0, 1000);
+        assert_eq!(got.len(), MAX_NEXT_SLOTS);
+        assert!(got.windows(2).all(|w| w[0] < w[1]));
+    }
+
+    #[test]
+    fn looks_ahead_at_most_52_weeks() {
+        let p = pat(0, vec![r(Weekday::Thu, 0, 0)]);
+        let taken: Vec<i64> = (0..60).map(|w| 604_800 * (w + 1)).collect();
+        // Weeks 1..=52 are taken, so only 53 and later remain: out of reach.
+        assert!(next_free_slots(&p, &taken, 0, 5).is_empty());
+        let got = next_free_slots(&p, &taken[..10], 0, 3);
+        assert_eq!(got, vec![604_800 * 11, 604_800 * 12, 604_800 * 13]);
+    }
+
+    #[test]
+    fn never_passes_the_queue_ceiling() {
+        let all: Vec<_> = Weekday::ALL.iter().map(|d| r(*d, 12, 0)).collect();
+        let got = next_free_slots(&pat(0, all), &[], MAX_SLOT_SECS - 3 * 86_400, 20);
+        assert!(!got.is_empty() && got.len() < 20);
+        assert!(got.iter().all(|s| *s <= MAX_SLOT_SECS));
+        assert!(next_free_slots(&mon_wed(), &[], i64::MAX, 5).is_empty());
+        assert!(next_free_slots(&mon_wed(), &[], i64::MIN, 5).len() <= 5);
     }
 }
