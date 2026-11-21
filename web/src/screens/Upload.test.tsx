@@ -114,6 +114,9 @@ describe("Upload", () => {
     expect(screen.getByLabelText("Title")).toHaveValue("Sunday reel");
   });
 
+});
+
+describe("Upload retries and safety", () => {
   it("retries only the queue call after a queue failure, without uploading again", async () => {
     const fn = stubApi({
       api: [ticket(), new Response(""), new Response("that slot is already taken", { status: 409 }), new Response("{}", { status: 201 })],
@@ -213,7 +216,7 @@ const slotsReply = (...slots: number[]) => json({ slots });
 const queuedBody = (fn: ReturnType<typeof stubApi>) =>
   JSON.parse((apiCalls(fn).at(-1) as [string, RequestInit])[1].body as string);
 
-describe("Upload slot picker", () => {
+describe("Upload slot picker: listing", () => {
   it("fetches the pattern and the next five slots together on mount", async () => {
     const fn = stubApi({ slotReplies: [slotsReply(SLOT_A)] });
     render(<Upload onQueued={vi.fn()} onOpenSlots={vi.fn()} />);
@@ -239,6 +242,9 @@ describe("Upload slot picker", () => {
     expect(screen.queryByLabelText("Date and time")).not.toBeInTheDocument();
   });
 
+});
+
+describe("Upload slot picker: choosing", () => {
   it("queues with the first slot's Unix seconds by default", async () => {
     const fn = stubApi({
       slotReplies: [slotsReply(SLOT_A, SLOT_B)],
@@ -294,6 +300,9 @@ describe("Upload slot picker", () => {
     expect(await screen.findByRole("alert")).toHaveTextContent("Choose when to publish.");
   });
 
+});
+
+describe("Upload slot picker: no slots", () => {
   it("falls back to the date and time input with a link to the Slots screen when there are no slots", async () => {
     stubApi({ slotReplies: [slotsReply()] });
     const onOpenSlots = vi.fn();
@@ -313,6 +322,9 @@ describe("Upload slot picker", () => {
     expect(screen.queryByRole("radio")).not.toBeInTheDocument();
   });
 
+});
+
+describe("Upload slot picker: after a queue error", () => {
   it("refreshes the slots after a taken-slot error, preselects the first and does not upload again", async () => {
     const fn = stubApi({
       slotReplies: [slotsReply(SLOT_A, SLOT_B), slotsReply(SLOT_B, SLOT_C)],
