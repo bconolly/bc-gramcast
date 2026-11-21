@@ -12,7 +12,7 @@ if (!outDir) {
   console.error("Usage: node scripts/screenshots.cjs <outDir>");
   process.exit(2);
 }
-const TYPES = { ".html": "text/html", ".js": "text/javascript", ".css": "text/css" };
+const TYPES = { ".html": "text/html", ".js": "text/javascript", ".css": "text/css", ".png": "image/png" };
 
 // Apply the same headers Cloudflare will (public/_headers), so a CSP problem shows up here.
 function readHeaders() {

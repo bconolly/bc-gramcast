@@ -11,6 +11,7 @@ Built with the "Beyond vibe coding" workflow. The full build plan is the source 
 - Logic lives in `crates/domain`. The Worker and API only validate and map.
 - Platform, storage and scheduler code sit behind traits (ports and adapters).
 - Show proof at each step: test summaries, and screenshots for UI.
+- Every screen shows the BC Guides logo (brand assets in web/public/brand/).
 
 ## Never (rules, because these can't be taken back)
 - Never commit secrets, tokens or `.dev.vars`. Secrets live in Worker secrets and GitHub secrets.
