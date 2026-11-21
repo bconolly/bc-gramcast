@@ -45,6 +45,13 @@ export class ApiError extends Error {
   }
 }
 
+/** The Worker's fixed 409 text for a slot someone else has taken. */
+export const SLOT_TAKEN_MESSAGE = "that slot is already taken";
+
+/** True for the 409 that means the chosen slot is gone (not "that video is already queued"). */
+export const isSlotTaken = (e: unknown): boolean =>
+  e instanceof ApiError && e.status === 409 && e.message === SLOT_TAKEN_MESSAGE;
+
 const UPLOAD_FAILED = "The video could not be uploaded. Please try again.";
 const MAX_SERVER_MESSAGE = 200;
 
@@ -69,12 +76,27 @@ async function call(path: string, init?: RequestInit): Promise<Response> {
   return res;
 }
 
-function postJson(path: string, body: unknown): Promise<Response> {
+function sendJson(method: "POST" | "PUT", path: string, body: unknown): Promise<Response> {
   return call(path, {
-    method: "POST",
+    method,
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body),
   });
+}
+
+const postJson = (path: string, body: unknown) => sendJson("POST", path, body);
+
+export type WeekdayId = "mon" | "tue" | "wed" | "thu" | "fri" | "sat" | "sun";
+
+export interface PatternRule {
+  weekday: WeekdayId;
+  /** 24-hour HH:MM. */
+  time: string;
+}
+
+export interface PatternJson {
+  utc_offset_minutes: number;
+  rules: PatternRule[];
 }
 
 export async function getQueue(): Promise<PostJson[]> {
@@ -133,4 +155,36 @@ export async function submitPost(
     platforms: input.platforms,
     slot_at: input.slot_at,
   });
+}
+
+const isRecord = (v: unknown): v is Record<string, unknown> => typeof v === "object" && v !== null;
+
+/** Reads a JSON body and checks its shape; any mismatch gets the generic failure line. */
+async function readChecked<T>(res: Response, ok: (body: unknown) => body is T): Promise<T> {
+  const body: unknown = await res.json().catch(() => undefined);
+  if (!ok(body)) throw new ApiError(`Something went wrong (error ${res.status}). Please try again.`, res.status);
+  return body;
+}
+
+const isPattern = (b: unknown): b is PatternJson =>
+  isRecord(b) &&
+  Number.isInteger(b.utc_offset_minutes) &&
+  Array.isArray(b.rules) &&
+  b.rules.every((r) => isRecord(r) && typeof r.weekday === "string" && typeof r.time === "string");
+
+const isSlots = (b: unknown): b is { slots: number[] } =>
+  isRecord(b) && Array.isArray(b.slots) && b.slots.every((n) => Number.isInteger(n));
+
+export async function getPattern(): Promise<PatternJson> {
+  return readChecked(await call("/api/slots/pattern"), isPattern);
+}
+
+/** Saves the weekly pattern. Resolves to the pattern as the server normalised it. */
+export async function savePattern(pattern: PatternJson): Promise<PatternJson> {
+  return (await sendJson("PUT", "/api/slots/pattern", pattern)).json();
+}
+
+/** The next free pattern slots, as Unix seconds in ascending order. */
+export async function getNextSlots(count: number): Promise<number[]> {
+  return (await readChecked(await call(`/api/slots/next?count=${count}`), isSlots)).slots;
 }

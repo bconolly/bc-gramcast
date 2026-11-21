@@ -1,9 +1,12 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   ApiError,
+  getNextSlots,
+  getPattern,
   getQueue,
   putVideo,
   queuePost,
+  savePattern,
   startUpload,
   submitPost,
 } from "@/lib/api";
@@ -159,5 +162,70 @@ describe("submitPost", () => {
     );
     await expect(submitPost(input)).rejects.toBeInstanceOf(ApiError);
     expect(fetchFn).toHaveBeenCalledTimes(2);
+  });
+});
+
+describe("slot pattern", () => {
+  const pattern = { utc_offset_minutes: 600, rules: [{ weekday: "wed" as const, time: "19:00" }] };
+
+  it("getPattern reads GET /api/slots/pattern", async () => {
+    const fetchFn = mockFetch(reply(JSON.stringify(pattern)));
+    expect(await getPattern()).toEqual(pattern);
+    expect(fetchFn.mock.calls[0]?.[0]).toBe("/api/slots/pattern");
+  });
+
+  it("savePattern PUTs JSON with the JSON content type and returns the normalised pattern", async () => {
+    const fetchFn = mockFetch(reply(JSON.stringify(pattern)));
+    expect(await savePattern(pattern)).toEqual(pattern);
+    const [url, init] = fetchFn.mock.calls[0] as [string, RequestInit];
+    expect(url).toBe("/api/slots/pattern");
+    expect(init.method).toBe("PUT");
+    expect(new Headers(init.headers).get("Content-Type")).toBe("application/json");
+    expect(JSON.parse(init.body as string)).toEqual(pattern);
+  });
+
+  it("savePattern shows the server's fixed message on failure", async () => {
+    mockFetch(reply("too many rules", 422));
+    await expect(savePattern(pattern)).rejects.toMatchObject({ message: "too many rules", status: 422 });
+  });
+
+  it("getNextSlots asks for count and returns the Unix seconds", async () => {
+    const fetchFn = mockFetch(reply(JSON.stringify({ slots: [100, 200] })));
+    expect(await getNextSlots(5)).toEqual([100, 200]);
+    expect(fetchFn.mock.calls[0]?.[0]).toBe("/api/slots/next?count=5");
+  });
+
+  it("getNextSlots surfaces a failure", async () => {
+    mockFetch(reply("count must be a whole number from 1 to 20", 422));
+    await expect(getNextSlots(0)).rejects.toMatchObject({ status: 422 });
+  });
+
+  const GENERIC = /^Something went wrong/;
+
+  it.each([
+    ["slots missing", {}],
+    ["slots not an array", { slots: "1,2" }],
+    ["slot not an integer", { slots: [1.5] }],
+    ["slot a string", { slots: ["100"] }],
+  ])("getNextSlots rejects a bad body: %s", async (_name, body) => {
+    mockFetch(reply(JSON.stringify(body)));
+    await expect(getNextSlots(5)).rejects.toThrow(GENERIC);
+  });
+
+  it.each([
+    ["not an object", "null"],
+    ["offset missing", { rules: [] }],
+    ["offset fractional", { utc_offset_minutes: 1.5, rules: [] }],
+    ["rules not an array", { utc_offset_minutes: 600, rules: {} }],
+    ["rule weekday not a string", { utc_offset_minutes: 600, rules: [{ weekday: 1, time: "19:00" }] }],
+    ["rule time missing", { utc_offset_minutes: 600, rules: [{ weekday: "wed" }] }],
+  ])("getPattern rejects a bad body: %s", async (_name, body) => {
+    mockFetch(reply(typeof body === "string" ? body : JSON.stringify(body)));
+    await expect(getPattern()).rejects.toThrow(GENERIC);
+  });
+
+  it("getPattern rejects a body that is not JSON", async () => {
+    mockFetch(reply("<html>"));
+    await expect(getPattern()).rejects.toThrow(GENERIC);
   });
 });
