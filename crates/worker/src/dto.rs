@@ -99,7 +99,7 @@ pub fn classify_insert_error(text: &str) -> InsertError {
 }
 
 /// DNS-rebinding guard for local dev: only a Host of exactly `localhost` or
-/// `127.0.0.1`, with an optional numeric port, may use the no-auth mode.
+/// `127.0.0.1`, with an optional port (1 to 65535), may use the no-auth mode.
 pub fn is_local_host(host_header: Option<&str>) -> bool {
     let Some(value) = host_header else {
         return false;
@@ -108,8 +108,10 @@ pub fn is_local_host(host_header: Option<&str>) -> bool {
         Some((host, port)) => (host, Some(port)),
         None => (value, None),
     };
-    let port_ok =
-        port.is_none_or(|p| (1..=5).contains(&p.len()) && p.bytes().all(|b| b.is_ascii_digit()));
+    // 1..=65535: digits only (parse alone would accept a leading `+`), and never port 0.
+    let port_ok = port.is_none_or(|p| {
+        p.bytes().all(|b| b.is_ascii_digit()) && p.parse::<u16>().is_ok_and(|n| n != 0)
+    });
     port_ok && (host.eq_ignore_ascii_case("localhost") || host == "127.0.0.1")
 }
 
@@ -126,6 +128,7 @@ pub fn is_json_content_type(header: Option<&str>) -> bool {
 /// client-sent values, and port errors never leak their detail.
 pub fn error_status(e: &AppError) -> (u16, &'static str) {
     match e {
+        AppError::VideoNotUploaded => (422, "video has not been uploaded"),
         AppError::Upload(u) => (
             422,
             match u {
@@ -205,6 +208,11 @@ mod tests {
                 "file must be an MP4",
             ),
             (AppError::Upload(UploadError::Empty), 422, "file is empty"),
+            (
+                AppError::VideoNotUploaded,
+                422,
+                "video has not been uploaded",
+            ),
             (
                 AppError::Upload(UploadError::TooLarge {
                     size_bytes: 123_456_789,
@@ -315,6 +323,10 @@ mod tests {
             "127.0.0.2",
             "[::1]",
             "localhost:8787:1",
+            "localhost:0",
+            "localhost:00000",
+            "localhost:65536",
+            "127.0.0.1:99999",
             " localhost",
         ] {
             assert!(!is_local_host(Some(bad)), "{bad:?}");

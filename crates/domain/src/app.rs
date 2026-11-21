@@ -1,7 +1,7 @@
 //! Use cases. They talk to the outside world only through the ports below,
 //! so the Worker (and later an AWS adapter) plugs in without changing them.
 
-use crate::media::{UploadError, VideoUpload};
+use crate::media::{UploadError, VideoUpload, MAX_UPLOAD_BYTES};
 use crate::queue::{validate_slot, Queue, QueueError, QueuedPost};
 
 /// How long an upload link stays valid.
@@ -38,8 +38,18 @@ pub trait PostRepository {
     async fn insert(&self, post: &QueuedPost) -> Result<(), InsertError>;
 }
 
+/// Storage port: what is actually in the bucket. The signed upload link can't
+/// enforce a size, so we check after the upload.
+#[allow(async_fn_in_trait)]
+pub trait UploadStore {
+    /// Size in bytes of the stored object, or `None` if there is no such object.
+    async fn object_size(&self, key: &str) -> Result<Option<u64>, PortError>;
+}
+
 #[derive(Debug, PartialEq, Eq)]
 pub enum AppError {
+    /// The post names a video that is not in storage.
+    VideoNotUploaded,
     Upload(UploadError),
     Queue(QueueError),
     Port(PortError),
@@ -68,6 +78,7 @@ pub fn start_upload(
 
 pub async fn queue_post(
     repo: &impl PostRepository,
+    store: &impl UploadStore,
     now: i64,
     post: QueuedPost,
 ) -> Result<(), AppError> {
@@ -75,6 +86,19 @@ pub async fn queue_post(
     let existing = repo.all().await.map_err(AppError::Port)?;
     let mut queue = Queue::from_stored(existing);
     queue.add(post.clone()).map_err(AppError::Queue)?;
+    // The key is valid by now, so storage is only asked about well-formed keys.
+    match store
+        .object_size(&post.video_key)
+        .await
+        .map_err(AppError::Port)?
+    {
+        None => return Err(AppError::VideoNotUploaded),
+        Some(0) => return Err(AppError::Upload(UploadError::Empty)),
+        Some(n) if n > MAX_UPLOAD_BYTES => {
+            return Err(AppError::Upload(UploadError::TooLarge { size_bytes: n }))
+        }
+        Some(_) => {}
+    }
     let slot_at = post.slot_at;
     repo.insert(&post).await.map_err(|e| match e {
         InsertError::SlotTaken => AppError::Queue(QueueError::SlotTaken { slot_at }),
@@ -91,6 +115,7 @@ pub async fn upcoming(repo: &impl PostRepository, now: i64) -> Result<Vec<Queued
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::media::MAX_UPLOAD_BYTES;
     use crate::queue::Platform;
     use std::cell::RefCell;
 
@@ -99,6 +124,29 @@ mod tests {
         fn put_url(&self, key: &str, ct: &str, secs: u32) -> Result<String, PortError> {
             Ok(format!("https://signed/{key}?ct={ct}&exp={secs}"))
         }
+    }
+
+    /// Reports a fixed stored size for every key, and records which keys were asked about.
+    struct FakeStore {
+        size: Option<u64>,
+        asked: RefCell<Vec<String>>,
+    }
+    impl UploadStore for FakeStore {
+        async fn object_size(&self, key: &str) -> Result<Option<u64>, PortError> {
+            self.asked.borrow_mut().push(key.into());
+            Ok(self.size)
+        }
+    }
+
+    fn store_with(size: Option<u64>) -> FakeStore {
+        FakeStore {
+            size,
+            asked: RefCell::default(),
+        }
+    }
+
+    fn store() -> FakeStore {
+        store_with(Some(10))
     }
 
     #[derive(Default)]
@@ -156,7 +204,7 @@ mod tests {
     #[test]
     fn queue_post_stores_a_valid_post() {
         let repo = FakeRepo::default();
-        pollster::block_on(queue_post(&repo, 0, post("a", 100))).unwrap();
+        pollster::block_on(queue_post(&repo, &store(), 0, post("a", 100))).unwrap();
         assert_eq!(repo.posts.borrow().len(), 1);
     }
 
@@ -164,7 +212,7 @@ mod tests {
     fn queue_post_refuses_a_taken_slot_without_storing() {
         let repo = FakeRepo::default();
         repo.posts.borrow_mut().push(post("a", 100));
-        let e = pollster::block_on(queue_post(&repo, 0, post("b", 100)));
+        let e = pollster::block_on(queue_post(&repo, &store(), 0, post("b", 100)));
         assert_eq!(
             e,
             Err(AppError::Queue(QueueError::SlotTaken { slot_at: 100 }))
@@ -175,9 +223,9 @@ mod tests {
     #[test]
     fn queue_post_rejects_past_and_out_of_range_slots_without_storing() {
         let repo = FakeRepo::default();
-        let past = pollster::block_on(queue_post(&repo, 500, post("a", 100)));
+        let past = pollster::block_on(queue_post(&repo, &store(), 500, post("a", 100)));
         assert_eq!(past, Err(AppError::Queue(QueueError::SlotInPast)));
-        let far = pollster::block_on(queue_post(&repo, 500, post("b", 4_102_444_801)));
+        let far = pollster::block_on(queue_post(&repo, &store(), 500, post("b", 4_102_444_801)));
         assert_eq!(far, Err(AppError::Queue(QueueError::SlotOutOfRange)));
         assert!(repo.posts.borrow().is_empty());
     }
@@ -188,7 +236,7 @@ mod tests {
         repo.posts.borrow_mut().push(post("a", 100));
         let mut dup = post("b", 200);
         dup.video_key = "videos/a.mp4".into();
-        let e = pollster::block_on(queue_post(&repo, 0, dup));
+        let e = pollster::block_on(queue_post(&repo, &store(), 0, dup));
         assert_eq!(e, Err(AppError::Queue(QueueError::VideoAlreadyQueued)));
         assert_eq!(repo.posts.borrow().len(), 1);
     }
@@ -200,7 +248,7 @@ mod tests {
         old.video_key = "legacy/odd key".into();
         old.title.clear();
         repo.posts.borrow_mut().push(old);
-        pollster::block_on(queue_post(&repo, 0, post("a", 100))).unwrap();
+        pollster::block_on(queue_post(&repo, &store(), 0, post("a", 100))).unwrap();
         assert_eq!(repo.posts.borrow().len(), 2);
     }
 
@@ -226,13 +274,13 @@ mod tests {
 
     #[test]
     fn queue_post_maps_a_lost_video_race() {
-        let e = pollster::block_on(queue_post(&VideoRacingRepo, 0, post("a", 100)));
+        let e = pollster::block_on(queue_post(&VideoRacingRepo, &store(), 0, post("a", 100)));
         assert_eq!(e, Err(AppError::Queue(QueueError::VideoAlreadyQueued)));
     }
 
     #[test]
     fn queue_post_maps_a_lost_slot_race_to_slot_taken() {
-        let e = pollster::block_on(queue_post(&RacingRepo, 0, post("a", 100)));
+        let e = pollster::block_on(queue_post(&RacingRepo, &store(), 0, post("a", 100)));
         assert_eq!(
             e,
             Err(AppError::Queue(QueueError::SlotTaken { slot_at: 100 }))
@@ -251,5 +299,71 @@ mod tests {
             .map(|p| p.id)
             .collect();
         assert_eq!(ids, ["soon", "late"]);
+    }
+
+    #[test]
+    fn queue_post_refuses_a_video_missing_from_storage_without_storing() {
+        let repo = FakeRepo::default();
+        let e = pollster::block_on(queue_post(&repo, &store_with(None), 0, post("a", 100)));
+        assert_eq!(e, Err(AppError::VideoNotUploaded));
+        assert!(repo.posts.borrow().is_empty());
+    }
+
+    #[test]
+    fn queue_post_refuses_an_empty_stored_video_without_storing() {
+        let repo = FakeRepo::default();
+        let e = pollster::block_on(queue_post(&repo, &store_with(Some(0)), 0, post("a", 100)));
+        assert_eq!(e, Err(AppError::Upload(UploadError::Empty)));
+        assert!(repo.posts.borrow().is_empty());
+    }
+
+    #[test]
+    fn queue_post_refuses_an_oversized_stored_video_without_storing() {
+        let repo = FakeRepo::default();
+        let size = MAX_UPLOAD_BYTES + 1;
+        let s = store_with(Some(size));
+        let e = pollster::block_on(queue_post(&repo, &s, 0, post("a", 100)));
+        assert_eq!(
+            e,
+            Err(AppError::Upload(UploadError::TooLarge { size_bytes: size }))
+        );
+        assert!(repo.posts.borrow().is_empty());
+    }
+
+    #[test]
+    fn queue_post_accepts_a_video_at_exactly_the_size_limit() {
+        let repo = FakeRepo::default();
+        let s = store_with(Some(MAX_UPLOAD_BYTES));
+        pollster::block_on(queue_post(&repo, &s, 0, post("a", 100))).unwrap();
+        assert_eq!(repo.posts.borrow().len(), 1);
+    }
+
+    #[test]
+    fn queue_post_asks_storage_about_the_posts_video_key_only_once_valid() {
+        let repo = FakeRepo::default();
+        let s = store();
+        pollster::block_on(queue_post(&repo, &s, 0, post("a", 100))).unwrap();
+        assert_eq!(*s.asked.borrow(), ["videos/a.mp4"]);
+        let mut bad = post("b", 200);
+        bad.video_key = "../escape".into();
+        let s2 = store();
+        let e = pollster::block_on(queue_post(&repo, &s2, 0, bad));
+        assert_eq!(e, Err(AppError::Queue(QueueError::BadVideoKey)));
+        assert!(s2.asked.borrow().is_empty());
+    }
+
+    struct BrokenStore;
+    impl UploadStore for BrokenStore {
+        async fn object_size(&self, _key: &str) -> Result<Option<u64>, PortError> {
+            Err(PortError("r2 down".into()))
+        }
+    }
+
+    #[test]
+    fn queue_post_surfaces_a_storage_failure_as_a_port_error() {
+        let repo = FakeRepo::default();
+        let e = pollster::block_on(queue_post(&repo, &BrokenStore, 0, post("a", 100)));
+        assert_eq!(e, Err(AppError::Port(PortError("r2 down".into()))));
+        assert!(repo.posts.borrow().is_empty());
     }
 }
