@@ -4,6 +4,7 @@ pub mod auth;
 pub mod codec;
 pub mod keycache;
 pub mod media;
+pub mod oauth;
 pub mod publish;
 pub mod publish_app;
 pub mod queue;
