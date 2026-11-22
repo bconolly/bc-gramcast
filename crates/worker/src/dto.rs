@@ -367,6 +367,13 @@ pub const MAX_JWKS_BYTES: usize = 64 * 1024;
 /// Most keys a key set may list. Access publishes two at a time.
 pub const MAX_JWKS_KEYS: usize = 10;
 
+/// Whether a key-set response status is acceptable. Only 200 is: the key
+/// endpoint never redirects, so any 3xx (seen because redirects are not
+/// followed) is refused along with every other status.
+pub fn jwks_status_ok(status: u16) -> bool {
+    status == 200
+}
+
 /// Whether a key-set response may be read, judging by its `Content-Length`
 /// header alone. No header is fine (the size is checked again once read); an
 /// unreadable or too-large one is not.
@@ -1054,6 +1061,14 @@ mod tests {
             key_import_counts_line(3, 0),
             "key import: parsed=3 imported=0"
         );
+    }
+
+    #[test]
+    fn only_a_200_key_response_is_accepted() {
+        assert!(jwks_status_ok(200));
+        for refused in [204, 301, 302, 303, 307, 308, 404, 500] {
+            assert!(!jwks_status_ok(refused), "{refused}");
+        }
     }
 
     #[test]
