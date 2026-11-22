@@ -43,6 +43,13 @@ export function isLocked(post: Changeable, nowSecs: number): boolean {
   );
 }
 
+export const WAITING_MESSAGE = "Waiting to publish";
+
+/** Queued with its slot arrived or passed (for example put back after a sign-in or limit problem). */
+export function isWaiting(post: Changeable, nowSecs: number): boolean {
+  return (post.publish?.state ?? "queued") === "queued" && post.slot_at <= nowSecs;
+}
+
 /** One fixed message per failure code the Worker can send. */
 export const FAILURE_MESSAGES: Record<string, string> = {
   auth: "YouTube stopped accepting the saved sign-in. Reconnect it in Connections, then queue this video again.",

@@ -258,6 +258,28 @@ describe("Queue publish state", () => {
     expect(row("Lost post").getByText(/YouTube Studio/)).toBeInTheDocument();
   });
 
+  it("says a queued post whose slot has passed is waiting to publish", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    try {
+      const now = 1_800_000_000;
+      vi.setSystemTime(now * 1000);
+      const passed = { ...base, id: "x1", video_key: "videos/x1.mp4", title: "Late one", slot_at: now - 3600, publish: { state: "queued" } };
+      const atNow = { ...base, id: "x2", video_key: "videos/x2.mp4", title: "On the dot", slot_at: now, publish: { state: "queued" } };
+      const ahead = { ...base, id: "x3", video_key: "videos/x3.mp4", title: "Ahead one", slot_at: now + 3600, publish: { state: "queued" } };
+      const going = { ...base, id: "x4", video_key: "videos/x4.mp4", title: "Going one", slot_at: now - 60, publish: { state: "publishing" } };
+      vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response(JSON.stringify([passed, atNow, ahead, going]))));
+      render(<Queue />);
+      await screen.findByText("Late one");
+      expect(row("Late one").getByText("Waiting to publish")).toBeInTheDocument();
+      expect(row("On the dot").getByText("Waiting to publish")).toBeInTheDocument();
+      expect(row("Late one").queryByRole("button")).not.toBeInTheDocument();
+      expect(row("Ahead one").queryByText("Waiting to publish")).not.toBeInTheDocument();
+      expect(row("Going one").queryByText("Waiting to publish")).not.toBeInTheDocument();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("hides Edit and Delete inside the lock window and says why, in the Worker's words", async () => {
     vi.useFakeTimers({ toFake: ["Date"] });
     try {

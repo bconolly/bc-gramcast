@@ -7,6 +7,8 @@ import {
   failureMessage,
   isChangeable,
   isLocked,
+  isWaiting,
+  WAITING_MESSAGE,
   youtubeShortsUrl,
   type PublishState,
 } from "@/lib/publish";
@@ -81,5 +83,18 @@ describe("isChangeable", () => {
   });
   it("uses the Worker's words", () => {
     expect(TOO_CLOSE_MESSAGE).toBe("Too close to its slot to change.");
+  });
+});
+
+describe("isWaiting", () => {
+  const post = (slot_at: number, state: PublishState = "queued") => ({ slot_at, publish: { state } });
+  it("is a queued post whose slot has arrived or passed", () => {
+    expect(isWaiting(post(1000), 1000)).toBe(true);
+    expect(isWaiting(post(10), 1000)).toBe(true);
+    expect(isWaiting({ slot_at: 10 }, 1000)).toBe(true);
+    expect(isWaiting(post(1001), 1000)).toBe(false);
+    expect(isWaiting(post(10, "publishing"), 1000)).toBe(false);
+    expect(isWaiting(post(10, "failed"), 1000)).toBe(false);
+    expect(WAITING_MESSAGE).toBe("Waiting to publish");
   });
 });
