@@ -46,18 +46,24 @@ pub struct PublishedRef {
 pub enum PublishError {
     /// The token was refused or could not be refreshed.
     Auth,
-    RateLimited,
+    /// `retry_at` (Unix seconds) is the provider's hint, if it gave one.
+    RateLimited { retry_at: Option<i64> },
     /// The provider refused this video or its metadata; retrying will not help.
     Rejected,
-    /// Network or provider trouble that may pass.
+    /// The provider definitely did not create the video, so retrying is safe.
+    /// If there is any doubt, an adapter must return `Unknown` instead.
     Transient,
+    /// The outcome is unknown: the provider may have accepted the upload (a timeout
+    /// after sending, a dropped response). Never retried; goes to manual review.
+    Unknown,
 }
 
 impl From<PublishError> for FailReason {
     fn from(e: PublishError) -> Self {
         match e {
             PublishError::Auth => FailReason::Auth,
-            PublishError::RateLimited => FailReason::RateLimited,
+            PublishError::RateLimited { .. } => FailReason::RateLimited,
+            PublishError::Unknown => FailReason::Unknown,
             PublishError::Rejected => FailReason::Rejected,
             PublishError::Transient => FailReason::Transient,
         }
@@ -65,6 +71,10 @@ impl From<PublishError> for FailReason {
 }
 
 /// Provider port: uploads one video as a YouTube Short.
+///
+/// Error contract: `Transient` means the provider definitely did NOT create the
+/// video. Any failure where it might have (timeout after the body was sent, a
+/// lost response, an unparsable success) must be `Unknown`.
 #[allow(async_fn_in_trait)]
 pub trait Publisher {
     async fn publish(
@@ -194,7 +204,11 @@ async fn publish_one(
         ),
         Err(e) => {
             let reason = FailReason::from(e);
-            let next = record_failure(&claimed, reason, now);
+            let retry_at = match e {
+                PublishError::RateLimited { retry_at } => retry_at,
+                _ => None,
+            };
+            let next = record_failure(&claimed, reason, now, retry_at);
             let outcome = if matches!(next, Ok(PublishState::Queued { .. })) {
                 Outcome::Retrying(reason)
             } else {
@@ -265,7 +279,7 @@ mod tests {
     fn provider_errors_map_to_fixed_reason_codes() {
         assert_eq!(FailReason::from(PublishError::Auth), FailReason::Auth);
         assert_eq!(
-            FailReason::from(PublishError::RateLimited),
+            FailReason::from(PublishError::RateLimited { retry_at: None }),
             FailReason::RateLimited
         );
         assert_eq!(
@@ -482,16 +496,16 @@ mod tests {
     }
 
     #[test]
-    fn an_auth_failure_fails_the_post_without_retry() {
+    fn an_auth_failure_requeues_the_post_without_using_an_attempt() {
         let repo = FakeRepo::with(vec![scheduled("a", NOW - 1)]);
         let publisher = FakePublisher::returning(vec![Err(PublishError::Auth)]);
         let report = run(&repo, &publisher, &fresh_store(), &refresher_ok());
-        assert_eq!(report.outcomes[0].1, Outcome::Failed(FailReason::Auth));
+        assert_eq!(report.outcomes[0].1, Outcome::Retrying(FailReason::Auth));
         assert_eq!(
             repo.state("a"),
-            PublishState::Failed {
-                attempts: 1,
-                reason: FailReason::Auth
+            PublishState::Queued {
+                attempts: 0,
+                not_before: NOW
             }
         );
     }
@@ -506,7 +520,7 @@ mod tests {
             &FakeTokenStore::default(),
             &refresher_ok(),
         );
-        assert_eq!(report.outcomes[0].1, Outcome::Failed(FailReason::Auth));
+        assert_eq!(report.outcomes[0].1, Outcome::Retrying(FailReason::Auth));
         assert!(publisher.calls.borrow().is_empty());
     }
 
@@ -547,14 +561,15 @@ mod tests {
         };
         let publisher = FakePublisher::default();
         let report = run(&repo, &publisher, &tokens, &refresher);
-        assert_eq!(report.outcomes[0].1, Outcome::Failed(FailReason::Auth));
+        assert_eq!(report.outcomes[0].1, Outcome::Retrying(FailReason::Auth));
         assert!(publisher.calls.borrow().is_empty());
     }
 
     #[test]
     fn a_rate_limit_requeues_with_backoff() {
         let repo = FakeRepo::with(vec![scheduled("a", NOW - 1)]);
-        let publisher = FakePublisher::returning(vec![Err(PublishError::RateLimited)]);
+        let publisher =
+            FakePublisher::returning(vec![Err(PublishError::RateLimited { retry_at: None })]);
         let report = run(&repo, &publisher, &fresh_store(), &refresher_ok());
         assert_eq!(
             report.outcomes[0].1,
@@ -563,10 +578,28 @@ mod tests {
         assert_eq!(
             repo.state("a"),
             PublishState::Queued {
-                attempts: 1,
-                not_before: NOW + 60
+                attempts: 0,
+                not_before: NOW + 3600
             }
         );
+    }
+
+    #[test]
+    fn an_unknown_outcome_is_failed_for_review_and_never_requeued() {
+        let repo = FakeRepo::with(vec![scheduled("a", NOW - 1)]);
+        let publisher = FakePublisher::returning(vec![Err(PublishError::Unknown)]);
+        let report = run(&repo, &publisher, &fresh_store(), &refresher_ok());
+        assert_eq!(report.outcomes[0].1, Outcome::Failed(FailReason::Unknown));
+        assert_eq!(
+            repo.state("a"),
+            PublishState::Failed {
+                attempts: 1,
+                reason: FailReason::Unknown
+            }
+        );
+        assert!(run(&repo, &publisher, &fresh_store(), &refresher_ok())
+            .outcomes
+            .is_empty());
     }
 
     #[test]

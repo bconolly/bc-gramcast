@@ -13,6 +13,10 @@ use crate::queue::{Platform, QueuedPost};
 pub const MAX_ATTEMPTS: u32 = 3;
 /// First retry waits this long; each further attempt doubles it.
 pub const BACKOFF_BASE_SECS: i64 = 60;
+/// A rate limit with no provider hint waits this long. Does not count as an attempt.
+pub const RATE_LIMIT_BACKOFF_SECS: i64 = 60 * 60;
+/// A provider-supplied `retry_at` is trusted only up to this far ahead.
+pub const MAX_RATE_LIMIT_WAIT_SECS: i64 = 24 * 60 * 60;
 /// How long a post may sit in `Publishing` before it is flagged for manual review.
 /// Our own choice, not a provider limit.
 pub const PUBLISH_TIMEOUT_SECS: i64 = 15 * 60;
@@ -25,6 +29,9 @@ pub enum FailReason {
     Rejected,
     Transient,
     StuckPublishing,
+    /// The provider call ended with an unknown result: the video may exist.
+    /// Manual review, never requeued (a retry could double-post).
+    Unknown,
 }
 
 impl FailReason {
@@ -35,13 +42,8 @@ impl FailReason {
             FailReason::Rejected => "rejected",
             FailReason::Transient => "transient",
             FailReason::StuckPublishing => "stuck_publishing",
+            FailReason::Unknown => "unknown",
         }
-    }
-
-    /// Only failures that say "try again later" are retried. An auth failure
-    /// needs the owner to reconnect, and a rejection will not change.
-    pub fn is_retryable(self) -> bool {
-        matches!(self, FailReason::RateLimited | FailReason::Transient)
     }
 }
 
@@ -116,7 +118,7 @@ pub fn select_due(posts: &[ScheduledPost], now: i64) -> Vec<&ScheduledPost> {
 pub fn claim(state: &PublishState, now: i64) -> Result<PublishState, StateError> {
     match state {
         PublishState::Queued { attempts, .. } => Ok(PublishState::Publishing {
-            attempt: attempts + 1,
+            attempt: attempts.saturating_add(1),
             started_at: now,
         }),
         _ => Err(StateError::WrongState),
@@ -133,26 +135,55 @@ pub fn record_success(state: &PublishState, external_id: &str) -> Result<Publish
     }
 }
 
-/// Publishing -> Queued (retry after backoff) or Failed (not retryable, or out of attempts).
+/// Publishing -> Queued or Failed.
+/// - `Transient`: counts as an attempt; requeued with backoff until `MAX_ATTEMPTS`, then Failed.
+/// - `RateLimited`: requeued, not counted as an attempt, waiting until `retry_at` (clamped to
+///   between now and a day ahead) or an hour if the provider gave none.
+/// - `Auth`: requeued at once, not counted: the owner must reconnect, and no post should
+///   be failed for it. The caller stops the run.
+/// - `Rejected`, `Unknown`, `StuckPublishing`: Failed. Never requeued.
 pub fn record_failure(
     state: &PublishState,
     reason: FailReason,
     now: i64,
+    retry_at: Option<i64>,
 ) -> Result<PublishState, StateError> {
     let PublishState::Publishing { attempt, .. } = state else {
         return Err(StateError::WrongState);
     };
-    if reason.is_retryable() && *attempt < MAX_ATTEMPTS {
+    let uncounted = attempt.saturating_sub(1);
+    let requeue = |attempts: u32, not_before: i64| {
         Ok(PublishState::Queued {
-            attempts: *attempt,
-            not_before: now.saturating_add(backoff_secs(*attempt)),
+            attempts,
+            not_before,
         })
-    } else {
-        Ok(PublishState::Failed {
+    };
+    match reason {
+        FailReason::Transient if *attempt < MAX_ATTEMPTS => {
+            requeue(*attempt, now.saturating_add(backoff_secs(*attempt)))
+        }
+        FailReason::RateLimited => {
+            let wait_until = match retry_at {
+                Some(at) => at.clamp(now, now.saturating_add(MAX_RATE_LIMIT_WAIT_SECS)),
+                None => now.saturating_add(RATE_LIMIT_BACKOFF_SECS),
+            };
+            requeue(uncounted, wait_until)
+        }
+        FailReason::Auth => requeue(uncounted, now),
+        _ => Ok(PublishState::Failed {
             attempts: *attempt,
             reason,
-        })
+        }),
     }
+}
+
+/// The provider's id for a video, as we are willing to store it: 1 to 32 of `[A-Za-z0-9_-]`.
+/// Anything else is not trusted (see `PublishError::Unknown`).
+pub fn is_valid_external_id(id: &str) -> bool {
+    (1..=32).contains(&id.len())
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
 }
 
 /// A post stuck in `Publishing` past the timeout goes to `Failed(StuckPublishing)`,
@@ -299,16 +330,16 @@ mod tests {
     }
 
     #[test]
-    fn a_retryable_failure_requeues_with_backoff() {
+    fn a_transient_failure_requeues_with_backoff() {
         assert_eq!(
-            record_failure(&publishing(1, 5), FailReason::Transient, 1000),
+            record_failure(&publishing(1, 5), FailReason::Transient, 1000, None),
             Ok(PublishState::Queued {
                 attempts: 1,
                 not_before: 1060
             })
         );
         assert_eq!(
-            record_failure(&publishing(2, 5), FailReason::RateLimited, 1000),
+            record_failure(&publishing(2, 5), FailReason::Transient, 1000, None),
             Ok(PublishState::Queued {
                 attempts: 2,
                 not_before: 1120
@@ -319,7 +350,12 @@ mod tests {
     #[test]
     fn the_last_attempt_fails_for_good() {
         assert_eq!(
-            record_failure(&publishing(MAX_ATTEMPTS, 5), FailReason::Transient, 1000),
+            record_failure(
+                &publishing(MAX_ATTEMPTS, 5),
+                FailReason::Transient,
+                1000,
+                None
+            ),
             Ok(PublishState::Failed {
                 attempts: 3,
                 reason: FailReason::Transient
@@ -328,10 +364,14 @@ mod tests {
     }
 
     #[test]
-    fn auth_and_rejection_are_never_retried() {
-        for r in [FailReason::Auth, FailReason::Rejected] {
+    fn rejection_unknown_and_stuck_are_never_requeued() {
+        for r in [
+            FailReason::Rejected,
+            FailReason::Unknown,
+            FailReason::StuckPublishing,
+        ] {
             assert_eq!(
-                record_failure(&publishing(1, 5), r, 1000),
+                record_failure(&publishing(1, 5), r, 1000, None),
                 Ok(PublishState::Failed {
                     attempts: 1,
                     reason: r
@@ -341,11 +381,68 @@ mod tests {
     }
 
     #[test]
+    fn a_rate_limit_waits_an_hour_and_does_not_use_up_an_attempt() {
+        assert_eq!(
+            record_failure(
+                &publishing(MAX_ATTEMPTS, 5),
+                FailReason::RateLimited,
+                1000,
+                None
+            ),
+            Ok(PublishState::Queued {
+                attempts: MAX_ATTEMPTS - 1,
+                not_before: 1000 + RATE_LIMIT_BACKOFF_SECS
+            })
+        );
+    }
+
+    #[test]
+    fn a_rate_limit_retry_at_is_used_but_kept_within_a_day() {
+        let at = |r| match record_failure(&publishing(1, 5), FailReason::RateLimited, 1000, r) {
+            Ok(PublishState::Queued { not_before, .. }) => not_before,
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(at(Some(5000)), 5000);
+        assert_eq!(at(Some(10)), 1000);
+        assert_eq!(at(Some(i64::MAX)), 1000 + MAX_RATE_LIMIT_WAIT_SECS);
+    }
+
+    #[test]
+    fn an_auth_failure_requeues_without_using_an_attempt() {
+        assert_eq!(
+            record_failure(&publishing(2, 5), FailReason::Auth, 1000, None),
+            Ok(PublishState::Queued {
+                attempts: 1,
+                not_before: 1000
+            })
+        );
+    }
+
+    #[test]
     fn failure_only_applies_to_a_publishing_post() {
         assert_eq!(
-            record_failure(&PublishState::new_queued(), FailReason::Transient, 1),
+            record_failure(&PublishState::new_queued(), FailReason::Transient, 1, None),
             Err(StateError::WrongState)
         );
+    }
+
+    #[test]
+    fn claim_does_not_overflow_the_attempt_count() {
+        let s = PublishState::Queued {
+            attempts: u32::MAX,
+            not_before: 0,
+        };
+        assert_eq!(claim(&s, 1), Ok(publishing(u32::MAX, 1)));
+    }
+
+    #[test]
+    fn external_ids_are_short_and_url_safe() {
+        assert!(is_valid_external_id("dQw4w9WgXcQ"));
+        assert!(is_valid_external_id("a_b-C"));
+        assert!(is_valid_external_id(&"a".repeat(32)));
+        for bad in ["", &"a".repeat(33), "a b", "a/b", "a<b", "é", "a\nb"] {
+            assert!(!is_valid_external_id(bad), "{bad}");
+        }
     }
 
     #[test]
@@ -369,5 +466,6 @@ mod tests {
         assert_eq!(FailReason::Rejected.code(), "rejected");
         assert_eq!(FailReason::Transient.code(), "transient");
         assert_eq!(FailReason::StuckPublishing.code(), "stuck_publishing");
+        assert_eq!(FailReason::Unknown.code(), "unknown");
     }
 }
