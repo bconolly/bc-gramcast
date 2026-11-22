@@ -144,6 +144,10 @@ pub trait PublishRepository {
     ) -> Result<Cas, PortError>;
 }
 
+/// Posts a scheduled run handles. One: an upload can take most of the invocation and its
+/// subrequest allowance, so the next post waits for the next run (5 minutes later).
+pub const POSTS_PER_RUN: usize = 1;
+
 /// What happened to one post in a run.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Outcome {
@@ -170,6 +174,29 @@ pub enum Outcome {
     },
 }
 
+impl Outcome {
+    /// A fixed log code, never provider text.
+    pub fn code(&self) -> &'static str {
+        match self {
+            Outcome::Published { .. } => "published",
+            Outcome::Retrying(_) => "retrying",
+            Outcome::Failed(_) => "failed",
+            Outcome::AlreadyClaimed => "already_claimed",
+            Outcome::Released => "released",
+            Outcome::FlaggedStuck => "flagged_stuck",
+            Outcome::StateLost { .. } => "state_lost",
+        }
+    }
+
+    /// The reason behind a retry or a failure.
+    pub fn reason(&self) -> Option<FailReason> {
+        match self {
+            Outcome::Retrying(r) | Outcome::Failed(r) => Some(*r),
+            _ => None,
+        }
+    }
+}
+
 /// Why a run stopped before working through every due post.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Halt {
@@ -184,6 +211,18 @@ pub enum Halt {
     Storage,
 }
 
+impl Halt {
+    /// A fixed log code.
+    pub fn code(self) -> &'static str {
+        match self {
+            Halt::NeedsReconnect => "needs_reconnect",
+            Halt::TokenUnavailable => "token_unavailable",
+            Halt::RateLimited => "rate_limited",
+            Halt::Storage => "storage",
+        }
+    }
+}
+
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct PublishReport {
     /// (post id, outcome), in the order handled.
@@ -195,6 +234,8 @@ pub struct PublishReport {
 /// time-dependent step. Posts that were not reached stay Queued and unclaimed. A failure
 /// on one post does not stop the next, except `Auth` and rate limits, which would hit
 /// every post and so end the run (`PublishReport::halted`).
+/// At most `max_posts` due posts are handled per call (earliest slots first), which bounds
+/// a run (W7); the rest stay Queued and unclaimed for the next run.
 /// Only a failure to list posts is an `Err`; later storage errors end the run as `Halt::Storage`.
 pub async fn publish_due(
     clock: &impl Fn() -> i64,
@@ -203,6 +244,7 @@ pub async fn publish_due(
     tokens: &impl TokenStore,
     refresher: &impl TokenRefresher,
     links: &impl VideoLinks,
+    max_posts: usize,
 ) -> Result<PublishReport, PortError> {
     let run = Run {
         clock,
@@ -219,7 +261,7 @@ pub async fn publish_due(
         return Ok(report);
     }
     let due = select_due(&posts, clock());
-    if due.is_empty() {
+    if due.is_empty() || max_posts == 0 {
         return Ok(report);
     }
     // One token check for the run: if it fails, nothing is claimed.
@@ -230,7 +272,7 @@ pub async fn publish_due(
             return Ok(report);
         }
     };
-    for p in due {
+    for p in due.into_iter().take(max_posts) {
         // Before the claim: a token problem is not an upload outcome, so it must
         // never fail a post that was not uploaded. Nothing is claimed.
         if let Err(e) = run.refresh_if_needed(&mut token).await {
@@ -759,6 +801,7 @@ mod tests {
             tokens,
             refresher,
             &FakeLinks,
+            usize::MAX,
         ))
         .unwrap()
     }
@@ -792,6 +835,101 @@ mod tests {
         let publisher = FakePublisher::returning(vec![ok_ref("yt1")]);
         run(&repo, &publisher, &fresh_store(), &refresher_ok());
         assert_eq!(*repo.listed_at.borrow(), [NOW]);
+    }
+
+    fn three_due() -> FakeRepo {
+        FakeRepo::with(vec![
+            scheduled("a", NOW - 3),
+            scheduled("b", NOW - 2),
+            scheduled("c", NOW - 1),
+        ])
+    }
+
+    #[test]
+    fn a_run_handles_no_more_posts_than_its_cap_earliest_first() {
+        for (cap, handled) in [(0, 0), (1, 1), (2, 2), (3, 3), (10, 3)] {
+            let repo = three_due();
+            let publisher =
+                FakePublisher::returning(vec![ok_ref("y1"), ok_ref("y2"), ok_ref("y3")]);
+            let tokens = fresh_store();
+            let refresher = refresher_ok();
+            let report = pollster::block_on(publish_due(
+                &|| NOW,
+                &repo,
+                &publisher,
+                &tokens,
+                &refresher,
+                &FakeLinks,
+                cap,
+            ))
+            .unwrap();
+            assert_eq!(report.outcomes.len(), handled, "cap {cap}");
+            assert_eq!(report.halted, None);
+            let ids = ["a", "b", "c"];
+            for (n, id) in ids.iter().enumerate() {
+                let untouched = n >= handled;
+                assert_eq!(
+                    repo.state(id) == PublishState::new_queued(),
+                    untouched,
+                    "{id} cap {cap}"
+                );
+            }
+            // Posts past the cap are not claimed, so nothing is half-done for them.
+            assert_eq!(publisher.calls.borrow().len(), handled);
+        }
+    }
+
+    #[test]
+    fn a_run_with_a_cap_of_zero_does_not_even_check_the_token() {
+        let repo = three_due();
+        let tokens = FakeTokenStore::default(); // no token: a check would halt
+        let report = pollster::block_on(publish_due(
+            &|| NOW,
+            &repo,
+            &FakePublisher::default(),
+            &tokens,
+            &refresher_ok(),
+            &FakeLinks,
+            0,
+        ))
+        .unwrap();
+        assert_eq!(report, PublishReport::default());
+    }
+
+    #[test]
+    fn a_scheduled_run_handles_one_post() {
+        assert_eq!(POSTS_PER_RUN, 1);
+    }
+
+    #[test]
+    fn halts_and_outcomes_have_fixed_log_codes() {
+        assert_eq!(Halt::NeedsReconnect.code(), "needs_reconnect");
+        assert_eq!(Halt::TokenUnavailable.code(), "token_unavailable");
+        assert_eq!(Halt::RateLimited.code(), "rate_limited");
+        assert_eq!(Halt::Storage.code(), "storage");
+        let o = |o: Outcome| o.code();
+        assert_eq!(
+            o(Outcome::Published {
+                external_id: "x".into()
+            }),
+            "published"
+        );
+        assert_eq!(o(Outcome::Retrying(FailReason::Transient)), "retrying");
+        assert_eq!(o(Outcome::Failed(FailReason::Rejected)), "failed");
+        assert_eq!(o(Outcome::AlreadyClaimed), "already_claimed");
+        assert_eq!(o(Outcome::Released), "released");
+        assert_eq!(o(Outcome::FlaggedStuck), "flagged_stuck");
+        assert_eq!(o(Outcome::StateLost { external_id: None }), "state_lost");
+        // The reason behind a retry or a failure is reported separately, by its own code.
+        assert_eq!(
+            Outcome::Retrying(FailReason::Auth).reason(),
+            Some(FailReason::Auth)
+        );
+        assert_eq!(
+            Outcome::Failed(FailReason::Unknown).reason(),
+            Some(FailReason::Unknown)
+        );
+        assert_eq!(Outcome::Released.reason(), None);
     }
 
     #[test]
@@ -917,6 +1055,7 @@ mod tests {
                 &tokens,
                 &refresher,
                 &FakeLinks,
+                usize::MAX,
             ))
             .unwrap();
             assert_eq!(report.halted, Some(Halt::TokenUnavailable));
@@ -1048,6 +1187,7 @@ mod tests {
                 &tokens,
                 &refresher_ok(),
                 &FakeLinks,
+                usize::MAX,
             ))
             .unwrap();
             outcomes.push(r.outcomes[0].1.clone());
@@ -1245,6 +1385,7 @@ mod tests {
             &tokens,
             &refresher,
             &FakeLinks,
+            usize::MAX,
         ))
         .unwrap();
         // Backoff is measured from the moment each post failed, not from the start of the run.
@@ -1304,6 +1445,7 @@ mod tests {
             &tokens,
             &refresher,
             &FakeLinks,
+            usize::MAX,
         ))
         .unwrap();
         assert_eq!(report.halted, Some(Halt::TokenUnavailable));
@@ -1346,6 +1488,7 @@ mod tests {
             &fresh_store(),
             &refresher_ok(),
             &FakeLinks,
+            usize::MAX,
         ))
         .unwrap();
         assert_eq!(report.halted, Some(Halt::Storage));
@@ -1449,6 +1592,7 @@ mod tests {
             &fresh_store(),
             &refresher_ok(),
             &FakeLinks,
+            usize::MAX,
         ))
         .unwrap();
         assert_eq!(later.outcomes, [("a".to_string(), Outcome::FlaggedStuck)]);
@@ -1544,6 +1688,7 @@ mod tests {
             &SaveAnswers(inner, answer),
             &refresher_ok(),
             &FakeLinks,
+            usize::MAX,
         ))
         .unwrap();
         (report, repo, publisher)
@@ -1583,6 +1728,7 @@ mod tests {
             &SaveAnswers(inner, Some(false)),
             &refresher_ok(),
             &FakeLinks,
+            usize::MAX,
         ))
         .unwrap();
         assert_eq!(report.halted, Some(Halt::TokenUnavailable));
@@ -1651,6 +1797,7 @@ mod tests {
             &store,
             &refresher_ok(),
             &FakeLinks,
+            usize::MAX,
         ))
         .unwrap();
         assert_eq!(report.halted, Some(Halt::NeedsReconnect));
@@ -1677,6 +1824,7 @@ mod tests {
             &fresh_store(),
             &refresher_ok(),
             &NoLinks,
+            usize::MAX,
         ))
         .unwrap();
         assert_eq!(
@@ -1719,6 +1867,7 @@ mod tests {
                 &fresh_store(),
                 &refresher_ok(),
                 &NeverAsked,
+                usize::MAX,
             ))
             .unwrap();
             assert_eq!(
@@ -1753,6 +1902,7 @@ mod tests {
                 &fresh_store(),
                 &refresher_ok(),
                 &Sized(size),
+                usize::MAX,
             ))
             .unwrap();
             assert_eq!(
