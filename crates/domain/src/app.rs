@@ -62,11 +62,14 @@ pub trait PostRepository {
     async fn insert(&self, post: &QueuedPost) -> Result<(), InsertError>;
     async fn get(&self, id: &str) -> Result<Option<QueuedPost>, PortError>;
     /// Replaces the editable fields of the post with this id, only while its stored
-    /// slot is after `now`. Must fail with `SlotTaken` if another post holds the
-    /// slot, `NotFound` if there is no such row and `NotQueued` if its slot has passed.
+    /// slot is after `now` AND the publisher has not claimed it (checked in the same
+    /// atomic write, not read first). Must fail with `SlotTaken` if another post holds
+    /// the slot, `NotFound` if there is no such row and `NotQueued` if its slot has
+    /// passed or the post has been claimed.
     async fn update(&self, post: &QueuedPost, now: i64) -> Result<(), UpdateError>;
-    /// Removes the post, only while its stored slot is after `now`. Fails with
-    /// `NotFound` or `NotQueued` as for `update`.
+    /// Removes the post, only while its stored slot is after `now` AND the publisher
+    /// has not claimed it, in the same atomic write. Fails with `NotFound` or
+    /// `NotQueued` as for `update`. The caller removes the video only after `Ok`.
     async fn delete(&self, id: &str, now: i64) -> Result<(), DeleteError>;
 }
 
@@ -1038,6 +1041,44 @@ mod tests {
         }
         assert_eq!(repo.posts.borrow().len(), 1);
         assert!(s.deleted.borrow().is_empty());
+    }
+
+    /// Its slot is still ahead, but the publisher has claimed the post: the repository
+    /// refuses both writes, as its guarded SQL does.
+    struct Claimed;
+    impl PostRepository for Claimed {
+        async fn all(&self) -> Result<Vec<QueuedPost>, PortError> {
+            Ok(vec![])
+        }
+        async fn insert(&self, _p: &QueuedPost) -> Result<(), InsertError> {
+            Ok(())
+        }
+        async fn get(&self, id: &str) -> Result<Option<QueuedPost>, PortError> {
+            Ok(Some(post(id, 100)))
+        }
+        async fn update(&self, _p: &QueuedPost, _now: i64) -> Result<(), UpdateError> {
+            Err(UpdateError::NotQueued)
+        }
+        async fn delete(&self, _id: &str, _now: i64) -> Result<(), DeleteError> {
+            Err(DeleteError::NotQueued)
+        }
+    }
+
+    #[test]
+    fn deleting_a_claimed_post_keeps_its_video() {
+        let s = store();
+        let e = pollster::block_on(delete_post(&Claimed, &s, ID_A, 0));
+        assert_eq!(e, Err(AppError::NotQueued));
+        assert!(
+            s.deleted.borrow().is_empty(),
+            "the video must not be removed"
+        );
+    }
+
+    #[test]
+    fn editing_a_claimed_post_is_refused() {
+        let e = pollster::block_on(update_post(&Claimed, ID_A, changes(500), 0));
+        assert_eq!(e, Err(AppError::NotQueued));
     }
 
     #[test]

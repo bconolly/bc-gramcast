@@ -229,36 +229,60 @@ pub fn write_applied(changes: Option<usize>) -> bool {
     changes.is_some_and(|n| n > 0)
 }
 
-/// Settles an update that did not report a change. `row_slot` is the stored
-/// `slot_at` read back afterwards (`None`: no such row). The SQL only touches rows
-/// whose slot is after `now`, so a row at or before it was refused, not updated.
+/// What the edit and delete paths read back after a write that changed nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RowGuard {
+    pub slot_at: i64,
+    /// The publisher has taken the post (or it is finished): see `row_claimed`.
+    pub claimed: bool,
+}
+
+/// Unclaimed means Queued with 0 attempts. Anything else, including a state or a
+/// count this code does not recognise, counts as claimed, so it fails closed.
+pub fn row_claimed(state: &str, attempts: f64) -> bool {
+    !(state == "queued" && attempts == 0.0)
+}
+
+/// Edit and delete touch a row only while its slot is after `now` AND the publisher has
+/// not claimed it (the state columns of migration 0004). The slot test alone left a gap:
+/// the publisher claims on the Worker clock, which can pass the slot after this request
+/// began.
+pub const UPDATE_POST_SQL: &str = "UPDATE posts SET title = ?1, caption = ?2, platforms = ?3, \
+     slot_at = ?4 WHERE id = ?5 AND slot_at > ?6 AND state = 'queued' AND attempts = 0";
+pub const DELETE_POST_SQL: &str =
+    "DELETE FROM posts WHERE id = ?1 AND slot_at > ?2 AND state = 'queued' AND attempts = 0";
+
+/// Settles an update that did not report a change. `row` is what was read back
+/// afterwards (`None`: no such row). The SQL only touches unclaimed rows whose slot
+/// is after `now`, so a claimed row or one at or before it was refused, not updated.
 pub fn update_after_miss(
     changes: Option<usize>,
-    row_slot: Option<i64>,
+    row: Option<RowGuard>,
     now: i64,
 ) -> Result<(), UpdateError> {
-    match (changes, row_slot) {
+    match (changes, row) {
         (_, None) => Err(UpdateError::NotFound),
-        (_, Some(slot)) if slot <= now => Err(UpdateError::NotQueued),
-        // No count, and the row now holds a future slot: our update landed.
+        (_, Some(r)) if r.claimed || r.slot_at <= now => Err(UpdateError::NotQueued),
+        // No count, and the row is open with a future slot: our update landed.
         (None, Some(_)) => Ok(()),
-        // A count of 0 with a queued row should be impossible: do not claim success.
+        // A count of 0 with an open row should be impossible: do not claim success.
         (Some(_), Some(_)) => Err(UpdateError::Port(PortError(
             "update changed no rows".into(),
         ))),
     }
 }
 
-/// Settles a delete that did not report a change, like `update_after_miss`.
+/// Settles a delete that did not report a change, like `update_after_miss`. A claimed
+/// row still exists, so it is `NotQueued` and its video must stay.
 pub fn delete_after_miss(
     changes: Option<usize>,
-    row_slot: Option<i64>,
+    row: Option<RowGuard>,
     now: i64,
 ) -> Result<(), DeleteError> {
-    match (changes, row_slot) {
+    match (changes, row) {
         (None, None) => Ok(()),
         (Some(_), None) => Err(DeleteError::NotFound),
-        (_, Some(slot)) if slot <= now => Err(DeleteError::NotQueued),
+        (_, Some(r)) if r.claimed || r.slot_at <= now => Err(DeleteError::NotQueued),
         (_, Some(_)) => Err(DeleteError::Port(PortError(
             "delete removed no rows".into(),
         ))),
@@ -649,33 +673,67 @@ mod tests {
         assert!(!write_applied(None));
     }
 
+    const OPEN: RowGuard = RowGuard {
+        slot_at: NOW + 1,
+        claimed: false,
+    };
+    const CLAIMED: RowGuard = RowGuard {
+        slot_at: NOW + 1,
+        claimed: true,
+    };
+    const PASSED: RowGuard = RowGuard {
+        slot_at: NOW,
+        claimed: false,
+    };
+
+    #[test]
+    fn a_post_is_unclaimed_only_while_queued_with_no_attempts() {
+        assert!(!row_claimed("queued", 0.0));
+        for (state, attempts) in [
+            ("queued", 1.0),
+            ("publishing", 0.0),
+            ("published", 0.0),
+            ("failed", 3.0),
+            ("something-new", 0.0),
+            ("queued", f64::NAN),
+            ("queued", -1.0),
+        ] {
+            assert!(row_claimed(state, attempts), "{state} {attempts}");
+        }
+    }
+
     #[test]
     fn update_after_no_change_reads_the_row_to_decide() {
-        // Row gone: NotFound. Row there with a passed slot: NotQueued.
+        // Row gone: NotFound. Row there with a passed slot or a claim: NotQueued.
         assert_eq!(
             update_after_miss(Some(0), None, NOW),
             Err(UpdateError::NotFound)
         );
         assert_eq!(
-            update_after_miss(Some(0), Some(NOW), NOW),
+            update_after_miss(Some(0), Some(PASSED), NOW),
             Err(UpdateError::NotQueued)
         );
         assert_eq!(
-            update_after_miss(Some(0), Some(NOW - 1), NOW),
-            Err(UpdateError::NotQueued)
+            update_after_miss(Some(0), Some(CLAIMED), NOW),
+            Err(UpdateError::NotQueued),
+            "a claimed post is refused even with its slot still ahead"
         );
-        // 0 changes yet a queued row cannot happen: do not claim success.
+        // 0 changes yet an open row cannot happen: do not claim success.
         assert!(matches!(
-            update_after_miss(Some(0), Some(NOW + 1), NOW),
+            update_after_miss(Some(0), Some(OPEN), NOW),
             Err(UpdateError::Port(_))
         ));
     }
 
     #[test]
     fn update_without_a_change_count_trusts_the_reread_row() {
-        assert_eq!(update_after_miss(None, Some(NOW + 1), NOW), Ok(()));
+        assert_eq!(update_after_miss(None, Some(OPEN), NOW), Ok(()));
         assert_eq!(
-            update_after_miss(None, Some(NOW), NOW),
+            update_after_miss(None, Some(PASSED), NOW),
+            Err(UpdateError::NotQueued)
+        );
+        assert_eq!(
+            update_after_miss(None, Some(CLAIMED), NOW),
             Err(UpdateError::NotQueued)
         );
         assert_eq!(
@@ -691,11 +749,15 @@ mod tests {
             Err(DeleteError::NotFound)
         );
         assert_eq!(
-            delete_after_miss(Some(0), Some(NOW), NOW),
+            delete_after_miss(Some(0), Some(PASSED), NOW),
+            Err(DeleteError::NotQueued)
+        );
+        assert_eq!(
+            delete_after_miss(Some(0), Some(CLAIMED), NOW),
             Err(DeleteError::NotQueued)
         );
         assert!(matches!(
-            delete_after_miss(Some(0), Some(NOW + 1), NOW),
+            delete_after_miss(Some(0), Some(OPEN), NOW),
             Err(DeleteError::Port(_))
         ));
     }
@@ -704,13 +766,29 @@ mod tests {
     fn delete_without_a_change_count_trusts_the_reread_row() {
         assert_eq!(delete_after_miss(None, None, NOW), Ok(()));
         assert_eq!(
-            delete_after_miss(None, Some(NOW), NOW),
+            delete_after_miss(None, Some(PASSED), NOW),
             Err(DeleteError::NotQueued)
         );
+        assert_eq!(
+            delete_after_miss(None, Some(CLAIMED), NOW),
+            Err(DeleteError::NotQueued),
+            "a claimed row was not deleted, so its video must stay"
+        );
         assert!(matches!(
-            delete_after_miss(None, Some(NOW + 1), NOW),
+            delete_after_miss(None, Some(OPEN), NOW),
             Err(DeleteError::Port(_))
         ));
+    }
+
+    #[test]
+    fn the_edit_and_delete_sql_both_require_an_unclaimed_row() {
+        for sql in [UPDATE_POST_SQL, DELETE_POST_SQL] {
+            assert!(sql.contains("slot_at > ?"), "{sql}");
+            assert!(sql.contains("state = 'queued'"), "{sql}");
+            assert!(sql.contains("attempts = 0"), "{sql}");
+        }
+        assert!(UPDATE_POST_SQL.starts_with("UPDATE posts SET title = ?1"));
+        assert!(DELETE_POST_SQL.starts_with("DELETE FROM posts WHERE id = ?1"));
     }
 
     #[test]
