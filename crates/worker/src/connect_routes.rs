@@ -9,7 +9,7 @@
 //! expired callback is refused before anything is sent to Google. There is no PKCE
 //! (support for this flow was not confirmed). Neither route logs a state, code,
 //! token, secret or URL. `start` also refuses a `Sec-Fetch-Site` that is not
-//! `same-origin` or `none`, so another site cannot start the flow for the owner.
+//! `same-origin` or `none` (302 to Settings with `connect_error=try_again`), so another site cannot start the flow for the owner.
 
 use crate::adapters::now_secs;
 use crate::connect_dto;
@@ -39,7 +39,9 @@ pub async fn start(req: Request, ctx: Ctx) -> Result<Response> {
     // Only the owner's own navigation may start the flow, not a link on another site.
     let site = req.headers().get("Sec-Fetch-Site").ok().flatten();
     if !auth::check_navigation(site.as_deref()) {
-        return Response::error("forbidden", 403);
+        // Send the owner to the app with a message, not a bare error page.
+        let refused = Err(ConnectError::TryAgain);
+        return redirect(&connect_dto::redirect_location(refused));
     }
     let config = match oauth_config(&ctx.env) {
         Ok(c) => c,

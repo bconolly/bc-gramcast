@@ -13,13 +13,17 @@ describe("readConnectResult", () => {
   });
 
   it("maps each fixed error code to its own message", () => {
-    const codes = ["access_denied", "bad_state", "exchange_failed", "server_error"];
+    const codes = ["access_denied", "bad_state", "exchange_failed", "server_error", "try_again"];
     expect(Object.keys(CONNECT_ERROR_MESSAGES).sort()).toEqual(codes.sort());
     for (const code of codes) {
       expect(readConnectResult(`?connect_error=${code}`).errorMessage).toBe(CONNECT_ERROR_MESSAGES[code]);
     }
     const all = codes.map((c) => CONNECT_ERROR_MESSAGES[c]);
     expect(new Set(all).size).toBe(codes.length);
+  });
+
+  it("tells the owner to press Connect YouTube again for try_again", () => {
+    expect(readConnectResult("?connect_error=try_again").errorMessage).toBe("Please press Connect YouTube again.");
   });
 
   it("never echoes an unknown code", () => {

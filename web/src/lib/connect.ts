@@ -9,6 +9,7 @@ export const CONNECT_ERROR_MESSAGES: Record<string, string> = {
   bad_state: "That connection attempt expired or was already used. Please start again.",
   exchange_failed: "Google would not complete the connection. Please try again.",
   server_error: "Something went wrong on our side. Please try again.",
+  try_again: "Please press Connect YouTube again.",
 };
 
 export const GENERIC_CONNECT_ERROR = "YouTube could not be connected. Please try again.";

@@ -214,6 +214,7 @@ mod tests {
             (ConnectError::BadState, "bad_state"),
             (ConnectError::ExchangeFailed, "exchange_failed"),
             (ConnectError::Server, "server_error"),
+            (ConnectError::TryAgain, "try_again"),
         ] {
             assert_eq!(
                 redirect_location(Err(e)),

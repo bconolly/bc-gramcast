@@ -137,6 +137,8 @@ pub enum ConnectError {
     ExchangeFailed,
     /// Our own storage failed.
     Server,
+    /// The start request did not come from the owner's own navigation; nothing was begun.
+    TryAgain,
 }
 
 impl ConnectError {
@@ -146,6 +148,7 @@ impl ConnectError {
             ConnectError::BadState => "bad_state",
             ConnectError::ExchangeFailed => "exchange_failed",
             ConnectError::Server => "server_error",
+            ConnectError::TryAgain => "try_again",
         }
     }
 }
@@ -428,6 +431,7 @@ mod tests {
         assert_eq!(ConnectError::BadState.code(), "bad_state");
         assert_eq!(ConnectError::ExchangeFailed.code(), "exchange_failed");
         assert_eq!(ConnectError::Server.code(), "server_error");
+        assert_eq!(ConnectError::TryAgain.code(), "try_again");
     }
 
     // ---- the callback use case ----
