@@ -23,6 +23,12 @@ pub fn failure_line(f: RunFailure) -> &'static str {
     }
 }
 
+/// A row of the list that could not be read and was left out. `id` comes from
+/// `publish_dto::map_rows`: a well-formed post id or the word `invalid`.
+pub fn skipped_row_line(id: &str) -> String {
+    format!("publish list: skipped an unreadable row post={id}")
+}
+
 /// One line for the run, one per post handled, one for a halt.
 pub fn run_lines(report: &PublishReport) -> Vec<String> {
     let mut lines = vec![format!("publish run posts={}", report.outcomes.len())];
@@ -69,6 +75,14 @@ mod tests {
                 .collect(),
             halted,
         }
+    }
+
+    #[test]
+    fn a_skipped_row_logs_a_fixed_line_with_its_id() {
+        assert_eq!(
+            skipped_row_line(ID),
+            format!("publish list: skipped an unreadable row post={ID}")
+        );
     }
 
     #[test]

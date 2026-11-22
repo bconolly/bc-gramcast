@@ -5,8 +5,10 @@
 //! the counters that do not belong to it are 0, so a stored state has exactly one
 //! shape and the compare-and-set can compare every column.
 
+use crate::dto;
 use domain::app::PortError;
-use domain::publish::{is_valid_external_id, FailReason, PublishState};
+use domain::publish::{is_valid_external_id, FailReason, PublishState, ScheduledPost};
+use domain::queue::{is_post_id, QueuedPost};
 use serde::Deserialize;
 
 /// The columns of one `PublishState`, in the order the SQL below binds them.
@@ -127,6 +129,72 @@ pub struct RawState {
     pub started_at: Option<f64>,
     pub external_id: Option<String>,
     pub fail_reason: Option<String>,
+}
+
+/// A `posts` row with its state columns, as D1 returns it. Flat, so no serde `flatten`.
+#[derive(Debug, Deserialize)]
+pub struct ListRow {
+    pub id: String,
+    pub video_key: String,
+    pub title: String,
+    pub caption: String,
+    pub platforms: String,
+    pub slot_at: f64,
+    pub state: String,
+    pub attempts: f64,
+    pub not_before: f64,
+    pub attempt: Option<f64>,
+    pub started_at: Option<f64>,
+    pub external_id: Option<String>,
+    pub fail_reason: Option<String>,
+}
+
+/// One row as a post and its state. Errors carry fixed text, never a row value.
+pub fn scheduled_post(r: ListRow) -> Result<ScheduledPost, PortError> {
+    let state = state_from_row(&RawState {
+        state: r.state,
+        attempts: r.attempts,
+        not_before: r.not_before,
+        attempt: r.attempt,
+        started_at: r.started_at,
+        external_id: r.external_id,
+        fail_reason: r.fail_reason,
+    })?;
+    let platforms = r
+        .platforms
+        .split(',')
+        .map(dto::platform_from_str)
+        .collect::<Option<Vec<_>>>()
+        .ok_or_else(bad_row)?;
+    let post = QueuedPost {
+        id: r.id,
+        video_key: r.video_key,
+        title: r.title,
+        caption: r.caption,
+        platforms,
+        slot_at: whole(r.slot_at)?,
+    };
+    Ok(ScheduledPost { post, state })
+}
+
+/// Maps every row; a row that cannot be read is skipped (one bad row must not stop the
+/// whole list) and its id is returned for a fixed log line, or `invalid` if it is not a
+/// well-formed post id.
+pub fn map_rows(rows: Vec<ListRow>) -> (Vec<ScheduledPost>, Vec<String>) {
+    let mut posts = Vec::with_capacity(rows.len());
+    let mut skipped = Vec::new();
+    for row in rows {
+        let id = if is_post_id(&row.id) {
+            row.id.clone()
+        } else {
+            "invalid".to_string()
+        };
+        match scheduled_post(row) {
+            Ok(p) => posts.push(p),
+            Err(_) => skipped.push(id),
+        }
+    }
+    (posts, skipped)
 }
 
 /// Largest integer a JavaScript number (as D1 returns it) holds exactly.
@@ -427,5 +495,52 @@ mod tests {
         r.external_id = Some("SECRET-LOOKING-VALUE".into());
         let e = state_from_row(&r).unwrap_err();
         assert!(!e.0.contains("SECRET"), "{e:?}");
+    }
+
+    fn list_row(id: &str) -> ListRow {
+        ListRow {
+            id: id.into(),
+            video_key: format!("videos/{id}.mp4"),
+            title: "T".into(),
+            caption: "C".into(),
+            platforms: "youtube,instagram".into(),
+            slot_at: 1_800_000_000.0,
+            state: "queued".into(),
+            attempts: 0.0,
+            not_before: 0.0,
+            attempt: None,
+            started_at: None,
+            external_id: None,
+            fail_reason: None,
+        }
+    }
+
+    const ID_OK: &str = "0123456789abcdef0123456789abcdef";
+    const ID_BAD_STATE: &str = "11111111111111111111111111111111";
+    const ID_BAD_PLATFORM: &str = "22222222222222222222222222222222";
+
+    #[test]
+    fn a_row_maps_to_a_scheduled_post() {
+        let post = scheduled_post(list_row(ID_OK)).unwrap();
+        assert_eq!(post.post.id, ID_OK);
+        assert_eq!(post.post.slot_at, 1_800_000_000);
+        assert_eq!(post.state, PublishState::new_queued());
+    }
+
+    #[test]
+    fn one_unreadable_row_is_skipped_by_id_and_the_rest_are_kept() {
+        let mut bad_state = list_row(ID_BAD_STATE);
+        bad_state.state = "something-new".into();
+        let mut bad_platform = list_row(ID_BAD_PLATFORM);
+        bad_platform.platforms = "tiktok".into();
+        let mut odd_id = list_row("not-a-post-id <script>");
+        odd_id.attempts = f64::NAN;
+        let (posts, skipped) = map_rows(vec![bad_state, list_row(ID_OK), bad_platform, odd_id]);
+        assert_eq!(
+            posts.iter().map(|p| p.post.id.as_str()).collect::<Vec<_>>(),
+            [ID_OK]
+        );
+        // Only ids that pass the post id check are named; anything else is not echoed.
+        assert_eq!(skipped, [ID_BAD_STATE, ID_BAD_PLATFORM, "invalid"]);
     }
 }

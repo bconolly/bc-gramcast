@@ -4,8 +4,8 @@
 //! column mapping and SQL are in `publish_dto`. These adapters cannot run natively.
 //! Their errors are fixed text: no D1 error or row value is copied in.
 
-use crate::adapters::{row_to_post, PostRow};
-use crate::publish_dto::{self, Param, RawState};
+use crate::publish_dto::{self, Param};
+use crate::publish_log;
 use domain::app::PortError;
 use domain::publish::ScheduledPost;
 use domain::publish_app::{Cas, PublishRepository};
@@ -37,48 +37,9 @@ impl D1PublishRepository {
     }
 }
 
-/// A `posts` row with its state columns. Flat, so no serde `flatten` is needed.
-#[derive(Deserialize)]
-struct ListRow {
-    id: String,
-    video_key: String,
-    title: String,
-    caption: String,
-    platforms: String,
-    slot_at: f64,
-    state: String,
-    attempts: f64,
-    not_before: f64,
-    attempt: Option<f64>,
-    started_at: Option<f64>,
-    external_id: Option<String>,
-    fail_reason: Option<String>,
-}
-
 #[derive(Deserialize)]
 struct IdRow {
     id: String,
-}
-
-fn scheduled(r: ListRow) -> Result<ScheduledPost, PortError> {
-    let state = publish_dto::state_from_row(&RawState {
-        state: r.state,
-        attempts: r.attempts,
-        not_before: r.not_before,
-        attempt: r.attempt,
-        started_at: r.started_at,
-        external_id: r.external_id,
-        fail_reason: r.fail_reason,
-    })?;
-    let post = row_to_post(PostRow {
-        id: r.id,
-        video_key: r.video_key,
-        title: r.title,
-        caption: r.caption,
-        platforms: r.platforms,
-        slot_at: r.slot_at,
-    })?;
-    Ok(ScheduledPost { post, state })
 }
 
 impl D1PublishRepository {
@@ -93,9 +54,14 @@ impl D1PublishRepository {
             .all()
             .await
             .map_err(fail)?
-            .results::<ListRow>()
+            .results::<publish_dto::ListRow>()
             .map_err(fail)?;
-        rows.into_iter().map(scheduled).collect()
+        // One bad row is left out and logged by id, so it cannot stop every run.
+        let (posts, skipped) = publish_dto::map_rows(rows);
+        for id in skipped {
+            worker::console_error!("{}", publish_log::skipped_row_line(&id));
+        }
+        Ok(posts)
     }
 }
 
