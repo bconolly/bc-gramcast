@@ -82,7 +82,7 @@ Sources: [Validate JWTs](https://developers.cloudflare.com/cloudflare-one/access
 Not verified yet: none of this has run against Cloudflare. The Web Crypto calls (`importKey` with a JWK, `verify` with RSASSA-PKCS1-v1_5 and SHA-256) were checked in Node 22 only, not in the Workers runtime. The real token's claims (for example whether `email` is present for your login method, and what a service token looks like) and the live key endpoint's response have not been seen. How to supply the vars at deploy time (the `--var` flag above, and whether a value set in the dashboard survives a deploy that carries empty ones) is from memory of wrangler, not checked. The 503 "sign-in not configured yet" answer is the safe state until the setup above is done.
 
 ## Connect YouTube
-The owner connects their YouTube account once; the Worker keeps the token encrypted in D1. Nothing publishes yet.
+The owner connects their YouTube account once; the Worker keeps the token encrypted in D1. Publishing is described under Publishing below.
 
 Secrets (set with `wrangler secret put <NAME>`, never commit them):
 
@@ -99,17 +99,48 @@ Steps:
 2. Set the three secrets and register the redirect URI with Google.
 3. Open the app, go to Connections (`/settings`), press Connect YouTube, and allow access on Google's page. You come back to Connections showing Connected.
 
-How it works: `GET /api/connect/youtube/start` makes a single-use random state (valid 10 minutes), stores it and sends you to Google asking only for the `youtube.upload` scope, with `access_type=offline` and `prompt=consent` so Google returns a refresh token. `GET /api/connect/youtube/callback` checks and uses up the state, trades the code for tokens, encrypts them (AES-256-GCM, a fresh random nonce per write, the provider name as authenticated data) and redirects to `/settings?connected=1`, or `/settings?connect_error=<code>` where the code is one of `access_denied`, `bad_state`, `exchange_failed`, `server_error`, `try_again`. `GET /api/connect/status` returns only `{"youtube":{"connected":bool,"needs_reconnect":bool}}`, from row presence and the flag; it never decrypts. A saved token that can no longer be read (for example after the key changed) shows as Connected until the publishing slice reports unreadable rows. No route returns a token, and nothing logs a code, token, state or URL.
+How it works: `GET /api/connect/youtube/start` makes a single-use random state (valid 10 minutes), stores it and sends you to Google asking only for the `youtube.upload` scope, with `access_type=offline` and `prompt=consent` so Google returns a refresh token. `GET /api/connect/youtube/callback` checks and uses up the state, trades the code for tokens, encrypts them (AES-256-GCM, a fresh random nonce per write, the provider name as authenticated data) and redirects to `/settings?connected=1`, or `/settings?connect_error=<code>` where the code is one of `access_denied`, `bad_state`, `exchange_failed`, `server_error`, `try_again`. `GET /api/connect/status` returns only `{"youtube":{"connected":bool,"needs_reconnect":bool}}`, from row presence and the flag; it never decrypts. A saved token that can no longer be read (for example after the key changed) shows as Connected until a scheduled run finds it unreadable, marks it needs-reconnect (only if the row is still the one it read) and the status then says so. No route returns a token, and nothing logs a code, token, state or URL.
 
 `start` also refuses a `Sec-Fetch-Site` that is present and not `same-origin` or `none`: it answers 302 to `/settings?connect_error=try_again` ("Please press Connect YouTube again.") and starts nothing. A scheduled run's token refresh and its needs-reconnect mark apply only if the stored row is still the one that run loaded, so reconnecting while a run is in flight is never overwritten. If Google's reply names the granted scopes, they must include `youtube.upload`. Both connect routes are GET navigations behind the same owner sign-in as the rest of the API. The Origin check covers only POST, PUT, PATCH and DELETE, and the callback comes from Google, so what protects it is the single-use state. There is no PKCE (support for this flow was not confirmed).
 
 Not verified: none of this has run against Google or Cloudflare. `DELETE ... RETURNING` and `UPDATE ... RETURNING` in D1 are assumed to work like SQLite's (the statements ran against SQLite 3.53.1 only). The D1 statements were run against SQLite and the Web Crypto call shapes against Node, not in the Workers runtime or D1. Whether the Access cookie is sent on the redirect back from Google, and the exact fields in Google's token reply, are untested here.
 
+## Publishing
+A Cron Trigger (`*/5 * * * *`) runs the Worker's `scheduled` handler, the only place anything is published, using the Worker's own clock. Each run handles at most ONE due post, as a YouTube Short, through the resumable upload. Fakes are used in all tests; nothing here has run against YouTube or Cloudflare.
+
+| Var / secret | Default | What it does |
+| --- | --- | --- |
+| `PUBLISH_ENABLED` (var) | `"false"` | Publishing runs only when this is exactly `true`. Anything else logs `publish disabled`. |
+| `PUBLISH_PRIVACY` (var) | `"private"` | `private`, `unlisted` or `public`; unset or anything else is private. |
+| cron | `*/5 * * * *` | `[triggers]` in `wrangler.toml`. |
+| `YOUTUBE_CLIENT_ID`, `YOUTUBE_CLIENT_SECRET`, `TOKEN_ENC_KEY` | none | Secrets, as under Connect YouTube. The refresh uses the same ones. |
+
+Deploy steps: apply migrations (`wrangler d1 migrations apply gramcast`, which now includes `0004_publish_state.sql`: it adds the state columns; existing posts become Queued with 0 attempts), then deploy. `wrangler.toml` ships publishing off, so a deploy re-applies `"false"` unless you pass `--var PUBLISH_ENABLED:true`.
+
+What a run does: lists due Queued posts (slot reached, any retry delay over) and Publishing posts; flags posts stuck in Publishing for 15 minutes as Failed (`stuck_publishing`, never retried: check YouTube); refreshes the token if it expires within 5 minutes (a refresh that cannot be saved, or whose save did not apply because you reconnected meanwhile, stops the run); claims the earliest due post with one compare-and-set UPDATE on every state column; uploads it; records the result the same way.
+
+Limits (from Cloudflare's free plan as I understand it; unconfirmed in this environment): 50 subrequests per invocation, 10 ms CPU per invocation (network waiting does not count; whether moving bytes between R2 and fetch does is UNCONFIRMED, so a large video may hit it), 15 minutes for a cron invocation. Assumed: R2 and D1 binding calls count as subrequests. Budget: 18 reserved for D1 and token calls, 2 to start, 2 per chunk (R2 range read plus PUT) of 8 MiB, 8 for status checks, so at most 11 chunks: videos over 88 MiB are refused at upload time. A new chunk is not started after 10 minutes; each request times out after 60 seconds. Both are our own choices, inside the 15 minute stuck limit.
+
+Log lines (fixed words only; never a token, URL, key, provider text or error text): `publish disabled`; `publish run posts=N`; `publish post=<id> outcome=<code> [reason=<code>] [external_id=<id>]`; `publish halted=<code>`; `publish run failed: setup` or `: list`.
+- Outcomes: `published`; `retrying` (put back with a delay); `failed` (see reasons); `already_claimed` (another run won the claim); `released` (claim undone because the token could not be refreshed, no attempt used); `flagged_stuck`; `state_lost` (the upload finished or failed but the final write did not land; the post stays Publishing and is flagged stuck later, so check YouTube).
+- Halts (the run stopped early): `needs_reconnect` (no token, or Google refuses it or it cannot be read: reconnect in Connections); `token_unavailable` (refresh trouble that may pass); `rate_limited` (quota; the post waits an hour, no attempt used); `storage` (D1 failed).
+- Failure reasons: `rejected` (YouTube refused the video or its text, or the video is empty or over the cap); `transient` (3 tries failed, nothing was posted); `unknown` (the upload ended with an unknown result, the video may exist: never retried, check YouTube Studio); `stuck_publishing`; `auth` and `rate_limited` are retried, not final.
+
+### First real publish test
+1. Apply migrations, set the secrets, deploy, open Connections and connect YouTube.
+2. Queue ONE throwaway video (a few seconds, vertical) for a slot a few minutes ahead.
+3. Set `PUBLISH_ENABLED=true` (keep `PUBLISH_PRIVACY=private`) and deploy with `--var PUBLISH_ENABLED:true`.
+4. Run `wrangler tail`. Within five minutes of the slot you should see `publish run posts=1` and `outcome=published external_id=...`.
+5. Check YouTube Studio: a private Short with the post's title and description. The Queue shows Published with a link.
+6. Delete the test video in Studio, set `PUBLISH_ENABLED` back to `false` until you are ready, and switch `PUBLISH_PRIVACY` when you want public posts.
+
+Unverified, check during that test: that `AbortSignal.timeout` exists in Workers; that a 308 with its `Range` header reaches `fetch` as an ordinary response; that the chunk PUTs want (or tolerate) the bearer token and no content type; the YouTube error reason strings in `domain::youtube` (`quotaExceeded`, `dailyLimitExceeded`, `rateLimitExceeded`, `userRateLimitExceeded`; `insufficientPermissions`, `youtubeSignupRequired`), which are from memory; that `Retry-After` is delta-seconds (dates are ignored); `UPDATE ... RETURNING` in D1; and the CPU question above. A 404 on an upload session with the final chunk unsent is retried by the next run from the start rather than restarted in the same run. The Queue lists Published and Failed posts for a week after their slot; a Failed post cannot be edited or deleted. Instagram is not published yet: Instagram-only posts stay Queued.
+
 ## API
 All endpoints answer only to the owner (see Run locally). Request bodies are JSON.
-- `POST /api/uploads`, `POST /api/posts`, `GET /api/queue`: upload a video and queue it.
-- `PATCH /api/posts/{id}`: edit a queued post. Body: `title`, `caption`, `platforms`, `slot_at` (all required, same rules as queueing; `id` and `video_key` cannot be sent). Answers with the saved post; 404 for an unknown id, 409 if another post holds the slot or the post is no longer queued (its slot has passed).
-- `DELETE /api/posts/{id}`: delete a queued post and its video. Answers 204; 404 for an unknown id; 409 if the post is no longer queued. The post is removed first; if the video cannot be removed the call still succeeds and the Worker logs a fixed line with the post id.
+- `POST /api/uploads`, `POST /api/posts`, `GET /api/queue`: upload a video (88 MiB at most) and queue it. The queue answer carries each post's `publish: {state, external_id?, reason?}`.
+- `PATCH /api/posts/{id}`: edit a queued, unclaimed post. Body: `title`, `caption`, `platforms`, `slot_at` (all required, same rules as queueing; `id` and `video_key` cannot be sent). Answers with the saved post; 404 for an unknown id, 409 if another post holds the slot or the post is no longer queued (its slot has passed or publishing has claimed it).
+- `DELETE /api/posts/{id}`: delete a queued post and its video. Answers 204; 404 for an unknown id; 409 if the post is no longer queued or has been claimed (its video then stays). The post is removed first; if the video cannot be removed the call still succeeds and the Worker logs a fixed line with the post id.
 - `GET /api/slots/pattern`: the weekly posting pattern, for example `{"utc_offset_minutes":600,"rules":[{"weekday":"wed","time":"19:00"}]}`. Before one is saved it is Brisbane (+600) with no rules.
 - `PUT /api/slots/pattern`: save the pattern (same shape; weekday `mon` to `sun`, time 24h `HH:MM`, offset -720 to 840, at most 14 rules). Answers with the normalised pattern.
 - `GET /api/connect/status`, `GET /api/connect/youtube/start`, `GET /api/connect/youtube/callback`: see Connect YouTube above. Connections screenshots: `node web/scripts/screenshots-connections.cjs <out-dir>/` (same Playwright requirement).
@@ -123,13 +154,11 @@ All endpoints answer only to the owner (see Run locally). Request bodies are JSO
 - Sign-in is built but untested on Cloudflare (see Sign-in above). Add a Miniflare or `wrangler dev` smoke test of the sign-in path with a fake key endpoint.
 - Static assets are served without the Worker, so Access must cover the whole hostname; the assets contain no data.
 - `next_slots` reads all posts. Later, query only posts with a future `slot_at`.
-- Re-check the object's size and type with `head()` in the publish use case: the 15 minute upload link can still overwrite the object after the post is queued.
+- The publish run re-reads the object's size with `head()` and refuses 0 bytes or more than 88 MiB, but not its type or content: the 15 minute upload link can still overwrite the object after the post is queued.
 - Delete rejected and orphaned uploads (add an R2 lifecycle rule as a backstop). A video left behind when a post is deleted but the R2 delete fails is one of these.
-- Editing is unrestricted because nothing publishes yet. When publishing lands, block edits and deletes for posts that are publishing or published.
 - Request bodies have no size cap in the Worker yet (a PATCH or POST body is parsed whole). Add a limit, for example by checking `Content-Length`.
 - After a failed edit save, focus is not returned to the form (the Save button is disabled while saving). Opening another post's Edit drops the unsaved changes in the first form without asking.
 - Editing cannot replace the video: delete the post and upload again.
 - The delete and edit adapters (D1 `get`, `update`, `delete`, R2 `delete_object`) are compile-checked only, not run against Cloudflare.
 - Put Cloudflare Access in front of every hostname the Worker answers on (workers.dev, Preview URLs and any custom domain), or set `workers_dev = false` and `preview_urls = false`.
 - Install `worker-build` in CI from a pinned, cached copy instead of building it each run.
-- The "still queued" check in SQL uses the time the request started, so it does not stop an edit or delete that lands just after the slot passes. Close this when publishing lands (for example with a status column in the WHERE clause).
