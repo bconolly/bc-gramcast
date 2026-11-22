@@ -29,13 +29,22 @@ export function localInputToUnix(value: string): number | null {
   return Number.isNaN(ms) ? null : Math.floor(ms / 1000);
 }
 
-export interface FormValues {
-  file: File | null;
+/** Unix seconds to a datetime-local value (local time, to the minute). */
+export function unixToLocalInput(unixSecs: number): string {
+  const d = new Date(unixSecs * 1000);
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
+}
+
+export interface FieldValues {
   title: string;
   caption: string;
   platforms: Platform[];
   slotAt: number | null;
   now: number;
+}
+
+export interface FormValues extends FieldValues {
+  file: File | null;
 }
 
 /** Mirrors VideoUpload::new in crates/domain/src/media.rs (\p{Cc} is Rust's char::is_control). */
@@ -64,9 +73,9 @@ function slotProblem(slotAt: number | null, now: number): string | null {
   return null;
 }
 
-/** Returns every problem as a message, or an empty list when the form is fine. */
-export function validateForm(v: FormValues): string[] {
-  const problems: (string | null)[] = [fileProblem(v.file)];
+/** The title, caption, platform and time rules, shared by new and edited posts. */
+export function validateFields(v: FieldValues): string[] {
+  const problems: (string | null)[] = [];
   if (v.title.trim() === "") problems.push("Title is required.");
   else if (charCount(v.title) > MAX_TITLE_CHARS) {
     problems.push(`Title must be ${MAX_TITLE_CHARS} characters or fewer.`);
@@ -77,4 +86,10 @@ export function validateForm(v: FormValues): string[] {
   if (v.platforms.length === 0) problems.push("Choose at least one platform.");
   problems.push(slotProblem(v.slotAt, v.now));
   return problems.filter((p): p is string => p !== null);
+}
+
+/** Returns every problem as a message, or an empty list when the form is fine. */
+export function validateForm(v: FormValues): string[] {
+  const file = fileProblem(v.file);
+  return file === null ? validateFields(v) : [file, ...validateFields(v)];
 }

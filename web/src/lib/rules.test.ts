@@ -6,6 +6,8 @@ import {
   charCount,
   formatSlot,
   localInputToUnix,
+  unixToLocalInput,
+  validateFields,
   validateForm,
 } from "@/lib/rules";
 
@@ -92,5 +94,31 @@ describe("validateForm", () => {
     expect(validateForm({ ...ok, slotAt: null })).toContain("Choose when to publish.");
     expect(validateForm({ ...ok, slotAt: NOW - 1 })).toContain("The time must be in the future.");
     expect(validateForm({ ...ok, slotAt: 4_102_444_801 })).toContain("The time is out of range.");
+  });
+});
+
+describe("unixToLocalInput", () => {
+  it("gives the datetime-local value for local time and round-trips", () => {
+    const secs = new Date(2099, 2, 5, 7, 4).getTime() / 1000;
+    expect(unixToLocalInput(secs)).toBe("2099-03-05T07:04");
+    expect(localInputToUnix(unixToLocalInput(secs))).toBe(secs);
+  });
+});
+
+describe("validateFields", () => {
+  const fields = { title: "T", caption: "", platforms: ["youtube" as const], slotAt: NOW + 60, now: NOW };
+
+  it("accepts good edits and has no file rule", () => {
+    expect(validateFields(fields)).toEqual([]);
+  });
+
+  it("reports the same problems as the upload form, without a file message", () => {
+    const bad = { ...fields, title: " ", platforms: [], slotAt: NOW - 1 };
+    expect(validateFields(bad)).toEqual([
+      "Title is required.",
+      "Choose at least one platform.",
+      "The time must be in the future.",
+    ]);
+    expect(validateForm({ ...bad, file: null })[0]).toBe("Choose an MP4 video.");
   });
 });

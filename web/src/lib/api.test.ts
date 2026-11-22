@@ -1,14 +1,17 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   ApiError,
+  deletePost,
   getNextSlots,
   getPattern,
   getQueue,
+  isSlotTaken,
   putVideo,
   queuePost,
   savePattern,
   startUpload,
   submitPost,
+  updatePost,
 } from "@/lib/api";
 
 const PUT_URL = "https://acct.r2.cloudflarestorage.com/b/videos/x.mp4?X-Amz-Signature=sig";
@@ -227,5 +230,57 @@ describe("slot pattern", () => {
   it("getPattern rejects a body that is not JSON", async () => {
     mockFetch(reply("<html>"));
     await expect(getPattern()).rejects.toThrow(GENERIC);
+  });
+});
+
+describe("updatePost", () => {
+  const edit = { title: "T", caption: "C", platforms: ["youtube" as const], slot_at: 500 };
+  const saved = { id: "ab12", video_key: "videos/ab12.mp4", ...edit, status: "ready" };
+
+  it("PATCHes JSON to the post's own path and returns the saved post", async () => {
+    const fetchFn = mockFetch(reply(JSON.stringify(saved)));
+    expect(await updatePost("ab12", edit)).toEqual(saved);
+    const [url, init] = fetchFn.mock.calls[0] as [string, RequestInit];
+    expect(url).toBe("/api/posts/ab12");
+    expect(init.method).toBe("PATCH");
+    expect(new Headers(init.headers).get("Content-Type")).toBe("application/json");
+    expect(JSON.parse(init.body as string)).toEqual(edit);
+  });
+
+  it("encodes the id so it cannot change the path", async () => {
+    const fetchFn = mockFetch(reply(JSON.stringify(saved)));
+    await updatePost("a/../b?x", edit);
+    expect(fetchFn.mock.calls[0]?.[0]).toBe("/api/posts/a%2F..%2Fb%3Fx");
+  });
+
+  it("keeps the 409 status so a taken slot can be recognised", async () => {
+    mockFetch(reply("that slot is already taken", 409));
+    const err = await updatePost("ab12", edit).catch((e: unknown) => e);
+    expect(isSlotTaken(err)).toBe(true);
+  });
+
+  it("refuses a reply that is not a post", async () => {
+    mockFetch(reply("{}"));
+    await expect(updatePost("ab12", edit)).rejects.toBeInstanceOf(ApiError);
+  });
+});
+
+describe("deletePost", () => {
+  it("sends DELETE to the post's path and resolves on 204", async () => {
+    const fetchFn = mockFetch(new Response(null, { status: 204 }));
+    await expect(deletePost("ab12")).resolves.toBeUndefined();
+    const [url, init] = fetchFn.mock.calls[0] as [string, RequestInit];
+    expect(url).toBe("/api/posts/ab12");
+    expect(init.method).toBe("DELETE");
+  });
+
+  it("shows the server's message on 404", async () => {
+    mockFetch(reply("post not found", 404));
+    await expect(deletePost("ab12")).rejects.toMatchObject({ message: "post not found", status: 404 });
+  });
+
+  it("says so when the server cannot be reached", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockRejectedValue(new TypeError("net")));
+    await expect(deletePost("ab12")).rejects.toThrow("Could not reach the server");
   });
 });
