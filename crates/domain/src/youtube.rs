@@ -79,6 +79,17 @@ impl SubrequestBudget {
     }
 }
 
+/// One request may take this long before it is given up on. Our own choice: a chunk is
+/// 8 MiB, which needs a few seconds even on a slow link.
+pub const REQUEST_TIMEOUT_SECS: i64 = 60;
+/// No new chunk is started after this long into an upload. Our own choice, well inside
+/// `PUBLISH_TIMEOUT_SECS` (15 minutes, also the cron invocation limit): the last request
+/// can still run for `REQUEST_TIMEOUT_SECS` past it, and a status check or two after that.
+pub const UPLOAD_DEADLINE_SECS: i64 = 10 * 60;
+
+const _: () =
+    assert!(UPLOAD_DEADLINE_SECS + 3 * REQUEST_TIMEOUT_SECS < crate::publish::PUBLISH_TIMEOUT_SECS);
+
 /// Who can see the video. The default is private, so a first real test never goes public.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Privacy {
@@ -317,6 +328,15 @@ mod tests {
         ] {
             assert!(!publish_enabled(off), "{off:?}");
         }
+    }
+
+    #[test]
+    fn a_whole_upload_stays_well_inside_the_publish_timeout() {
+        // The deadline, the request that straddles it, and two more (a status check
+        // and the final write), all under the 15 minutes after which a post is flagged.
+        let worst = UPLOAD_DEADLINE_SECS + 3 * REQUEST_TIMEOUT_SECS;
+        assert!(worst < crate::publish::PUBLISH_TIMEOUT_SECS, "{worst}");
+        assert_eq!(UPLOAD_DEADLINE_SECS, 600);
     }
 
     #[test]

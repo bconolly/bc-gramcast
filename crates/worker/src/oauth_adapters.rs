@@ -9,11 +9,14 @@
 
 use crate::adapters::{call, now_secs, object, subtle};
 use crate::connect_dto;
+use crate::net;
 use domain::app::PortError;
 use domain::connect::{CodeExchanger, TokenReply};
 use domain::oauth::{self, OAuthConfig, RandomSource, StateStore};
+use domain::publish_app::{PublishError, TokenRefresher};
 use domain::seal::{self, SealedToken, TokenCipher, KEY_LEN, NONCE_LEN, PROVIDER_YOUTUBE};
 use domain::token::{StoredToken, TokenLoad, TokenStore};
+use domain::youtube;
 use serde::Deserialize;
 use std::cell::RefCell;
 use worker::js_sys::{self, Array, Function, Reflect, Uint8Array};
@@ -411,5 +414,67 @@ impl CodeExchanger for GoogleExchanger {
         let status = response.status_code();
         let text = response.text().await.map_err(fail)?;
         Ok(connect_dto::reply_from_body(status, &text))
+    }
+}
+
+/// Refreshes the access token at Google's token endpoint. The classification (what is
+/// `Auth`, `RateLimited` or `Transient`) is `domain::youtube::refresh_outcome`.
+#[allow(dead_code)] // wired by the scheduled handler, a later commit of this slice
+pub struct GoogleRefresher {
+    config: OAuthConfig,
+    client_secret: String,
+}
+
+#[allow(dead_code)] // as above
+impl GoogleRefresher {
+    pub fn from_env(env: &Env, config: OAuthConfig) -> Result<Self, PortError> {
+        let client_secret = env
+            .secret("YOUTUBE_CLIENT_SECRET")
+            .map_err(|_| port("YOUTUBE_CLIENT_SECRET missing"))?
+            .to_string();
+        Ok(Self {
+            config,
+            client_secret,
+        })
+    }
+
+    fn request(&self, refresh_token: &str) -> Option<Request> {
+        // The body holds the refresh token and the client secret: never logged.
+        let body = self
+            .config
+            .refresh_request_body(refresh_token, &self.client_secret);
+        let headers = Headers::new();
+        headers
+            .set("Content-Type", "application/x-www-form-urlencoded")
+            .ok()?;
+        headers.set("Accept", "application/json").ok()?;
+        let mut init = RequestInit::new();
+        init.with_method(Method::Post)
+            .with_headers(headers)
+            .with_body(Some(JsValue::from_str(&body)))
+            .with_redirect(RequestRedirect::Manual);
+        Request::new_with_init(oauth::GOOGLE_TOKEN_URL, &init).ok()
+    }
+}
+
+impl TokenRefresher for GoogleRefresher {
+    /// A failure to send or read is `Transient`: refreshing creates nothing at YouTube.
+    /// The answer's text is parsed for its fixed fields and dropped, never logged.
+    async fn refresh(&self, token: &StoredToken) -> Result<StoredToken, PublishError> {
+        // Nothing to refresh with: only the owner reconnecting fixes it.
+        if token.refresh_token.is_empty() {
+            return Err(PublishError::Auth);
+        }
+        let request = self
+            .request(&token.refresh_token)
+            .ok_or(PublishError::Transient)?;
+        let mut response = net::send(request)
+            .await
+            .map_err(|_| PublishError::Transient)?;
+        let status = response.status_code();
+        let retry_after = response.headers().get("Retry-After").ok().flatten();
+        let text = response.text().await.map_err(|_| PublishError::Transient)?;
+        let reply = connect_dto::reply_from_body(status, &text);
+        youtube::refresh_outcome(&reply, retry_after.as_deref(), now_secs())
     }
 }
