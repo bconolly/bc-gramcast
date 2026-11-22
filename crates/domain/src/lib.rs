@@ -3,5 +3,6 @@ pub mod app;
 pub mod auth;
 pub mod keycache;
 pub mod media;
+pub mod publish;
 pub mod queue;
 pub mod slots;
