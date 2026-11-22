@@ -167,6 +167,25 @@ pub fn api_reason<'a>(reasons: impl IntoIterator<Item = &'a str>) -> ApiReason {
     }
 }
 
+/// Longest upload session address we will use.
+pub const MAX_SESSION_URI_LEN: usize = 2048;
+
+/// Whether the `Location` of a started session is an address we will send the video
+/// and the access token to: https, on Google's own domain, no user info, no port, no
+/// odd characters. Defence in depth: the answer comes from Google, but a bearer token
+/// must never follow a redirect-like value to another host.
+pub fn is_session_uri(uri: &str) -> bool {
+    let Some(rest) = uri.strip_prefix("https://") else {
+        return false;
+    };
+    if uri.len() > MAX_SESSION_URI_LEN || !uri.bytes().all(|b| b.is_ascii_graphic() && b != b'\\') {
+        return false;
+    }
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    let host = authority.to_ascii_lowercase();
+    !host.contains(['@', ':']) && (host == "googleapis.com" || host.ends_with(".googleapis.com"))
+}
+
 /// An absolute retry time from a `Retry-After` header, as delta-seconds added to the
 /// Worker's `now`. An HTTP-date, a negative or a non-numeric value gives `None` (the
 /// domain then waits its default); dates are not parsed here.
@@ -367,6 +386,42 @@ mod tests {
             vec!["quotaExceeded "],
         ] {
             assert_eq!(api_reason(other.clone()), ApiReason::Other, "{other:?}");
+        }
+    }
+
+    #[test]
+    fn only_googles_own_https_addresses_are_session_uris() {
+        for ok in [
+            "https://www.googleapis.com/upload/youtube/v3/videos?uploadType=resumable&upload_id=AB-c_9",
+            "https://www.googleapis.com/x",
+            "https://WWW.GoogleAPIs.com/x",
+            "https://upload.googleapis.com/x",
+            "https://googleapis.com",
+        ] {
+            assert!(is_session_uri(ok), "{ok}");
+        }
+        let long = format!(
+            "https://www.googleapis.com/{}",
+            "a".repeat(MAX_SESSION_URI_LEN)
+        );
+        for bad in [
+            "",
+            "http://www.googleapis.com/x",
+            "//www.googleapis.com/x",
+            "https://www.googleapis.com.evil.com/x",
+            "https://evilgoogleapis.com/x",
+            "https://evil.com/?www.googleapis.com",
+            "https://evil.com/#.googleapis.com",
+            "https://user@www.googleapis.com/x",
+            "https://www.googleapis.com@evil.com/x",
+            "https://www.googleapis.com:8443/x",
+            "https://evil.com\\@www.googleapis.com/x",
+            "https://www.googleapis.com/a b",
+            "https://www.googleapis.com/a\nb",
+            "https://www.googleapis.com/é",
+            &long,
+        ] {
+            assert!(!is_session_uri(bad), "{bad}");
         }
     }
 

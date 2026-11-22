@@ -6,7 +6,7 @@ use crate::publish::{
     claim, flag_if_stuck, is_valid_external_id, record_failure, record_success, select_due,
     FailReason, PublishState, ScheduledPost,
 };
-use crate::queue::QueuedPost;
+use crate::queue::{is_valid_video_key, QueuedPost};
 use crate::token::{StoredToken, TokenLoad, TokenStore};
 use crate::youtube::MAX_PUBLISH_BYTES;
 use std::fmt;
@@ -515,6 +515,10 @@ where
         post: &QueuedPost,
         token: &StoredToken,
     ) -> Result<PublishedRef, PublishError> {
+        // Storage is only asked about well-formed keys, as the delete path does.
+        if !is_valid_video_key(&post.video_key) {
+            return Err(PublishError::Rejected);
+        }
         let video = self
             .links
             .access(&post.video_key)
@@ -1687,6 +1691,42 @@ mod tests {
             }
         );
         assert!(publisher.calls.borrow().is_empty());
+    }
+
+    #[test]
+    fn a_post_with_a_malformed_video_key_is_rejected_before_storage_is_asked() {
+        struct NeverAsked;
+        impl VideoLinks for NeverAsked {
+            async fn access(&self, _k: &str) -> Result<VideoAccess, PortError> {
+                panic!("storage must not be asked about a malformed key");
+            }
+        }
+        for key in [
+            "",
+            "../x.mp4",
+            "videos/a b.mp4",
+            "videos/x.MP4",
+            "other/x.mp4",
+        ] {
+            let mut post = scheduled("a", 1);
+            post.post.video_key = key.into();
+            let repo = FakeRepo::with(vec![post]);
+            let publisher = FakePublisher::default();
+            let report = pollster::block_on(publish_due(
+                &|| NOW,
+                &repo,
+                &publisher,
+                &fresh_store(),
+                &refresher_ok(),
+                &NeverAsked,
+            ))
+            .unwrap();
+            assert_eq!(
+                report.outcomes[0].1,
+                Outcome::Failed(FailReason::Rejected),
+                "{key}"
+            );
+        }
     }
 
     #[test]
