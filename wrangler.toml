@@ -36,3 +36,7 @@ POLICY_AUD = ""
 # Must match the VIDEOS binding's bucket_name above.
 R2_BUCKET = "gramcast-videos"
 R2_ACCOUNT_ID = "REPLACE_WITH_ACCOUNT_ID"
+# Public address of this app. The YouTube redirect URI is this plus
+# /api/connect/youtube/callback, and it must match the one registered with Google.
+# Secrets for the connect flow (not here): YOUTUBE_CLIENT_ID, YOUTUBE_CLIENT_SECRET, TOKEN_ENC_KEY.
+PUBLIC_BASE_URL = "https://gramcast.gramcast.workers.dev"
