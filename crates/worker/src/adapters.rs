@@ -3,8 +3,8 @@
 
 use crate::dto;
 use domain::app::{
-    InsertError, PortError, PostRepository, SlotPatternRepository, UpdateError, UploadSigner,
-    UploadStore,
+    DeleteError, InsertError, PortError, PostRepository, SlotPatternRepository, UpdateError,
+    UploadSigner, UploadStore,
 };
 use domain::queue::QueuedPost;
 use domain::slots::SlotPattern;
@@ -109,57 +109,6 @@ impl PostRepository for D1PostRepository {
             .transpose()
     }
 
-    async fn update(&self, post: &QueuedPost) -> Result<(), UpdateError> {
-        let platforms: Vec<&str> = post
-            .platforms
-            .iter()
-            .map(|p| dto::platform_to_str(*p))
-            .collect();
-        // video_key and id are never in the SET list, so they cannot change.
-        let result = self
-            .db
-            .prepare("UPDATE posts SET title = ?1, caption = ?2, platforms = ?3, slot_at = ?4 WHERE id = ?5")
-            .bind(&[
-                post.title.as_str().into(),
-                post.caption.as_str().into(),
-                platforms.join(",").into(),
-                (post.slot_at as f64).into(),
-                post.id.as_str().into(),
-            ])
-            .map_err(|e| UpdateError::Port(port_err(e)))?
-            .run()
-            .await
-            .map_err(|e| dto::classify_update_error(&d1_error_text(&e)))?;
-        match changes(&result).map_err(UpdateError::Port)? {
-            Some(0) => Err(UpdateError::NotFound),
-            Some(_) => Ok(()),
-            // No count from D1: look the row up to tell "updated" from "never there".
-            None => match self.get(&post.id).await.map_err(UpdateError::Port)? {
-                Some(_) => Ok(()),
-                None => Err(UpdateError::NotFound),
-            },
-        }
-    }
-
-    async fn delete(&self, id: &str) -> Result<bool, PortError> {
-        let result = self
-            .db
-            .prepare("DELETE FROM posts WHERE id = ?1")
-            .bind(&[id.into()])
-            .map_err(port_err)?
-            .run()
-            .await
-            .map_err(port_err)?;
-        match changes(&result)? {
-            Some(n) => Ok(n > 0),
-            // No count from D1: the row is gone, or the delete did not happen.
-            None => match self.get(id).await? {
-                None => Ok(true),
-                Some(_) => Err(PortError("delete had no effect".into())),
-            },
-        }
-    }
-
     async fn insert(&self, post: &QueuedPost) -> Result<(), InsertError> {
         let platforms: Vec<&str> = post
             .platforms
@@ -186,6 +135,58 @@ impl PostRepository for D1PostRepository {
             .await
             .map_err(|e| dto::classify_insert_error(&d1_error_text(&e)))?;
         Ok(())
+    }
+
+    async fn update(&self, post: &QueuedPost, now: i64) -> Result<(), UpdateError> {
+        let platforms: Vec<&str> = post
+            .platforms
+            .iter()
+            .map(|p| dto::platform_to_str(*p))
+            .collect();
+        // video_key and id are never in the SET list, so they cannot change. The
+        // slot_at > now test is the "still queued" rule again, so a post whose slot
+        // passed after the domain's check is still refused.
+        let result = self
+            .db
+            .prepare("UPDATE posts SET title = ?1, caption = ?2, platforms = ?3, slot_at = ?4 WHERE id = ?5 AND slot_at > ?6")
+            .bind(&[
+                post.title.as_str().into(),
+                post.caption.as_str().into(),
+                platforms.join(",").into(),
+                (post.slot_at as f64).into(),
+                post.id.as_str().into(),
+                (now as f64).into(),
+            ])
+            .map_err(|e| UpdateError::Port(port_err(e)))?
+            .run()
+            .await
+            .map_err(|e| dto::classify_update_error(&d1_error_text(&e)))?;
+        let changes = changes(&result).map_err(UpdateError::Port)?;
+        if dto::write_applied(changes) {
+            return Ok(());
+        }
+        let row = self.get(&post.id).await.map_err(UpdateError::Port)?;
+        dto::update_after_miss(changes, row.map(|p| p.slot_at), now)
+    }
+
+    async fn delete(&self, id: &str, now: i64) -> Result<(), DeleteError> {
+        let result = self
+            .db
+            .prepare("DELETE FROM posts WHERE id = ?1 AND slot_at > ?2")
+            .bind(&[id.into(), (now as f64).into()])
+            .map_err(|e| DeleteError::Port(port_err(e)))?
+            .run()
+            .await
+            .map_err(|e| DeleteError::Port(port_err(e)))?;
+        let changes = changes(&result).map_err(DeleteError::Port)?;
+        if dto::write_applied(changes) {
+            return Ok(());
+        }
+        let row = self.get(id).await.map_err(|e| {
+            worker::console_error!("{}", dto::DELETE_UNCONFIRMED_LINE);
+            DeleteError::Port(e)
+        })?;
+        dto::delete_after_miss(changes, row.map(|p| p.slot_at), now)
     }
 }
 

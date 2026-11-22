@@ -39,7 +39,18 @@ pub enum InsertError {
 #[derive(Debug, PartialEq, Eq)]
 pub enum UpdateError {
     NotFound,
+    /// The stored post's slot has arrived or passed.
+    NotQueued,
     SlotTaken,
+    Port(PortError),
+}
+
+/// Why a delete failed.
+#[derive(Debug, PartialEq, Eq)]
+pub enum DeleteError {
+    NotFound,
+    /// The stored post's slot has arrived or passed.
+    NotQueued,
     Port(PortError),
 }
 
@@ -50,11 +61,13 @@ pub trait PostRepository {
     /// Must fail if the slot or video is already taken, so two requests can't race.
     async fn insert(&self, post: &QueuedPost) -> Result<(), InsertError>;
     async fn get(&self, id: &str) -> Result<Option<QueuedPost>, PortError>;
-    /// Replaces the editable fields of the post with this id. Must fail with
-    /// `SlotTaken` if another post holds the slot, and `NotFound` if no row matched.
-    async fn update(&self, post: &QueuedPost) -> Result<(), UpdateError>;
-    /// `true` if a row was removed, `false` if there was none.
-    async fn delete(&self, id: &str) -> Result<bool, PortError>;
+    /// Replaces the editable fields of the post with this id, only while its stored
+    /// slot is after `now`. Must fail with `SlotTaken` if another post holds the
+    /// slot, `NotFound` if there is no such row and `NotQueued` if its slot has passed.
+    async fn update(&self, post: &QueuedPost, now: i64) -> Result<(), UpdateError>;
+    /// Removes the post, only while its stored slot is after `now`. Fails with
+    /// `NotFound` or `NotQueued` as for `update`.
+    async fn delete(&self, id: &str, now: i64) -> Result<(), DeleteError>;
 }
 
 /// Persistence port for the owner's weekly slot pattern (one per account).
@@ -176,7 +189,7 @@ pub async fn update_post(
         .await
         .map_err(AppError::Port)?
         .ok_or(AppError::NotFound)?;
-    if post.slot_at <= now {
+    if !post.is_queued(now) {
         return Err(AppError::NotQueued);
     }
     let slot_at = changes.slot_at;
@@ -184,8 +197,9 @@ pub async fn update_post(
     post.caption = changes.caption;
     post.platforms = changes.platforms;
     post.slot_at = slot_at;
-    repo.update(&post).await.map_err(|e| match e {
+    repo.update(&post, now).await.map_err(|e| match e {
         UpdateError::NotFound => AppError::NotFound,
+        UpdateError::NotQueued => AppError::NotQueued,
         UpdateError::SlotTaken => AppError::Queue(QueueError::SlotTaken { slot_at }),
         UpdateError::Port(p) => AppError::Port(p),
     })?;
@@ -210,12 +224,14 @@ pub async fn delete_post(
         .await
         .map_err(AppError::Port)?
         .ok_or(AppError::NotFound)?;
-    if post.slot_at <= now {
+    if !post.is_queued(now) {
         return Err(AppError::NotQueued);
     }
-    if !repo.delete(id).await.map_err(AppError::Port)? {
-        return Err(AppError::NotFound);
-    }
+    repo.delete(id, now).await.map_err(|e| match e {
+        DeleteError::NotFound => AppError::NotFound,
+        DeleteError::NotQueued => AppError::NotQueued,
+        DeleteError::Port(p) => AppError::Port(p),
+    })?;
     // A stored key is re-checked, so storage is only asked to delete well-formed keys.
     if !is_valid_video_key(&post.video_key) {
         return Ok(DeleteOutcome::VideoLeftBehind);
@@ -375,7 +391,7 @@ mod tests {
         async fn get(&self, id: &str) -> Result<Option<QueuedPost>, PortError> {
             Ok(self.posts.borrow().iter().find(|p| p.id == id).cloned())
         }
-        async fn update(&self, post: &QueuedPost) -> Result<(), UpdateError> {
+        async fn update(&self, post: &QueuedPost, now: i64) -> Result<(), UpdateError> {
             let mut posts = self.posts.borrow_mut();
             if posts
                 .iter()
@@ -384,16 +400,24 @@ mod tests {
                 return Err(UpdateError::SlotTaken);
             }
             match posts.iter_mut().find(|p| p.id == post.id) {
-                Some(slot) => *slot = post.clone(),
-                None => return Err(UpdateError::NotFound),
+                None => Err(UpdateError::NotFound),
+                Some(stored) if !stored.is_queued(now) => Err(UpdateError::NotQueued),
+                Some(stored) => {
+                    *stored = post.clone();
+                    Ok(())
+                }
             }
-            Ok(())
         }
-        async fn delete(&self, id: &str) -> Result<bool, PortError> {
+        async fn delete(&self, id: &str, now: i64) -> Result<(), DeleteError> {
             let mut posts = self.posts.borrow_mut();
-            let before = posts.len();
-            posts.retain(|p| p.id != id);
-            Ok(posts.len() != before)
+            match posts.iter().position(|p| p.id == id) {
+                None => Err(DeleteError::NotFound),
+                Some(i) if !posts[i].is_queued(now) => Err(DeleteError::NotQueued),
+                Some(i) => {
+                    posts.remove(i);
+                    Ok(())
+                }
+            }
         }
     }
 
@@ -409,11 +433,11 @@ mod tests {
         async fn get(&self, _id: &str) -> Result<Option<QueuedPost>, PortError> {
             Ok(None)
         }
-        async fn update(&self, _post: &QueuedPost) -> Result<(), UpdateError> {
+        async fn update(&self, _post: &QueuedPost, _now: i64) -> Result<(), UpdateError> {
             Err(UpdateError::NotFound)
         }
-        async fn delete(&self, _id: &str) -> Result<bool, PortError> {
-            Ok(false)
+        async fn delete(&self, _id: &str, _now: i64) -> Result<(), DeleteError> {
+            Err(DeleteError::NotFound)
         }
     }
 
@@ -516,11 +540,11 @@ mod tests {
         async fn get(&self, _id: &str) -> Result<Option<QueuedPost>, PortError> {
             Ok(None)
         }
-        async fn update(&self, _post: &QueuedPost) -> Result<(), UpdateError> {
+        async fn update(&self, _post: &QueuedPost, _now: i64) -> Result<(), UpdateError> {
             Err(UpdateError::NotFound)
         }
-        async fn delete(&self, _id: &str) -> Result<bool, PortError> {
-            Ok(false)
+        async fn delete(&self, _id: &str, _now: i64) -> Result<(), DeleteError> {
+            Err(DeleteError::NotFound)
         }
     }
 
@@ -990,11 +1014,11 @@ mod tests {
             async fn get(&self, id: &str) -> Result<Option<QueuedPost>, PortError> {
                 Ok(Some(post(id, 100)))
             }
-            async fn update(&self, _p: &QueuedPost) -> Result<(), UpdateError> {
+            async fn update(&self, _p: &QueuedPost, _now: i64) -> Result<(), UpdateError> {
                 Err(UpdateError::SlotTaken)
             }
-            async fn delete(&self, _id: &str) -> Result<bool, PortError> {
-                Ok(true)
+            async fn delete(&self, _id: &str, _now: i64) -> Result<(), DeleteError> {
+                Ok(())
             }
         }
         let e = pollster::block_on(update_post(&Racing, ID_A, changes(300), 0));
@@ -1035,5 +1059,77 @@ mod tests {
         assert_eq!(out, DeleteOutcome::VideoLeftBehind);
         assert!(repo.posts.borrow().is_empty());
         assert!(s.deleted.borrow().is_empty());
+    }
+
+    /// Passes the domain's own checks, then reports what the repository says.
+    struct RepoSays {
+        update: fn() -> UpdateError,
+        delete: fn() -> DeleteError,
+    }
+    impl PostRepository for RepoSays {
+        async fn all(&self) -> Result<Vec<QueuedPost>, PortError> {
+            Ok(vec![])
+        }
+        async fn insert(&self, _p: &QueuedPost) -> Result<(), InsertError> {
+            Ok(())
+        }
+        async fn get(&self, id: &str) -> Result<Option<QueuedPost>, PortError> {
+            Ok(Some(post(id, 100)))
+        }
+        async fn update(&self, _p: &QueuedPost, _now: i64) -> Result<(), UpdateError> {
+            Err((self.update)())
+        }
+        async fn delete(&self, _id: &str, _now: i64) -> Result<(), DeleteError> {
+            Err((self.delete)())
+        }
+    }
+
+    #[test]
+    fn a_post_that_stops_being_queued_mid_request_is_not_queued() {
+        let repo = RepoSays {
+            update: || UpdateError::NotQueued,
+            delete: || DeleteError::NotQueued,
+        };
+        let e = pollster::block_on(update_post(&repo, ID_A, changes(300), 0));
+        assert_eq!(e, Err(AppError::NotQueued));
+        let e = pollster::block_on(delete_post(&repo, &store(), ID_A, 0));
+        assert_eq!(e, Err(AppError::NotQueued));
+    }
+
+    #[test]
+    fn a_post_deleted_mid_request_is_not_found() {
+        let repo = RepoSays {
+            update: || UpdateError::NotFound,
+            delete: || DeleteError::NotFound,
+        };
+        let e = pollster::block_on(update_post(&repo, ID_A, changes(300), 0));
+        assert_eq!(e, Err(AppError::NotFound));
+        let e = pollster::block_on(delete_post(&repo, &store(), ID_A, 0));
+        assert_eq!(e, Err(AppError::NotFound));
+    }
+
+    #[test]
+    fn a_repository_failure_on_delete_is_a_port_error() {
+        let repo = RepoSays {
+            update: || UpdateError::Port(PortError("x".into())),
+            delete: || DeleteError::Port(PortError("x".into())),
+        };
+        let e = pollster::block_on(delete_post(&repo, &store(), ID_A, 0));
+        assert_eq!(e, Err(AppError::Port(PortError("x".into()))));
+    }
+
+    #[test]
+    fn the_repository_rule_refuses_a_slot_at_exactly_now() {
+        let repo = repo_with(&[(ID_A, 100)]);
+        let stored = repo.posts.borrow()[0].clone();
+        assert_eq!(
+            pollster::block_on(repo.update(&stored, 100)),
+            Err(UpdateError::NotQueued)
+        );
+        assert_eq!(
+            pollster::block_on(repo.delete(ID_A, 100)),
+            Err(DeleteError::NotQueued)
+        );
+        assert_eq!(pollster::block_on(repo.delete(ID_A, 99)), Ok(()));
     }
 }
