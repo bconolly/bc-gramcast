@@ -3,6 +3,7 @@
 pub mod connect_dto;
 pub mod dto;
 pub mod publish_dto;
+pub mod youtube_dto;
 
 #[cfg(target_arch = "wasm32")]
 mod adapters;
