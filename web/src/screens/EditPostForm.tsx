@@ -2,7 +2,7 @@ import { useState, type FormEvent } from "react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Textarea } from "@/components/ui/textarea";
-import { isSlotTaken, updatePost, type Platform, type PostJson } from "@/lib/api";
+import { NOT_QUEUED_NOTICE, isNotQueued, isSlotTaken, updatePost, type Platform, type PostJson } from "@/lib/api";
 import {
   MAX_CAPTION_CHARS,
   MAX_TITLE_CHARS,
@@ -19,11 +19,13 @@ interface Props {
   post: PostJson;
   onSaved: (post: PostJson) => void;
   onCancel: () => void;
+  /** The post left the queue while it was open, so the row is dropped. */
+  onGone: (notice: string) => void;
   onOpenSlots: () => void;
 }
 
 /** Inline edit of the title, caption, platforms and slot. The video never changes. */
-export function EditPostForm({ post, onSaved, onCancel, onOpenSlots }: Props) {
+export function EditPostForm({ post, onSaved, onCancel, onGone, onOpenSlots }: Props) {
   const [title, setTitle] = useState(post.title);
   const [caption, setCaption] = useState(post.caption);
   const [platforms, setPlatforms] = useState<Platform[]>(post.platforms);
@@ -46,6 +48,10 @@ export function EditPostForm({ post, onSaved, onCancel, onOpenSlots }: Props) {
     try {
       onSaved(await updatePost(post.id, { title, caption, platforms, slot_at: slotAt }));
     } catch (err) {
+      if (isNotQueued(err)) {
+        onGone(NOT_QUEUED_NOTICE);
+        return;
+      }
       const message = err instanceof Error ? err.message : "Something went wrong.";
       setProblems([message]);
       if (isSlotTaken(err) && (await slots.refreshAfterTaken())) {

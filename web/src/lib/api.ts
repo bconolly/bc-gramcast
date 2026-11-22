@@ -60,6 +60,15 @@ export const SLOT_TAKEN_MESSAGE = "that slot is already taken";
 export const isSlotTaken = (e: unknown): boolean =>
   e instanceof ApiError && e.status === 409 && e.message === SLOT_TAKEN_MESSAGE;
 
+/** The Worker's fixed 409 text for a post whose slot has arrived, so it can no longer be changed. */
+export const NOT_QUEUED_MESSAGE = "post is no longer queued";
+
+export const isNotQueued = (e: unknown): boolean =>
+  e instanceof ApiError && e.status === 409 && e.message === NOT_QUEUED_MESSAGE;
+
+/** What the owner is told when a post has left the queue under them. */
+export const NOT_QUEUED_NOTICE = "That post is no longer queued, so it was removed from the list.";
+
 const UPLOAD_FAILED = "The video could not be uploaded. Please try again.";
 const MAX_SERVER_MESSAGE = 200;
 

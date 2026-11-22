@@ -5,6 +5,7 @@ import {
   getNextSlots,
   getPattern,
   getQueue,
+  isNotQueued,
   isSlotTaken,
   putVideo,
   queuePost,
@@ -282,5 +283,16 @@ describe("deletePost", () => {
   it("says so when the server cannot be reached", async () => {
     vi.stubGlobal("fetch", vi.fn().mockRejectedValue(new TypeError("net")));
     await expect(deletePost("ab12")).rejects.toThrow("Could not reach the server");
+  });
+});
+
+describe("isNotQueued", () => {
+  it("recognises only the 409 'no longer queued' message", async () => {
+    mockFetch(reply("post is no longer queued", 409), reply("that slot is already taken", 409));
+    const gone = await deletePost("ab12").catch((e: unknown) => e);
+    const taken = await deletePost("ab12").catch((e: unknown) => e);
+    expect(isNotQueued(gone)).toBe(true);
+    expect(isNotQueued(taken)).toBe(false);
+    expect(isNotQueued(new Error("post is no longer queued"))).toBe(false);
   });
 });

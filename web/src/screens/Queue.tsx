@@ -70,6 +70,7 @@ export function Queue({ onOpenSlots = () => undefined }: { onOpenSlots?: () => v
     focusLater(`edit-${saved.id}`);
     update((cur) => cur.map((p) => (p.id === saved.id ? saved : p)).sort((a, b) => a.slot_at - b.slot_at));
     setActive(null);
+    setNotice("Post saved");
   }
 
   let body;

@@ -73,7 +73,10 @@ export function QueueItem({ post, mode, onMode, onSaved, onDeleted, onOpenSlots 
         </div>
         {mode === "view" && <Actions id={post.id} title={post.title} onMode={onMode} />}
         {mode === "edit" && (
-          <EditPostForm post={post} onSaved={onSaved} onCancel={close} onOpenSlots={onOpenSlots} />
+          <EditPostForm post={post} onSaved={onSaved}
+            onCancel={close}
+            onGone={(notice) => onDeleted(post.id, notice)}
+            onOpenSlots={onOpenSlots} />
         )}
         {mode === "delete" && (
           <DeleteConfirm id={post.id} title={post.title} onDeleted={(notice) => onDeleted(post.id, notice)} onCancel={close} />

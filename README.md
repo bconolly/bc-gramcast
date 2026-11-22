@@ -102,6 +102,7 @@ All endpoints answer only to the owner (see Run locally). Request bodies are JSO
 - Delete rejected and orphaned uploads (add an R2 lifecycle rule as a backstop). A video left behind when a post is deleted but the R2 delete fails is one of these.
 - Editing is unrestricted because nothing publishes yet. When publishing lands, block edits and deletes for posts that are publishing or published.
 - Request bodies have no size cap in the Worker yet (a PATCH or POST body is parsed whole). Add a limit, for example by checking `Content-Length`.
+- After a failed edit save, focus is not returned to the form (the Save button is disabled while saving). Opening another post's Edit drops the unsaved changes in the first form without asking.
 - Editing cannot replace the video: delete the post and upload again.
 - The delete and edit adapters (D1 `get`, `update`, `delete`, R2 `delete_object`) are compile-checked only, not run against Cloudflare.
 - Put Cloudflare Access in front of every hostname the Worker answers on (workers.dev, Preview URLs and any custom domain), or set `workers_dev = false` and `preview_urls = false`.

@@ -1,6 +1,6 @@
 import { useState } from "react";
 import { Button } from "@/components/ui/button";
-import { ApiError, deletePost } from "@/lib/api";
+import { ApiError, NOT_QUEUED_NOTICE, deletePost, isNotQueued } from "@/lib/api";
 
 interface Props {
   id: string;
@@ -24,6 +24,10 @@ export function DeleteConfirm({ id, title, onDeleted, onCancel }: Props) {
     } catch (e) {
       if (e instanceof ApiError && e.status === 404) {
         onDeleted("That post was already deleted.");
+        return;
+      }
+      if (isNotQueued(e)) {
+        onDeleted(NOT_QUEUED_NOTICE);
         return;
       }
       setError(e instanceof Error ? e.message : "Something went wrong.");

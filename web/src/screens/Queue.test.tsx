@@ -152,6 +152,17 @@ describe("Queue delete", () => {
     expect(screen.getByText("Second post")).toBeInTheDocument();
   });
 
+  it("removes the row and says why when the post is no longer queued (409)", async () => {
+    serve(() => new Response("post is no longer queued", { status: 409 }));
+    const user = userEvent.setup();
+    render(<Queue />);
+    await user.click(await screen.findByRole("button", { name: "Delete Sunday reel" }));
+    await user.click(screen.getByRole("button", { name: "Delete post" }));
+    await waitFor(() => expect(screen.queryByText("Sunday reel")).not.toBeInTheDocument());
+    expect(screen.getByRole("status")).toHaveTextContent("That post is no longer queued, so it was removed from the list.");
+    expect(screen.getByText("Second post")).toBeInTheDocument();
+  });
+
   it("announces the delete politely and moves focus to the next row's Edit button", async () => {
     serve();
     const user = userEvent.setup();

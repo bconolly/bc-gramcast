@@ -130,6 +130,24 @@ describe("Queue edit", () => {
     expect(screen.queryByText("Sunday reel")).not.toBeInTheDocument();
   });
 
+  it("announces a successful save in the live region", async () => {
+    serve();
+    const user = userEvent.setup();
+    const form = await openEdit(user);
+    await user.click(form.getByRole("button", { name: "Save" }));
+    expect(await screen.findByRole("status")).toHaveTextContent("Post saved");
+  });
+
+  it("removes the row and says why when the post is no longer queued (409)", async () => {
+    serve(() => new Response("post is no longer queued", { status: 409 }));
+    const user = userEvent.setup();
+    const form = await openEdit(user);
+    await user.click(form.getByRole("button", { name: "Save" }));
+    await waitFor(() => expect(screen.queryByText("Sunday reel")).not.toBeInTheDocument());
+    expect(screen.getByRole("status")).toHaveTextContent("That post is no longer queued, so it was removed from the list.");
+    expect(screen.getByText("Second post")).toBeInTheDocument();
+  });
+
   it("shows validation problems and does not call the server", async () => {
     const fn = serve();
     const user = userEvent.setup();
