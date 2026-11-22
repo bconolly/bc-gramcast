@@ -1,5 +1,6 @@
 //! Cloudflare Worker: validates and maps HTTP to the domain use cases.
 
+pub mod connect_dto;
 pub mod dto;
 
 #[cfg(target_arch = "wasm32")]
