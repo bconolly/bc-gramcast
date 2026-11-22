@@ -4,8 +4,6 @@
 //! column mapping and SQL are in `publish_dto`. These adapters cannot run natively.
 //! Their errors are fixed text: no D1 error or row value is copied in.
 
-#![allow(dead_code)] // wired by the scheduled handler, a later commit of this slice
-
 use crate::adapters::{row_to_post, PostRow};
 use crate::publish_dto::{self, Param, RawState};
 use domain::app::PortError;

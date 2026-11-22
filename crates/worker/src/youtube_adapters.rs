@@ -14,8 +14,6 @@
 //! Bearer` like the initiation does (the address is checked to be on googleapis.com
 //! first); the PUTs carry no `Content-Type`.
 
-#![allow(dead_code)] // wired by the scheduled handler, a later commit of this slice
-
 use crate::adapters::now_secs;
 use crate::net;
 use crate::youtube_dto;

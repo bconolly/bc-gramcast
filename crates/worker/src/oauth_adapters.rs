@@ -419,13 +419,11 @@ impl CodeExchanger for GoogleExchanger {
 
 /// Refreshes the access token at Google's token endpoint. The classification (what is
 /// `Auth`, `RateLimited` or `Transient`) is `domain::youtube::refresh_outcome`.
-#[allow(dead_code)] // wired by the scheduled handler, a later commit of this slice
 pub struct GoogleRefresher {
     config: OAuthConfig,
     client_secret: String,
 }
 
-#[allow(dead_code)] // as above
 impl GoogleRefresher {
     pub fn from_env(env: &Env, config: OAuthConfig) -> Result<Self, PortError> {
         let client_secret = env

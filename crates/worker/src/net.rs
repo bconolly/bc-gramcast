@@ -2,8 +2,6 @@
 //! `domain::youtube::REQUEST_TIMEOUT_SECS`. A failure carries no detail on purpose: the
 //! underlying error can name the URL, which for an upload session is a secret.
 
-#![allow(dead_code)] // wired by the scheduled handler, a later commit of this slice
-
 use domain::youtube::REQUEST_TIMEOUT_SECS;
 use worker::js_sys::{self, Function, Reflect};
 use worker::wasm_bindgen::{JsCast, JsValue};

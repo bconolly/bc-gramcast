@@ -3,6 +3,7 @@
 pub mod connect_dto;
 pub mod dto;
 pub mod publish_dto;
+pub mod publish_log;
 pub mod youtube_dto;
 
 #[cfg(target_arch = "wasm32")]
@@ -15,6 +16,8 @@ mod net;
 mod oauth_adapters;
 #[cfg(target_arch = "wasm32")]
 mod publish_adapters;
+#[cfg(target_arch = "wasm32")]
+mod scheduled;
 #[cfg(target_arch = "wasm32")]
 mod youtube_adapters;
 
@@ -148,6 +151,14 @@ mod entry {
             response.headers_mut().set(name, value)?;
         }
         Ok(response)
+    }
+
+    /// The Cron Trigger (`*/5 * * * *`, see `wrangler.toml`): the only place anything is
+    /// published. The event and its scheduled time are not used: the run reads the
+    /// Worker clock itself.
+    #[event(scheduled)]
+    async fn scheduled(_event: ScheduledEvent, env: Env, _ctx: ScheduleContext) {
+        crate::scheduled::run(&env).await;
     }
 
     async fn handle(req: Request, env: Env) -> Result<Response> {
