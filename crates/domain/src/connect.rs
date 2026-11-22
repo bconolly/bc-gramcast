@@ -1,11 +1,13 @@
 //! The owner's YouTube connect callback: turning Google's token reply into a
-//! `StoredToken` and the fixed error codes shown to the owner.
+//! `StoredToken`, and the use case that ties state, code exchange and storage together.
 //!
 //! Provider text (the `error` field, bodies) is only ever compared with fixed
 //! strings here and never copied into an error, a log or a redirect. The owner
 //! sees one of the fixed codes in `ConnectError::code`.
 
-use crate::token::StoredToken;
+use crate::app::PortError;
+use crate::oauth::{self, StateError, StateStore};
+use crate::token::{StoredToken, TokenStore};
 use std::fmt;
 
 /// Longest access or refresh token accepted. Our own sanity bound.
@@ -136,9 +138,64 @@ impl ConnectError {
     }
 }
 
+/// The query parameters Google sent back. Borrowed, never stored or logged.
+pub struct CallbackParams<'a> {
+    pub state: Option<&'a str>,
+    pub code: Option<&'a str>,
+    pub error: Option<&'a str>,
+}
+
+/// Port: trades the authorisation code for tokens at Google's token endpoint.
+#[allow(async_fn_in_trait)]
+pub trait CodeExchanger {
+    async fn exchange(&self, code: &str) -> Result<TokenReply, PortError>;
+}
+
+/// Owner OAuth callback. The state is consumed first, so a replay or forgery stops
+/// before anything is sent to Google; a denial also uses the state up. Only a good
+/// exchange reaches `TokenStore::connect`, which clears the needs-reconnect mark.
+pub async fn connect_youtube_callback<S: StateStore, E: CodeExchanger, T: TokenStore>(
+    states: &S,
+    exchanger: &E,
+    tokens: &T,
+    params: &CallbackParams<'_>,
+    now: i64,
+) -> Result<(), ConnectError> {
+    let state = params.state.ok_or(ConnectError::BadState)?;
+    oauth::consume_state(states, state, now)
+        .await
+        .map_err(|e| match e {
+            StateError::Invalid => ConnectError::BadState,
+            StateError::Port(_) => ConnectError::Server,
+        })?;
+    match params.error {
+        Some("access_denied") => return Err(ConnectError::Denied),
+        Some(_) => return Err(ConnectError::ExchangeFailed),
+        None => {}
+    }
+    let code = params
+        .code
+        .filter(|c| !c.is_empty() && c.len() <= MAX_CODE_LEN)
+        .ok_or(ConnectError::ExchangeFailed)?;
+    let reply = exchanger
+        .exchange(code)
+        .await
+        .map_err(|_| ConnectError::ExchangeFailed)?;
+    let token =
+        parse_token_reply(&reply, Grant::Code, now).map_err(|_| ConnectError::ExchangeFailed)?;
+    tokens
+        .connect(&token)
+        .await
+        .map_err(|_| ConnectError::Server)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::oauth::STATE_TTL_SECS;
+    use crate::token::fakes::FakeTokenStore;
+    use std::cell::{Cell, RefCell};
+    use std::collections::HashMap;
 
     const NOW: i64 = 5_000_000;
 
@@ -311,5 +368,248 @@ mod tests {
         assert_eq!(ConnectError::BadState.code(), "bad_state");
         assert_eq!(ConnectError::ExchangeFailed.code(), "exchange_failed");
         assert_eq!(ConnectError::Server.code(), "server_error");
+    }
+
+    // ---- the callback use case ----
+
+    #[derive(Default)]
+    struct FakeStates {
+        rows: RefCell<HashMap<String, i64>>,
+        fail: bool,
+    }
+    impl StateStore for FakeStates {
+        async fn put(&self, s: &str, _now: i64, exp: i64) -> Result<(), PortError> {
+            self.rows.borrow_mut().insert(s.to_string(), exp);
+            Ok(())
+        }
+        async fn take(&self, s: &str) -> Result<Option<i64>, PortError> {
+            if self.fail {
+                return Err(PortError("d1 down".into()));
+            }
+            Ok(self.rows.borrow_mut().remove(s))
+        }
+    }
+
+    struct FakeExchanger {
+        reply: Result<TokenReply, PortError>,
+        calls: Cell<u32>,
+        last_code: RefCell<String>,
+    }
+    impl FakeExchanger {
+        fn new(reply: Result<TokenReply, PortError>) -> Self {
+            Self {
+                reply,
+                calls: Cell::new(0),
+                last_code: RefCell::new(String::new()),
+            }
+        }
+    }
+    impl CodeExchanger for FakeExchanger {
+        async fn exchange(&self, code: &str) -> Result<TokenReply, PortError> {
+            self.calls.set(self.calls.get() + 1);
+            *self.last_code.borrow_mut() = code.to_string();
+            match &self.reply {
+                Ok(r) => Ok(r.clone()),
+                Err(e) => Err(PortError(e.0.clone())),
+            }
+        }
+    }
+
+    struct FailingTokens;
+    impl TokenStore for FailingTokens {
+        async fn load(&self) -> Result<Option<StoredToken>, PortError> {
+            Ok(None)
+        }
+        async fn save(&self, _: &StoredToken) -> Result<(), PortError> {
+            Ok(())
+        }
+        async fn connect(&self, _: &StoredToken) -> Result<(), PortError> {
+            Err(PortError("d1 down".into()))
+        }
+        async fn mark_needs_reconnect(&self) -> Result<(), PortError> {
+            Ok(())
+        }
+        async fn needs_reconnect(&self) -> Result<bool, PortError> {
+            Ok(false)
+        }
+    }
+
+    fn state() -> String {
+        "c".repeat(64)
+    }
+    fn states_with(s: &str) -> FakeStates {
+        let st = FakeStates::default();
+        st.rows
+            .borrow_mut()
+            .insert(s.to_string(), NOW + STATE_TTL_SECS);
+        st
+    }
+    fn params<'a>(
+        state: Option<&'a str>,
+        code: Option<&'a str>,
+        error: Option<&'a str>,
+    ) -> CallbackParams<'a> {
+        CallbackParams { state, code, error }
+    }
+    fn run<T: TokenStore>(
+        states: &FakeStates,
+        ex: &FakeExchanger,
+        tokens: &T,
+        p: &CallbackParams<'_>,
+    ) -> Result<(), ConnectError> {
+        pollster::block_on(connect_youtube_callback(states, ex, tokens, p, NOW))
+    }
+
+    #[test]
+    fn a_good_callback_stores_the_token_and_clears_the_reconnect_mark() {
+        let (st, s) = (states_with(&state()), state());
+        let ex = FakeExchanger::new(Ok(ok_reply()));
+        let tokens = FakeTokenStore::default();
+        tokens.reconnect.set(true);
+        assert_eq!(
+            run(&st, &ex, &tokens, &params(Some(&s), Some("the-code"), None)),
+            Ok(())
+        );
+        assert_eq!(*ex.last_code.borrow(), "the-code");
+        let stored = tokens.token.borrow().clone().unwrap();
+        assert_eq!(stored.expires_at, NOW + 3599);
+        assert!(!tokens.reconnect.get(), "connect must clear the mark");
+        assert!(st.rows.borrow().is_empty(), "the state is used up");
+    }
+
+    #[test]
+    fn a_replayed_callback_is_refused_and_exchanges_nothing() {
+        let (st, s) = (states_with(&state()), state());
+        let ex = FakeExchanger::new(Ok(ok_reply()));
+        let tokens = FakeTokenStore::default();
+        let p = params(Some(&s), Some("c"), None);
+        assert_eq!(run(&st, &ex, &tokens, &p), Ok(()));
+        assert_eq!(run(&st, &ex, &tokens, &p), Err(ConnectError::BadState));
+        assert_eq!(ex.calls.get(), 1);
+    }
+
+    #[test]
+    fn a_bad_state_never_reaches_the_exchange_or_the_store() {
+        let ex = FakeExchanger::new(Ok(ok_reply()));
+        let tokens = FakeTokenStore::default();
+        let known = state();
+        let expired = FakeStates::default();
+        expired.rows.borrow_mut().insert(known.clone(), NOW);
+        let cases: Vec<(FakeStates, CallbackParams<'_>)> = vec![
+            (FakeStates::default(), params(None, Some("c"), None)),
+            (FakeStates::default(), params(Some(&known), Some("c"), None)),
+            (
+                FakeStates::default(),
+                params(Some("short"), Some("c"), None),
+            ),
+            (expired, params(Some(&known), Some("c"), None)),
+            // Google's error redirect with an unknown state is a bad state, not a denial.
+            (
+                FakeStates::default(),
+                params(Some(&known), None, Some("access_denied")),
+            ),
+        ];
+        for (st, p) in &cases {
+            assert_eq!(run(st, &ex, &tokens, p), Err(ConnectError::BadState));
+        }
+        assert_eq!(ex.calls.get(), 0);
+        assert!(tokens.token.borrow().is_none());
+    }
+
+    #[test]
+    fn a_denial_uses_up_the_state_and_exchanges_nothing() {
+        let (st, s) = (states_with(&state()), state());
+        let ex = FakeExchanger::new(Ok(ok_reply()));
+        let tokens = FakeTokenStore::default();
+        let r = run(
+            &st,
+            &ex,
+            &tokens,
+            &params(Some(&s), None, Some("access_denied")),
+        );
+        assert_eq!(r, Err(ConnectError::Denied));
+        assert!(st.rows.borrow().is_empty());
+        assert_eq!(ex.calls.get(), 0);
+    }
+
+    #[test]
+    fn another_provider_error_is_an_exchange_failure() {
+        let (st, s) = (states_with(&state()), state());
+        let ex = FakeExchanger::new(Ok(ok_reply()));
+        let r = run(
+            &st,
+            &ex,
+            &FakeTokenStore::default(),
+            &params(Some(&s), Some("c"), Some("<script>x</script>")),
+        );
+        assert_eq!(r, Err(ConnectError::ExchangeFailed));
+        assert_eq!(ex.calls.get(), 0);
+    }
+
+    #[test]
+    fn a_missing_or_oversized_code_is_an_exchange_failure() {
+        let big = "x".repeat(MAX_CODE_LEN + 1);
+        for code in [None, Some(""), Some(big.as_str())] {
+            let (st, s) = (states_with(&state()), state());
+            let ex = FakeExchanger::new(Ok(ok_reply()));
+            let r = run(
+                &st,
+                &ex,
+                &FakeTokenStore::default(),
+                &params(Some(&s), code, None),
+            );
+            assert_eq!(r, Err(ConnectError::ExchangeFailed));
+            assert_eq!(ex.calls.get(), 0);
+        }
+    }
+
+    #[test]
+    fn exchange_failures_keep_the_old_token_and_mark() {
+        let failures = [
+            Err(PortError("network".into())),
+            Ok(TokenReply {
+                status: 400,
+                error: Some("invalid_grant".into()),
+                ..ok_reply()
+            }),
+            Ok(TokenReply {
+                status: 500,
+                ..ok_reply()
+            }),
+            Ok(TokenReply {
+                refresh_token: None,
+                ..ok_reply()
+            }),
+        ];
+        for reply in failures {
+            let (st, s) = (states_with(&state()), state());
+            let ex = FakeExchanger::new(reply);
+            let tokens = FakeTokenStore::default();
+            tokens.reconnect.set(true);
+            let r = run(&st, &ex, &tokens, &params(Some(&s), Some("c"), None));
+            assert_eq!(r, Err(ConnectError::ExchangeFailed));
+            assert!(tokens.token.borrow().is_none());
+            assert!(tokens.reconnect.get());
+        }
+    }
+
+    #[test]
+    fn storage_failures_are_server_errors() {
+        let (st, s) = (states_with(&state()), state());
+        let ex = FakeExchanger::new(Ok(ok_reply()));
+        let r = run(&st, &ex, &FailingTokens, &params(Some(&s), Some("c"), None));
+        assert_eq!(r, Err(ConnectError::Server));
+
+        let down = FakeStates {
+            fail: true,
+            ..Default::default()
+        };
+        let r = run(
+            &down,
+            &ex,
+            &FakeTokenStore::default(),
+            &params(Some(&s), Some("c"), None),
+        );
+        assert_eq!(r, Err(ConnectError::Server));
     }
 }
