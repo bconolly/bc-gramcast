@@ -112,7 +112,11 @@ pub enum Cas {
 /// Persistence port for publishing state.
 #[allow(async_fn_in_trait)]
 pub trait PublishRepository {
-    async fn list(&self) -> Result<Vec<ScheduledPost>, PortError>;
+    /// What a run needs, as of `now` (Unix seconds from the run's clock): the Queued
+    /// posts that are due (slot reached and any retry delay over) and every Publishing
+    /// post (to flag the stuck ones). Not Published or Failed posts: history stays out.
+    /// The use case still checks `is_due`, so an adapter may return a little extra.
+    async fn list(&self, now: i64) -> Result<Vec<ScheduledPost>, PortError>;
     /// Writes `next` only if the post's stored state still equals `expected`,
     /// in one atomic step (an `UPDATE ... WHERE state = expected`). This is what
     /// stops two overlapping runs from publishing the same post twice.
@@ -196,7 +200,7 @@ pub async fn publish_due(
         refresher,
         links,
     };
-    let posts = repo.list().await?;
+    let posts = repo.list(clock()).await?;
     let mut report = PublishReport::default();
     if run.flag_stuck(&posts, &mut report).await.is_err() {
         report.halted = Some(Halt::Storage);
@@ -580,6 +584,8 @@ mod tests {
         /// Storage fails on a write from Publishing (a final write or a stuck flag), once
         /// this many of them have gone through. `None`: never fails.
         fail_final: Cell<Option<u32>>,
+        /// The `now` each `list` call was given.
+        listed_at: RefCell<Vec<i64>>,
     }
     impl FakeRepo {
         fn with(posts: Vec<ScheduledPost>) -> Self {
@@ -599,7 +605,8 @@ mod tests {
         }
     }
     impl PublishRepository for FakeRepo {
-        async fn list(&self) -> Result<Vec<ScheduledPost>, PortError> {
+        async fn list(&self, now: i64) -> Result<Vec<ScheduledPost>, PortError> {
+            self.listed_at.borrow_mut().push(now);
             Ok(self.posts.borrow().clone())
         }
         async fn transition(
@@ -757,6 +764,14 @@ mod tests {
             }
         );
         assert_eq!(repo.state("later"), PublishState::new_queued());
+    }
+
+    #[test]
+    fn the_run_lists_posts_as_of_its_own_clock() {
+        let repo = FakeRepo::with(vec![scheduled("a", NOW - 1)]);
+        let publisher = FakePublisher::returning(vec![ok_ref("yt1")]);
+        run(&repo, &publisher, &fresh_store(), &refresher_ok());
+        assert_eq!(*repo.listed_at.borrow(), [NOW]);
     }
 
     #[test]
