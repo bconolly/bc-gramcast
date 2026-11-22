@@ -40,7 +40,7 @@ impl fmt::Debug for StoredToken {
 /// One store value serves one run. `load` remembers which stored version it read
 /// (an opaque marker, such as the row's nonce); `save` and `mark_needs_reconnect`
 /// then apply only if the row is still that version. If the owner reconnected in
-/// the meantime the write is skipped and returns `Ok`: a lost race is harmless, and
+/// the meantime the write is skipped and returns `Ok` (for `save`, `Ok(false)`): a lost race is harmless, and
 /// the owner's new token and cleared mark must survive a scheduled run that started
 /// before it. Called before any `load`, both return an error. `connect` is
 /// unconditional: it is the owner's own act.
@@ -50,8 +50,10 @@ pub trait TokenStore {
     async fn load(&self) -> Result<Option<StoredToken>, PortError>;
     /// Stores a refreshed token, if the row is still the version `load` read. Used by
     /// the scheduled refresh path. Must NOT clear the needs-reconnect mark: only the
-    /// owner reconnecting does that (see `connect`).
-    async fn save(&self, token: &StoredToken) -> Result<(), PortError>;
+    /// owner reconnecting does that (see `connect`). `Ok(true)` means the write
+    /// applied; `Ok(false)` means the row had changed (the owner reconnected), nothing
+    /// was written, and the caller must stop and not use the token it refreshed.
+    async fn save(&self, token: &StoredToken) -> Result<bool, PortError>;
     /// Stores a token from a new owner sign-in AND clears the needs-reconnect mark.
     /// Callable only from the owner's OAuth callback, never from the scheduled run.
     async fn connect(&self, token: &StoredToken) -> Result<(), PortError>;
@@ -96,13 +98,14 @@ pub(crate) mod fakes {
             self.loaded.set(token.as_ref().map(|_| self.version.get()));
             Ok(token)
         }
-        async fn save(&self, token: &StoredToken) -> Result<(), PortError> {
-            if self.still_loaded()? {
-                *self.token.borrow_mut() = Some(token.clone());
-                self.version.set(self.version.get() + 1);
-                self.loaded.set(Some(self.version.get()));
+        async fn save(&self, token: &StoredToken) -> Result<bool, PortError> {
+            if !self.still_loaded()? {
+                return Ok(false);
             }
-            Ok(())
+            *self.token.borrow_mut() = Some(token.clone());
+            self.version.set(self.version.get() + 1);
+            self.loaded.set(Some(self.version.get()));
+            Ok(true)
         }
         async fn connect(&self, token: &StoredToken) -> Result<(), PortError> {
             *self.token.borrow_mut() = Some(token.clone());
@@ -169,7 +172,7 @@ mod tests {
         assert_eq!(pollster::block_on(s.load()), Ok(None));
         pollster::block_on(s.connect(&token(1))).unwrap();
         assert_eq!(pollster::block_on(s.load()), Ok(Some(token(1))));
-        pollster::block_on(s.save(&token(2))).unwrap();
+        assert_eq!(pollster::block_on(s.save(&token(2))), Ok(true));
         assert_eq!(pollster::block_on(s.load()), Ok(Some(token(2))));
     }
 
@@ -196,8 +199,8 @@ mod tests {
         pollster::block_on(s.connect(&token(2))).unwrap(); // the owner reconnects
         assert_eq!(
             pollster::block_on(s.save(&token(99))),
-            Ok(()),
-            "a lost race is not an error"
+            Ok(false),
+            "a lost race is not an error, but it is reported"
         );
         assert_eq!(s.token.borrow().clone(), Some(token(2)));
         assert!(!s.reconnect.get());

@@ -484,8 +484,8 @@ mod tests {
         async fn load(&self) -> Result<Option<StoredToken>, PortError> {
             Ok(None)
         }
-        async fn save(&self, _: &StoredToken) -> Result<(), PortError> {
-            Ok(())
+        async fn save(&self, _: &StoredToken) -> Result<bool, PortError> {
+            Ok(true)
         }
         async fn connect(&self, _: &StoredToken) -> Result<(), PortError> {
             Err(PortError("d1 down".into()))

@@ -92,8 +92,8 @@ mod tests {
         async fn load(&self) -> Result<Option<StoredToken>, PortError> {
             panic!("the status must not read the token");
         }
-        async fn save(&self, _: &StoredToken) -> Result<(), PortError> {
-            Ok(())
+        async fn save(&self, _: &StoredToken) -> Result<bool, PortError> {
+            Ok(true)
         }
         async fn connect(&self, _: &StoredToken) -> Result<(), PortError> {
             Ok(())

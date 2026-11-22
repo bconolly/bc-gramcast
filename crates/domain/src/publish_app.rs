@@ -360,11 +360,17 @@ where
             fresh.refresh_token = token.refresh_token.clone();
         }
         // A refresh that cannot be saved is not safe to carry on with: the
-        // provider may have rotated the refresh token.
-        self.tokens
+        // provider may have rotated the refresh token. A save that did not apply
+        // means the owner reconnected since this run loaded: the token held here is
+        // stale, so the run stops rather than carry on with it.
+        let applied = self
+            .tokens
             .save(&fresh)
             .await
             .map_err(|_| PublishError::Transient)?;
+        if !applied {
+            return Err(PublishError::Transient);
+        }
         *token = fresh;
         Ok(())
     }
@@ -1458,29 +1464,30 @@ mod tests {
         assert!(!dump.contains("SECRET") && !dump.contains("ya29"), "{dump}");
     }
 
-    #[test]
-    fn a_failing_token_save_stops_the_run_before_the_provider_is_called() {
-        struct NoSave(FakeTokenStore);
-        impl TokenStore for NoSave {
-            async fn load(&self) -> Result<Option<StoredToken>, PortError> {
-                self.0.load().await
-            }
-            async fn save(&self, _t: &StoredToken) -> Result<(), PortError> {
-                Err(PortError("kv down".into()))
-            }
-            async fn connect(&self, t: &StoredToken) -> Result<(), PortError> {
-                self.0.connect(t).await
-            }
-            async fn mark_needs_reconnect(&self) -> Result<(), PortError> {
-                self.0.mark_needs_reconnect().await
-            }
-            async fn needs_reconnect(&self) -> Result<bool, PortError> {
-                self.0.needs_reconnect().await
-            }
-            async fn connection_mark(&self) -> Result<Option<bool>, PortError> {
-                self.0.connection_mark().await
-            }
+    /// A token store whose `save` answers as told: `Some(applied)` or an error (`None`).
+    struct SaveAnswers(FakeTokenStore, Option<bool>);
+    impl TokenStore for SaveAnswers {
+        async fn load(&self) -> Result<Option<StoredToken>, PortError> {
+            self.0.load().await
         }
+        async fn save(&self, _t: &StoredToken) -> Result<bool, PortError> {
+            self.1.ok_or_else(|| PortError("kv down".into()))
+        }
+        async fn connect(&self, t: &StoredToken) -> Result<(), PortError> {
+            self.0.connect(t).await
+        }
+        async fn mark_needs_reconnect(&self) -> Result<(), PortError> {
+            self.0.mark_needs_reconnect().await
+        }
+        async fn needs_reconnect(&self) -> Result<bool, PortError> {
+            self.0.needs_reconnect().await
+        }
+        async fn connection_mark(&self) -> Result<Option<bool>, PortError> {
+            self.0.connection_mark().await
+        }
+    }
+
+    fn run_with_save(answer: Option<bool>) -> (PublishReport, FakeRepo, FakePublisher) {
         let inner = FakeTokenStore::default();
         *inner.token.borrow_mut() = Some(token(NOW, "ya29.OLD"));
         let repo = two_due();
@@ -1489,14 +1496,58 @@ mod tests {
             &|| NOW,
             &repo,
             &publisher,
-            &NoSave(inner),
+            &SaveAnswers(inner, answer),
+            &refresher_ok(),
+            &FakeLinks,
+        ))
+        .unwrap();
+        (report, repo, publisher)
+    }
+
+    #[test]
+    fn a_failing_token_save_stops_the_run_before_the_provider_is_called() {
+        let (report, repo, publisher) = run_with_save(None);
+        assert_eq!(report.halted, Some(Halt::TokenUnavailable));
+        assert_eq!(repo.state("a"), PublishState::new_queued());
+        assert!(publisher.calls.borrow().is_empty());
+    }
+
+    #[test]
+    fn a_refresh_save_that_did_not_apply_stops_the_run_without_using_the_new_token() {
+        // The owner reconnected between load and save: the refreshed token is stale.
+        let (report, repo, publisher) = run_with_save(Some(false));
+        assert_eq!(report.halted, Some(Halt::TokenUnavailable));
+        assert!(report.outcomes.is_empty());
+        assert_eq!(repo.state("a"), PublishState::new_queued());
+        assert!(
+            publisher.calls.borrow().is_empty(),
+            "no upload with the stale token"
+        );
+    }
+
+    #[test]
+    fn a_refresh_save_that_did_not_apply_mid_run_releases_the_claimed_post() {
+        let inner = FakeTokenStore::default();
+        *inner.token.borrow_mut() = Some(token(NOW + 3600, "ya29.OLD"));
+        let repo = two_due();
+        let publisher = FakePublisher::returning(vec![Err(PublishError::Auth)]);
+        let report = pollster::block_on(publish_due(
+            &|| NOW,
+            &repo,
+            &publisher,
+            &SaveAnswers(inner, Some(false)),
             &refresher_ok(),
             &FakeLinks,
         ))
         .unwrap();
         assert_eq!(report.halted, Some(Halt::TokenUnavailable));
+        assert_eq!(report.outcomes[0].1, Outcome::Released);
         assert_eq!(repo.state("a"), PublishState::new_queued());
-        assert!(publisher.calls.borrow().is_empty());
+        assert_eq!(
+            publisher.calls.borrow().len(),
+            1,
+            "no retry with the stale token"
+        );
     }
 
     #[test]

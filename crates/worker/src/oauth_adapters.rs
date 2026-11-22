@@ -271,7 +271,7 @@ impl<C: TokenCipher, R: RandomSource> TokenStore for D1TokenStore<C, R> {
         Ok(Some(token))
     }
 
-    async fn save(&self, token: &StoredToken) -> Result<(), PortError> {
+    async fn save(&self, token: &StoredToken) -> Result<bool, PortError> {
         let fail = |_| port("token write failed");
         let version = self.loaded_version()?;
         let sealed = self.seal(token).await?;
@@ -291,11 +291,13 @@ impl<C: TokenCipher, R: RandomSource> TokenStore for D1TokenStore<C, R> {
             .await
             .map_err(fail)?;
         // Applied: this run now holds the new version. Not applied: the owner
-        // reconnected meanwhile, which is not an error, and their token stays.
-        if written.is_some_and(|r| r.nonce == sealed.nonce) {
+        // reconnected meanwhile, which is not an error, and their token stays. The
+        // caller is told either way and stops on `false`.
+        let applied = written.is_some_and(|r| r.nonce == sealed.nonce);
+        if applied {
             *self.loaded.borrow_mut() = Some(sealed.nonce);
         }
-        Ok(())
+        Ok(applied)
     }
 
     async fn connect(&self, token: &StoredToken) -> Result<(), PortError> {
