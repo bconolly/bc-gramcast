@@ -3,6 +3,7 @@ pub mod app;
 pub mod auth;
 pub mod codec;
 pub mod connect;
+pub mod connection;
 pub mod keycache;
 pub mod media;
 pub mod oauth;

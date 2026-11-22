@@ -132,6 +132,19 @@ impl OAuthConfig {
         &self.redirect_uri
     }
 
+    /// Form body for the code exchange at `GOOGLE_TOKEN_URL`. Holds the client secret
+    /// and the code, so it must never be logged.
+    pub fn token_request_body(&self, code: &str, client_secret: &str) -> String {
+        let enc = codec::percent_encode;
+        format!(
+            "grant_type=authorization_code&code={}&client_id={}&client_secret={}&redirect_uri={}",
+            enc(code),
+            enc(&self.client_id),
+            enc(client_secret),
+            enc(&self.redirect_uri),
+        )
+    }
+
     /// The Google consent URL. `access_type=offline` and `prompt=consent` are what
     /// make Google return a refresh token on every authorisation.
     pub fn authorization_url(&self, state: &str) -> String {
@@ -378,6 +391,18 @@ mod tests {
                 "{bad:?}"
             );
         }
+    }
+
+    #[test]
+    fn the_token_request_is_a_form_with_every_value_encoded() {
+        let body = config().token_request_body("4/0A+b/c=d", "s3&cret=x y");
+        assert_eq!(
+            body,
+            "grant_type=authorization_code&code=4%2F0A%2Bb%2Fc%3Dd\
+             &client_id=client-1.apps.example\
+             &client_secret=s3%26cret%3Dx%20y\
+             &redirect_uri=https%3A%2F%2Fgramcast.gramcast.workers.dev%2Fapi%2Fconnect%2Fyoutube%2Fcallback"
+        );
     }
 
     #[test]
