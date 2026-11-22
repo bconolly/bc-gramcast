@@ -26,8 +26,7 @@ function YoutubeState({ load }: { load: Load }) {
       <div className="space-y-2">
         <Badge variant="warning">Needs reconnecting</Badge>
         <p className="text-sm">
-          Google stopped accepting the saved sign-in, or it can no longer be read (for example after the encryption key
-          changed). Videos will not be posted to YouTube. Reconnect to fix it.
+          Google stopped accepting the saved sign-in, so videos will not be posted to YouTube until you reconnect.
         </p>
       </div>
     );

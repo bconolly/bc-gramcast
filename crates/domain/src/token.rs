@@ -91,8 +91,10 @@ pub(crate) mod fakes {
     }
     impl TokenStore for FakeTokenStore {
         async fn load(&self) -> Result<Option<StoredToken>, PortError> {
-            self.loaded.set(Some(self.version.get()));
-            Ok(self.token.borrow().clone())
+            let token = self.token.borrow().clone();
+            // No token, no version: like the real save, which updates an existing row only.
+            self.loaded.set(token.as_ref().map(|_| self.version.get()));
+            Ok(token)
         }
         async fn save(&self, token: &StoredToken) -> Result<(), PortError> {
             if self.still_loaded()? {
@@ -229,6 +231,17 @@ mod tests {
         let s = FakeTokenStore::default();
         assert!(pollster::block_on(s.save(&token(1))).is_err());
         assert!(pollster::block_on(s.mark_needs_reconnect()).is_err());
+    }
+
+    #[test]
+    fn loading_no_token_records_no_version() {
+        let s = FakeTokenStore::default();
+        assert_eq!(pollster::block_on(s.load()), Ok(None));
+        assert_eq!(s.loaded.get(), None);
+        // As with the real UPDATE-only save: nothing was loaded, so nothing may be saved.
+        assert!(pollster::block_on(s.save(&token(1))).is_err());
+        assert!(pollster::block_on(s.mark_needs_reconnect()).is_err());
+        assert_eq!(s.token.borrow().clone(), None);
     }
 
     #[test]

@@ -37,9 +37,12 @@ describe("Connections", () => {
     stubStatus(true, true);
     render(<Connections result={none} />);
     expect(await screen.findByText("Needs reconnecting")).toBeInTheDocument();
-    expect(screen.getByText(/Google stopped accepting the saved sign-in, or it can no longer be read/)).toBeInTheDocument();
-    expect(screen.getByText(/after the encryption key changed/)).toBeInTheDocument();
-    expect(screen.getByText(/Reconnect to fix it/)).toBeInTheDocument();
+    expect(
+      screen.getByText(
+        "Google stopped accepting the saved sign-in, so videos will not be posted to YouTube until you reconnect.",
+      ),
+    ).toBeInTheDocument();
+    expect(screen.queryByText(/encryption key/)).not.toBeInTheDocument();
     expect(screen.getByRole("link", { name: "Reconnect YouTube" })).toBeInTheDocument();
   });
 
