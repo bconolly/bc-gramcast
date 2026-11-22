@@ -22,13 +22,13 @@ impl D1PostRepository {
 }
 
 #[derive(Deserialize)]
-struct PostRow {
-    id: String,
-    video_key: String,
-    title: String,
-    caption: String,
-    platforms: String,
-    slot_at: f64,
+pub(crate) struct PostRow {
+    pub(crate) id: String,
+    pub(crate) video_key: String,
+    pub(crate) title: String,
+    pub(crate) caption: String,
+    pub(crate) platforms: String,
+    pub(crate) slot_at: f64,
 }
 
 /// Rows changed by a write, from D1's result metadata, if it reports them.
@@ -37,7 +37,7 @@ pub(crate) fn changes(result: &worker::D1Result) -> Result<Option<usize>, PortEr
     Ok(meta.and_then(|m| m.changes))
 }
 
-fn row_to_post(r: PostRow) -> Result<QueuedPost, PortError> {
+pub(crate) fn row_to_post(r: PostRow) -> Result<QueuedPost, PortError> {
     let platforms = r
         .platforms
         .split(',')

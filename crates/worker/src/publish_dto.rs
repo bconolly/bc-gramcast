@@ -63,6 +63,54 @@ pub fn columns_of(state: &PublishState) -> StateColumns {
     }
 }
 
+/// Due Queued posts for YouTube plus every Publishing post, as of `?1` (the run's clock).
+/// Published and Failed posts are history and stay out. A post for Instagram only is
+/// never due here, so it cannot crowd the others out.
+pub const LIST_SQL: &str = "SELECT id, video_key, title, caption, platforms, slot_at, \
+     state, attempts, not_before, attempt, started_at, external_id, fail_reason FROM posts \
+     WHERE state = 'publishing' \
+     OR (state = 'queued' AND slot_at <= ?1 AND not_before <= ?1 AND platforms != 'instagram') \
+     ORDER BY slot_at";
+
+/// The compare-and-set: ONE statement that writes `next` (?2 to ?8) only if the row
+/// still holds every column of `expected` (?9 to ?15). `IS` compares NULLs too. A row
+/// that is missing or changed returns nothing, which the adapter reports as a conflict.
+pub const TRANSITION_SQL: &str = "UPDATE posts SET state = ?2, attempts = ?3, not_before = ?4, \
+     attempt = ?5, started_at = ?6, external_id = ?7, fail_reason = ?8 \
+     WHERE id = ?1 AND state = ?9 AND attempts IS ?10 AND not_before IS ?11 AND attempt IS ?12 \
+     AND started_at IS ?13 AND external_id IS ?14 AND fail_reason IS ?15 RETURNING id";
+
+/// One value to bind. The adapter turns these into D1 values (numbers as doubles, which
+/// are exact here: the domain caps times far below 2^53).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Param {
+    Int(i64),
+    Text(String),
+    Null,
+}
+
+fn columns_params(c: StateColumns) -> [Param; 7] {
+    let text = |t: Option<String>| t.map_or(Param::Null, Param::Text);
+    let int = |n: Option<i64>| n.map_or(Param::Null, Param::Int);
+    [
+        Param::Text(c.state.to_string()),
+        Param::Int(c.attempts),
+        Param::Int(c.not_before),
+        int(c.attempt),
+        int(c.started_at),
+        text(c.external_id),
+        text(c.fail_reason.map(str::to_string)),
+    ]
+}
+
+/// The 15 values for `TRANSITION_SQL`, in placeholder order.
+pub fn transition_params(id: &str, expected: &PublishState, next: &PublishState) -> Vec<Param> {
+    let mut v = vec![Param::Text(id.to_string())];
+    v.extend(columns_params(columns_of(next)));
+    v.extend(columns_params(columns_of(expected)));
+    v
+}
+
 /// A `posts` row's state columns as D1 returns them (numbers arrive as doubles).
 #[derive(Debug, Deserialize)]
 pub struct RawState {
@@ -170,6 +218,50 @@ mod tests {
             external_id: c.external_id.clone(),
             fail_reason: c.fail_reason.map(str::to_string),
         }
+    }
+
+    fn placeholders(sql: &str) -> usize {
+        let mut max = 0;
+        let mut rest = sql;
+        while let Some(i) = rest.find('?') {
+            let digits: String = rest[i + 1..]
+                .chars()
+                .take_while(char::is_ascii_digit)
+                .collect();
+            max = max.max(digits.parse().unwrap());
+            rest = &rest[i + 1..];
+        }
+        max
+    }
+
+    #[test]
+    fn the_transition_binds_one_value_per_placeholder_in_order() {
+        let expected = PublishState::Queued {
+            attempts: 1,
+            not_before: 50,
+        };
+        let next = PublishState::Publishing {
+            attempt: 2,
+            started_at: 60,
+        };
+        let p = transition_params("post1", &expected, &next);
+        assert_eq!(p.len(), placeholders(TRANSITION_SQL));
+        assert_eq!(p[0], Param::Text("post1".into()));
+        // ?2 to ?8 are the new state, ?9 to ?15 the expected one.
+        assert_eq!(p[1], Param::Text("publishing".into()));
+        assert_eq!(p[4], Param::Int(2));
+        assert_eq!(p[8], Param::Text("queued".into()));
+        assert_eq!(p[9], Param::Int(1));
+        assert_eq!(p[10], Param::Int(50));
+        assert_eq!(
+            &p[11..],
+            [Param::Null, Param::Null, Param::Null, Param::Null]
+        );
+    }
+
+    #[test]
+    fn the_list_binds_only_the_run_time() {
+        assert_eq!(placeholders(LIST_SQL), 1);
     }
 
     #[test]

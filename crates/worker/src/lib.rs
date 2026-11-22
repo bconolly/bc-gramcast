@@ -10,6 +10,8 @@ mod adapters;
 mod connect_routes;
 #[cfg(target_arch = "wasm32")]
 mod oauth_adapters;
+#[cfg(target_arch = "wasm32")]
+mod publish_adapters;
 
 #[cfg(target_arch = "wasm32")]
 mod entry {
