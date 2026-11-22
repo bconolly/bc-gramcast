@@ -191,6 +191,7 @@ pub fn is_json_content_type(header: Option<&str>) -> bool {
 /// client-sent values, and port errors never leak their detail.
 pub fn error_status(e: &AppError) -> (u16, &'static str) {
     match e {
+        AppError::NotFound => (404, "post not found"),
         AppError::VideoNotUploaded => (422, "video has not been uploaded"),
         AppError::Upload(u) => (
             422,
@@ -485,6 +486,11 @@ mod tests {
             r#"{"file_name":"a.mp4","content_type":"video/mp4","size_bytes":1,"admin":true}"#,
         );
         assert!(r.is_err());
+    }
+
+    #[test]
+    fn a_missing_post_is_a_fixed_404() {
+        assert_eq!(error_status(&AppError::NotFound), (404, "post not found"));
     }
 
     #[test]

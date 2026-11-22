@@ -59,6 +59,37 @@ pub fn validate_slot(slot_at: i64, now: i64) -> Result<(), QueueError> {
     Ok(())
 }
 
+/// The rules for the editable fields of a post, shared by new and edited posts.
+pub fn validate_fields(
+    title: &str,
+    caption: &str,
+    platforms: &[Platform],
+) -> Result<(), QueueError> {
+    if platforms.is_empty() {
+        return Err(QueueError::NoPlatforms);
+    }
+    let mut seen = Vec::new();
+    for p in platforms {
+        if seen.contains(p) {
+            return Err(QueueError::DuplicatePlatform);
+        }
+        seen.push(*p);
+    }
+    if title.trim().is_empty() {
+        return Err(QueueError::EmptyTitle);
+    }
+    if title.chars().count() > MAX_TITLE_CHARS || caption.chars().count() > MAX_CAPTION_CHARS {
+        return Err(QueueError::TooLong);
+    }
+    Ok(())
+}
+
+/// A post id as the Worker makes it (a UUID in simple form: lowercase hex),
+/// capped at 64 characters. Checked before an id from a URL reaches storage.
+pub fn is_post_id(id: &str) -> bool {
+    (1..=64).contains(&id.len()) && id.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+}
+
 /// Exactly `videos/` + 1 to 64 of `[A-Za-z0-9_-]` + `.mp4`.
 fn is_valid_video_key(key: &str) -> bool {
     let Some(name) = key
@@ -93,24 +124,7 @@ impl Queue {
     }
 
     pub fn add(&mut self, post: QueuedPost) -> Result<(), QueueError> {
-        if post.platforms.is_empty() {
-            return Err(QueueError::NoPlatforms);
-        }
-        let mut seen = Vec::new();
-        for p in &post.platforms {
-            if seen.contains(p) {
-                return Err(QueueError::DuplicatePlatform);
-            }
-            seen.push(*p);
-        }
-        if post.title.trim().is_empty() {
-            return Err(QueueError::EmptyTitle);
-        }
-        if post.title.chars().count() > MAX_TITLE_CHARS
-            || post.caption.chars().count() > MAX_CAPTION_CHARS
-        {
-            return Err(QueueError::TooLong);
-        }
+        validate_fields(&post.title, &post.caption, &post.platforms)?;
         if !is_valid_video_key(&post.video_key) {
             return Err(QueueError::BadVideoKey);
         }
@@ -147,6 +161,34 @@ mod tests {
             platforms: vec![Platform::Instagram, Platform::YouTube],
             slot_at,
         }
+    }
+
+    #[test]
+    fn post_ids_are_the_hex_the_generator_makes() {
+        assert!(is_post_id("0123456789abcdef0123456789abcdef"));
+        assert!(is_post_id("a"));
+        for bad in ["", "A", "a-b", "a/b", "a b", "g", "a'--", &"a".repeat(65)] {
+            assert!(!is_post_id(bad), "{bad}");
+        }
+    }
+
+    #[test]
+    fn validate_fields_is_the_shared_rule_set() {
+        use Platform::*;
+        assert_eq!(validate_fields("T", "", &[Instagram]), Ok(()));
+        assert_eq!(validate_fields("T", "", &[]), Err(QueueError::NoPlatforms));
+        assert_eq!(
+            validate_fields("T", "", &[YouTube, YouTube]),
+            Err(QueueError::DuplicatePlatform)
+        );
+        assert_eq!(
+            validate_fields(" ", "", &[YouTube]),
+            Err(QueueError::EmptyTitle)
+        );
+        assert_eq!(
+            validate_fields(&"x".repeat(101), "", &[YouTube]),
+            Err(QueueError::TooLong)
+        );
     }
 
     #[test]
