@@ -76,14 +76,6 @@ impl std::fmt::Debug for SessionUri {
     }
 }
 
-/// What has gone out so far, for the two safety rules (nothing sent: safe to retry;
-/// the final chunk sent: the video may exist).
-#[derive(Default)]
-struct Progress {
-    sent_any: bool,
-    sent_final: bool,
-}
-
 /// Publishes through YouTube's resumable upload. One value serves one invocation: the
 /// subrequest budget is shared by every publish call in it.
 pub struct YouTubePublisher {
@@ -250,25 +242,18 @@ impl Publisher for YouTubePublisher {
         let started = now_secs();
         let session = self.start(post, video, token).await?;
         let mut up = Upload::new(video.size())?;
-        let mut progress = Progress::default();
         let mut last_body: Option<String> = None;
         let mut step = up.begin(&mut self.budget.borrow_mut());
         loop {
             match step {
                 Step::Send(chunk) => {
                     if now_secs().saturating_sub(started) >= UPLOAD_DEADLINE_SECS {
-                        return Err(unfinished(&progress));
+                        return Err(up.out_of_time());
                     }
                     let Some(bytes) = self.read_chunk(video.key(), &chunk).await else {
                         // Not sent: only a final chunk already out makes the outcome unknown.
-                        return Err(if progress.sent_final {
-                            PublishError::Unknown
-                        } else {
-                            PublishError::Transient
-                        });
+                        return Err(up.out_of_time());
                     };
-                    progress.sent_any = true;
-                    progress.sent_final |= chunk.is_last();
                     let (reply, body) = self
                         .put(&session, token, &chunk.content_range(), Some(bytes))
                         .await;
@@ -289,14 +274,5 @@ impl Publisher for YouTubePublisher {
                 Step::Fail(e) => return Err(e),
             }
         }
-    }
-}
-
-/// Out of time with the upload unfinished: nothing sent is safe to retry, else unknown.
-fn unfinished(progress: &Progress) -> PublishError {
-    if progress.sent_any {
-        PublishError::Unknown
-    } else {
-        PublishError::Transient
     }
 }

@@ -5,7 +5,9 @@
 //! Safety rule (W8): the video exists at the provider only once the last byte is
 //! accepted. So a session that is gone, with the final chunk never sent, is safe to
 //! start over (`Transient`); once the final chunk may have reached the provider, or any
-//! reply was lost, the outcome is `Unknown` unless a status check settles it.
+//! reply was lost, the outcome is `Unknown` unless a status check settles it. Running out
+//! of budget, status checks or time follows the same rule: `Unknown` only once the final
+//! chunk was sent.
 
 use crate::publish::is_valid_external_id;
 use crate::publish_app::{PublishError, PublishedRef};
@@ -86,7 +88,6 @@ pub enum Step {
 pub struct Upload {
     total: u64,
     in_flight: Option<Chunk>,
-    sent_any: bool,
     sent_final: bool,
     queries: u32,
 }
@@ -111,7 +112,6 @@ impl Upload {
         Ok(Upload {
             total,
             in_flight: None,
-            sent_any: false,
             sent_final: false,
             queries: 0,
         })
@@ -127,7 +127,6 @@ impl Upload {
         let Some(chunk) = self.in_flight.take() else {
             return Step::Fail(PublishError::Unknown);
         };
-        self.sent_any = true;
         self.sent_final |= chunk.is_last();
         match reply.status {
             Some(308) => match confirmed_bytes(reply.range.as_deref(), self.total) {
@@ -161,12 +160,18 @@ impl Upload {
         }
     }
 
+    /// The adapter ran out of time or could not read the next chunk. Same rule as
+    /// running out of budget.
+    pub fn out_of_time(&self) -> PublishError {
+        self.session_gone_error()
+    }
+
     fn send_from(&mut self, offset: u64, budget: &mut SubrequestBudget) -> Step {
         let Some(chunk) = chunk_at(offset, self.total) else {
             return Step::Fail(PublishError::Unknown);
         };
         if !budget.spend(CHUNK_SUBREQUESTS) {
-            return Step::Fail(self.unfinished());
+            return Step::Fail(self.session_gone_error());
         }
         self.in_flight = Some(chunk);
         Step::Send(chunk)
@@ -174,7 +179,7 @@ impl Upload {
 
     fn query(&mut self, budget: &mut SubrequestBudget) -> Step {
         if self.queries >= STATUS_CHECK_RESERVE || !budget.spend(1) {
-            return Step::Fail(self.unfinished());
+            return Step::Fail(self.session_gone_error());
         }
         self.queries += 1;
         Step::Query
@@ -183,16 +188,12 @@ impl Upload {
     /// The session is gone. With the final chunk never sent nothing can exist, so a
     /// fresh start is safe; otherwise the video may exist.
     fn session_gone(&self) -> Step {
-        Step::Fail(if self.sent_final {
-            PublishError::Unknown
-        } else {
-            PublishError::Transient
-        })
+        Step::Fail(self.session_gone_error())
     }
 
-    /// Out of budget or checks: nothing sent means a retry is safe, else unknown.
-    fn unfinished(&self) -> PublishError {
-        if self.sent_any {
+    /// `Unknown` once the final chunk may have landed, else `Transient`.
+    fn session_gone_error(&self) -> PublishError {
+        if self.sent_final {
             PublishError::Unknown
         } else {
             PublishError::Transient
@@ -506,11 +507,13 @@ mod tests {
 
     #[test]
     fn a_video_that_cannot_finish_inside_the_budget_stops_with_the_right_error() {
-        // Nothing sent yet: safe to retry. Something sent: unknown.
+        // Nothing sent yet: safe to retry.
         let mut up = Upload::new(MIB).unwrap();
         let mut none = SubrequestBudget::for_upload();
         assert!(none.spend(UPLOAD_SUBREQUESTS));
         assert_eq!(up.begin(&mut none), Step::Fail(PublishError::Transient));
+        // A non-final chunk went out, then the budget ran out: nothing can exist before
+        // the final chunk, so this is safe to retry too.
         let mut up = Upload::new(20 * MIB).unwrap();
         let mut one = SubrequestBudget::for_upload();
         assert!(one.spend(UPLOAD_SUBREQUESTS - CHUNK_SUBREQUESTS));
@@ -519,8 +522,59 @@ mod tests {
         };
         assert_eq!(
             up.on_chunk(&ok308(8 * MIB), 0, &mut one),
+            Step::Fail(PublishError::Transient)
+        );
+        // The final chunk went out and the budget ran out before it was settled.
+        let mut up = Upload::new(MIB).unwrap();
+        let mut b = budget();
+        let Step::Send(_) = up.begin(&mut b) else {
+            panic!()
+        };
+        assert!(b.spend(b.left()));
+        assert_eq!(
+            up.on_chunk(&Reply::lost(), 0, &mut b),
             Step::Fail(PublishError::Unknown)
         );
+    }
+
+    #[test]
+    fn lost_replies_on_non_final_chunks_of_the_biggest_video_end_transient() {
+        let mut up = Upload::new(MAX_PUBLISH_BYTES).unwrap();
+        let mut b = budget();
+        let mut step = up.begin(&mut b);
+        let mut lost = 0;
+        let mut held = 0;
+        // Every chunk reply is lost and each status check shows the chunk arrived, so
+        // the upload creeps on until the status checks (or the budget) run out.
+        while !matches!(step, Step::Fail(_) | Step::Complete) {
+            step = match step {
+                Step::Send(c) => {
+                    lost += 1;
+                    held = c.end + 1;
+                    up.on_chunk(&Reply::lost(), 0, &mut b)
+                }
+                _ => up.on_query(&ok308(held), &mut b),
+            };
+        }
+        assert!(lost >= 3, "{lost}");
+        assert_eq!(step, Step::Fail(PublishError::Transient));
+    }
+
+    #[test]
+    fn running_out_of_time_follows_the_same_rule() {
+        let mut up = Upload::new(20 * MIB).unwrap();
+        let mut b = budget();
+        let Step::Send(_) = up.begin(&mut b) else {
+            panic!()
+        };
+        assert_eq!(up.out_of_time(), PublishError::Transient);
+        up.on_chunk(&ok308(8 * MIB), 0, &mut b);
+        assert_eq!(up.out_of_time(), PublishError::Transient);
+        let mut up = Upload::new(1_000).unwrap();
+        let mut b = budget();
+        up.begin(&mut b);
+        up.on_chunk(&Reply::lost(), 0, &mut b);
+        assert_eq!(up.out_of_time(), PublishError::Unknown);
     }
 
     #[test]
