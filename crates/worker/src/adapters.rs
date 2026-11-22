@@ -327,16 +327,18 @@ impl AccessVerifier {
 
     async fn refresh(&self) -> Result<Vec<(String, JsValue)>, PortError> {
         let mut init = RequestInit::new();
-        // The key endpoint never redirects; a redirect is refused.
+        // Workers does not implement redirect mode "error" (constructing such
+        // a Request throws), so use "manual": a redirect is then returned as
+        // a 3xx response, never followed, and refused by the status check.
         init.with_method(Method::Get)
-            .with_redirect(RequestRedirect::Error);
+            .with_redirect(RequestRedirect::Manual);
         let request =
             Request::new_with_init(&self.certs_url, &init).map_err(|_| port("bad key request"))?;
         let mut response = Fetch::Request(request)
             .send()
             .await
             .map_err(|_| port("key fetch failed"))?;
-        if response.status_code() != 200 {
+        if !dto::jwks_status_ok(response.status_code()) {
             return Err(port("key fetch status"));
         }
         // Refuse an oversized body before reading it. Without the header, the
