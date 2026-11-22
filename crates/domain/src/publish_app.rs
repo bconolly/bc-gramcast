@@ -138,6 +138,9 @@ pub enum Outcome {
     Failed(FailReason),
     /// Another run claimed the post first; we did nothing.
     AlreadyClaimed,
+    /// The claim was undone because the token could not be refreshed. The post is
+    /// back exactly as it was: no attempt used, nothing sent to the provider this turn.
+    Released,
     /// Left in Publishing too long. Needs a person; see `flag_if_stuck`.
     FlaggedStuck,
     /// The final state write did not land (the post changed under us, or storage
@@ -249,6 +252,13 @@ fn error_halt(e: PublishError) -> Option<Halt> {
         PublishError::RateLimited { .. } => Some(Halt::RateLimited),
         _ => None,
     }
+}
+
+/// Result of the one retry after a provider `Auth`.
+enum Retried {
+    Done(Result<PublishedRef, PublishError>),
+    /// The forced refresh failed for a reason other than `Auth`.
+    TokenTrouble,
 }
 
 struct Step {
@@ -366,7 +376,10 @@ where
 
         let mut result = self.upload(&p.post, token).await;
         if result == Err(PublishError::Auth) {
-            result = self.retry_after_refresh(&p.post, token).await;
+            match self.retry_after_refresh(&p.post, token).await {
+                Retried::Done(r) => result = r,
+                Retried::TokenTrouble => return self.release(id, &claimed, &p.state).await,
+            }
         }
         let now = (self.clock)();
         let external_id = result.as_ref().ok().map(|r| r.external_id.clone());
@@ -416,21 +429,41 @@ where
     /// force one refresh and try once more. If the provider still refuses, mark the
     /// token so later runs stop at once; a failed mark is ignored because the post is
     /// requeued and the run halts either way. A refresh that fails for any reason but
-    /// `Auth` is a plain `Transient` for this post: nothing was uploaded on this try.
-    async fn retry_after_refresh(
-        &self,
-        post: &QueuedPost,
-        token: &mut StoredToken,
-    ) -> Result<PublishedRef, PublishError> {
+    /// `Auth` is a token problem, not a verdict on this post (see `release`).
+    async fn retry_after_refresh(&self, post: &QueuedPost, token: &mut StoredToken) -> Retried {
         let result = match self.refresh(token).await {
             Ok(()) => self.upload(post, token).await,
             Err(PublishError::Auth) => Err(PublishError::Auth),
-            Err(_) => Err(PublishError::Transient),
+            Err(_) => return Retried::TokenTrouble,
         };
         if result == Err(PublishError::Auth) {
             let _ = self.tokens.mark_needs_reconnect().await;
         }
-        result
+        Retried::Done(result)
+    }
+
+    /// Undoes a claim: writes the pre-claim state back, so no attempt is used and the
+    /// post is exactly as it was. The run halts with `TokenUnavailable`, with no
+    /// reconnect mark, because the owner has nothing to do.
+    async fn release(
+        &self,
+        id: &str,
+        claimed: &PublishState,
+        before: &PublishState,
+    ) -> Result<Step, PortError> {
+        let halt = Some(Halt::TokenUnavailable);
+        let lost = |halt| Step {
+            outcome: Outcome::StateLost { external_id: None },
+            halt,
+        };
+        Ok(match self.repo.transition(id, claimed, before).await {
+            Ok(Cas::Applied) => Step {
+                outcome: Outcome::Released,
+                halt,
+            },
+            Ok(Cas::Conflict) => lost(halt),
+            Err(_) => lost(Some(Halt::Storage)),
+        })
     }
 
     /// Between "claimed" and "provider answered": token, video link, upload.
@@ -778,22 +811,58 @@ mod tests {
     }
 
     #[test]
-    fn auth_then_a_refresh_that_hit_trouble_is_a_retry_and_no_reconnect_mark() {
-        let repo = FakeRepo::with(vec![scheduled("a", NOW - 1)]);
-        let tokens = fresh_store();
+    fn auth_then_a_refresh_that_hit_trouble_releases_the_post_and_halts() {
+        for err in [
+            PublishError::Transient,
+            PublishError::Unknown,
+            PublishError::Rejected,
+            PublishError::RateLimited { retry_at: None },
+        ] {
+            let repo = two_due();
+            let tokens = fresh_store();
+            let refresher = FakeRefresher {
+                result: Err(err),
+                calls: Cell::new(0),
+            };
+            let publisher = FakePublisher::returning(vec![Err(PublishError::Auth)]);
+            let report = run(&repo, &publisher, &tokens, &refresher);
+            assert_eq!(report.outcomes, [("a".to_string(), Outcome::Released)]);
+            assert_eq!(report.halted, Some(Halt::TokenUnavailable), "{err:?}");
+            // Exactly as before the claim: no attempt used, nothing failed.
+            assert_eq!(repo.state("a"), PublishState::new_queued());
+            assert_eq!(repo.state("b"), PublishState::new_queued());
+            assert!(!tokens.reconnect.get());
+        }
+    }
+
+    #[test]
+    fn a_refresh_that_keeps_failing_never_burns_attempts_or_claims_the_next_post() {
+        let repo = two_due();
+        let tokens = FakeTokenStore::default();
+        // Valid for all three runs; only the provider's Auth forces a refresh.
+        *tokens.token.borrow_mut() = Some(token(NOW + 1_000_000, "ya29.SECRET"));
         let refresher = FakeRefresher {
-            result: Err(PublishError::Unknown),
+            result: Err(PublishError::Transient),
             calls: Cell::new(0),
         };
-        let publisher = FakePublisher::returning(vec![Err(PublishError::Auth)]);
-        let report = run(&repo, &publisher, &tokens, &refresher);
-        // Nothing was uploaded, so even an Unknown from the refresher is a plain retry.
-        assert_eq!(
-            report.outcomes[0].1,
-            Outcome::Retrying(FailReason::Transient)
-        );
-        assert!(!tokens.reconnect.get());
-        assert_eq!(publisher.calls.borrow().len(), 1);
+        let publisher = FakePublisher::returning(vec![Err(PublishError::Auth); 3]);
+        let now = Cell::new(NOW);
+        for _ in 0..3 {
+            let report = pollster::block_on(publish_due(
+                &|| now.get(),
+                &repo,
+                &publisher,
+                &tokens,
+                &refresher,
+                &FakeLinks,
+            ))
+            .unwrap();
+            assert_eq!(report.halted, Some(Halt::TokenUnavailable));
+            now.set(now.get() + 10_000);
+        }
+        assert_eq!(repo.state("a"), PublishState::new_queued());
+        assert_eq!(repo.state("b"), PublishState::new_queued());
+        assert_eq!(*publisher.calls.borrow(), ["a", "a", "a"]);
     }
 
     /// The provider is called at most twice in total (the call, and one retry after a
