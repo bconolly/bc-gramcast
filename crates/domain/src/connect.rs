@@ -6,7 +6,7 @@
 //! sees one of the fixed codes in `ConnectError::code`.
 
 use crate::app::PortError;
-use crate::oauth::{self, StateError, StateStore};
+use crate::oauth::{self, StateError, StateStore, YOUTUBE_UPLOAD_SCOPE};
 use crate::token::{StoredToken, TokenStore};
 use std::fmt;
 
@@ -26,6 +26,8 @@ pub struct TokenReply {
     pub refresh_token: Option<String>,
     pub expires_in: Option<i64>,
     pub token_type: Option<String>,
+    /// Space-separated scopes Google says were granted, when it says.
+    pub scope: Option<String>,
     /// The provider's `error` code, only compared with `invalid_grant`.
     pub error: Option<String>,
 }
@@ -46,7 +48,7 @@ pub enum Grant {
     /// First authorisation: Google must hand back a refresh token.
     Code,
     /// Refresh: the reply has no refresh token field, so ours is empty and the
-    /// caller keeps the one it already holds.
+    /// caller keeps the one it already holds. An oversized one is `Malformed`.
     Refresh,
 }
 
@@ -95,17 +97,27 @@ pub fn parse_token_reply(
     {
         return Err(ExchangeError::Malformed);
     }
+    // When Google says what was granted, it must include the upload scope. A reply
+    // with no scope field is accepted.
+    if reply.scope.as_deref().is_some_and(|granted| {
+        !granted
+            .split_whitespace()
+            .any(|s| s == YOUTUBE_UPLOAD_SCOPE)
+    }) {
+        return Err(ExchangeError::Rejected);
+    }
     let expires_in = reply
         .expires_in
         .filter(|n| (1..=MAX_EXPIRES_IN_SECS).contains(n))
         .ok_or(ExchangeError::Malformed)?;
     let refresh = match (grant, reply.refresh_token.as_ref()) {
-        (Grant::Code, r) => bounded(r).ok_or(match r {
-            Some(t) if t.len() > MAX_TOKEN_LEN => ExchangeError::Malformed,
-            _ => ExchangeError::MissingRefreshToken,
-        })?,
-        (Grant::Refresh, None) => "",
-        (Grant::Refresh, r) => bounded(r).unwrap_or(""),
+        (Grant::Code, Some(t)) if t.len() > MAX_TOKEN_LEN => return Err(ExchangeError::Malformed),
+        (Grant::Code, r) => bounded(r).ok_or(ExchangeError::MissingRefreshToken)?,
+        // A refresh reply may leave it out (or send it empty), but not send a huge one.
+        (Grant::Refresh, Some(t)) if t.len() > MAX_TOKEN_LEN => {
+            return Err(ExchangeError::Malformed)
+        }
+        (Grant::Refresh, r) => r.map_or("", String::as_str),
     };
     Ok(StoredToken {
         access_token: access.to_string(),
@@ -206,6 +218,7 @@ mod tests {
             refresh_token: Some("1//SECRET-REFRESH".into()),
             expires_in: Some(3599),
             token_type: Some("Bearer".into()),
+            scope: Some(format!("openid {YOUTUBE_UPLOAD_SCOPE}")),
             error: None,
         }
     }
@@ -306,6 +319,52 @@ mod tests {
     }
 
     #[test]
+    fn a_granted_scope_must_include_youtube_upload() {
+        let with = |scope: Option<&str>| TokenReply {
+            scope: scope.map(str::to_string),
+            ..ok_reply()
+        };
+        for grant in [Grant::Code, Grant::Refresh] {
+            for good in [
+                None,
+                Some(YOUTUBE_UPLOAD_SCOPE),
+                Some("a  b\t  https://www.googleapis.com/auth/youtube.upload"),
+            ] {
+                assert!(parse(&with(good), grant).is_ok(), "{good:?}");
+            }
+            for bad in [
+                "",
+                "openid email",
+                "https://www.googleapis.com/auth/youtube",
+                "https://www.googleapis.com/auth/youtube.upload.evil",
+                "xhttps://www.googleapis.com/auth/youtube.upload",
+            ] {
+                assert_eq!(
+                    parse(&with(Some(bad)), grant),
+                    Err(ExchangeError::Rejected),
+                    "{bad:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_refresh_reply_with_an_oversized_refresh_token_is_malformed() {
+        let huge = Some("r".repeat(MAX_TOKEN_LEN + 1));
+        let r = TokenReply {
+            refresh_token: huge,
+            ..ok_reply()
+        };
+        assert_eq!(parse(&r, Grant::Refresh), Err(ExchangeError::Malformed));
+        // An empty one is the same as none.
+        let empty = TokenReply {
+            refresh_token: Some(String::new()),
+            ..ok_reply()
+        };
+        assert_eq!(parse(&empty, Grant::Refresh).unwrap().refresh_token, "");
+    }
+
+    #[test]
     fn failure_statuses_are_sorted_without_reading_provider_text() {
         let err = |status, error: Option<&str>| TokenReply {
             status,
@@ -313,6 +372,7 @@ mod tests {
             refresh_token: None,
             expires_in: None,
             token_type: None,
+            scope: None,
             error: error.map(str::to_string),
         };
         assert_eq!(

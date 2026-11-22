@@ -135,16 +135,17 @@ mod tests {
     #[test]
     fn base64_decode_is_strict() {
         for bad in [
-            "Zg",        // no padding
-            "Zg=",       // short
-            "Zh==",      // non-zero trailing bits
-            "Zm9=",      // non-zero trailing bits
-            "Zm9v ",     // whitespace
-            "Zm9v\n",    // newline
-            "=Zg=",      // padding inside a group
-            "Z===",      // too much padding
-            "Zg==Zm9v",  // padding before the end
-            "Zm9\u{e9}", // not ASCII
+            "Zg",       // no padding
+            "Zg=",      // short
+            "Zh==",     // non-zero trailing bits
+            "Zm9=",     // non-zero trailing bits
+            "Zm9v ",    // whitespace
+            "Zm9v\n",   // newline
+            "=Zg=",     // padding inside a group
+            "Z===",     // too much padding
+            "Zg==Zm9v", // padding before the end
+            "Zm\u{e9}", // 4 bytes, not ASCII
+            "Zm9*",     // 4 bytes, outside the alphabet
         ] {
             assert_eq!(b64_decode(bad, 64), None, "{bad:?}");
         }

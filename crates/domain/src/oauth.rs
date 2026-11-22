@@ -87,6 +87,23 @@ pub struct OAuthConfig {
     redirect_uri: String,
 }
 
+/// `host` or `host:port`: letters, digits, `.` and `-` in the host (not starting with
+/// `.` or `-`), and at most one `:` followed by 1 to 5 digits.
+fn host_ok(rest: &str) -> bool {
+    let (host, port) = match rest.split_once(':') {
+        Some((host, port)) => (host, Some(port)),
+        None => (rest, None),
+    };
+    let host_ok = !host.is_empty()
+        && !host.starts_with(['.', '-'])
+        && host
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-'));
+    let port_ok =
+        port.is_none_or(|p| (1..=5).contains(&p.len()) && p.bytes().all(|b| b.is_ascii_digit()));
+    host_ok && port_ok
+}
+
 fn is_loopback_http(rest: &str) -> bool {
     let host = rest.split(':').next().unwrap_or("");
     host == "localhost" || host == "127.0.0.1"
@@ -100,12 +117,7 @@ fn checked_base(url: &str) -> Option<&str> {
         Some(rest) => (true, rest),
         None => (false, base.strip_prefix("http://")?),
     };
-    let host_ok = !rest.is_empty()
-        && !rest.starts_with(['.', '-', ':'])
-        && rest
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b':'));
-    (host_ok && (https || is_loopback_http(rest))).then_some(base)
+    (host_ok(rest) && (https || is_loopback_http(rest))).then_some(base)
 }
 
 impl OAuthConfig {
@@ -356,10 +368,17 @@ mod tests {
 
     #[test]
     fn values_are_percent_encoded() {
-        let c = OAuthConfig::new("id with space&x=1", "https://example.com").unwrap_err();
-        assert_eq!(c, ConfigError::ClientId);
-        let url = config().authorization_url("a b&c=d#e");
-        assert!(url.ends_with("&state=a%20b%26c%3Dd%23e"), "{url}");
+        // The port's colon and a state full of special characters must both be encoded.
+        let c = OAuthConfig::new("client-1", "https://example.com:8443").unwrap();
+        let url = c.authorization_url("a b&c=d#e/+%");
+        assert!(
+            url.contains("&redirect_uri=https%3A%2F%2Fexample.com%3A8443%2Fapi%2Fconnect%2Fyoutube%2Fcallback&"),
+            "{url}"
+        );
+        assert!(url.ends_with("&state=a%20b%26c%3Dd%23e%2F%2B%25"), "{url}");
+        // Exactly one query value per parameter: nothing raw leaked into the structure.
+        assert_eq!(url.matches('&').count(), 6, "{url}");
+        assert_eq!(url.matches('#').count(), 0, "{url}");
     }
 
     #[test]
@@ -384,6 +403,12 @@ mod tests {
             "https://exa mple.com",
             "https://example.com//",
             "https://exa\nmple.com",
+            "https://example.com:",
+            "https://a:b:c",
+            "https://example.com:123456",
+            "https://example.com:80a",
+            "https://example.com:8080:9",
+            "https://:8080",
         ] {
             assert_eq!(
                 OAuthConfig::new("c", bad).unwrap_err(),
@@ -414,6 +439,7 @@ mod tests {
         ] {
             assert!(OAuthConfig::new("c", ok).is_ok(), "{ok}");
         }
+        assert!(OAuthConfig::new("c", "https://example.com:8443").is_ok());
         assert!(OAuthConfig::new("c", "http://localhost.evil.com").is_err());
         assert!(OAuthConfig::new("c", "http://127.0.0.1.evil.com").is_err());
     }

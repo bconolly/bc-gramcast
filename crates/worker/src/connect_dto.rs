@@ -62,6 +62,7 @@ struct TokenJson {
     refresh_token: Option<String>,
     expires_in: Option<i64>,
     token_type: Option<String>,
+    scope: Option<String>,
     error: Option<String>,
 }
 
@@ -78,6 +79,7 @@ pub fn reply_from_body(status: u16, body: &str) -> TokenReply {
             refresh_token: j.refresh_token,
             expires_in: j.expires_in,
             token_type: j.token_type,
+            scope: j.scope,
             error: j.error,
         },
         None => TokenReply {
@@ -86,6 +88,7 @@ pub fn reply_from_body(status: u16, body: &str) -> TokenReply {
             refresh_token: None,
             expires_in: None,
             token_type: None,
+            scope: None,
             error: None,
         },
     }
@@ -174,6 +177,7 @@ mod tests {
         assert_eq!(r.refresh_token.as_deref(), Some("R"));
         assert_eq!(r.expires_in, Some(3599));
         assert_eq!(r.token_type.as_deref(), Some("Bearer"));
+        assert_eq!(r.scope.as_deref(), Some("x"));
         let err = reply_from_body(
             400,
             r#"{"error":"invalid_grant","error_description":"Bad Request"}"#,
