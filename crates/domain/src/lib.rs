@@ -13,4 +13,5 @@ pub mod queue;
 pub mod seal;
 pub mod slots;
 pub mod token;
+pub mod upload;
 pub mod youtube;
