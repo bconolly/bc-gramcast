@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { getQueue, type PostJson } from "@/lib/api";
-import { QueueItem, type Mode } from "@/screens/QueueItem";
+import { canChange, QueueItem, type Mode } from "@/screens/QueueItem";
 
 type State =
   | { kind: "loading" }
@@ -8,6 +8,7 @@ type State =
   | { kind: "loaded"; posts: PostJson[] };
 
 const EMPTY_ID = "queue-empty";
+const LIST_ID = "queue-list";
 
 /** Where focus goes once the next render has put the element on the page. */
 function useFocusLater() {
@@ -22,12 +23,18 @@ function useFocusLater() {
   };
 }
 
-/** The row that takes focus when `id` is deleted: the next one, else the previous one. */
-function neighbourEditId(posts: PostJson[], id: string): string {
+/**
+ * Where focus goes when `id` is deleted: the Edit button of the nearest row after it, else
+ * before it, that can still be edited (published and failed rows have no buttons); the list
+ * if rows are left but none can; the empty message if nothing is left.
+ */
+function neighbourFocusId(posts: PostJson[], id: string): string {
   const i = posts.findIndex((p) => p.id === id);
-  const rest = posts.filter((p) => p.id !== id);
-  const next = rest[i] ?? rest[i - 1];
-  return next ? `edit-${next.id}` : EMPTY_ID;
+  const after = posts.slice(i + 1).filter((p) => canChange(p));
+  const before = posts.slice(0, Math.max(i, 0)).filter((p) => canChange(p)).reverse();
+  const next = after[0] ?? before[0];
+  if (next) return `edit-${next.id}`;
+  return posts.length > 1 ? LIST_ID : EMPTY_ID;
 }
 
 export function Queue({ onOpenSlots = () => undefined }: { onOpenSlots?: () => void }) {
@@ -61,7 +68,7 @@ export function Queue({ onOpenSlots = () => undefined }: { onOpenSlots?: () => v
     setActive(mode === "view" ? null : { id, mode });
   }
   function remove(id: string, message = "Post deleted") {
-    focusLater(neighbourEditId(posts, id));
+    focusLater(neighbourFocusId(posts, id));
     update((cur) => cur.filter((p) => p.id !== id));
     setActive(null);
     setNotice(message);
@@ -89,7 +96,7 @@ export function Queue({ onOpenSlots = () => undefined }: { onOpenSlots?: () => v
     );
   } else {
     body = (
-      <ul className="space-y-3">
+      <ul id={LIST_ID} tabIndex={-1} className="space-y-3">
         {posts.map((p) => (
           <QueueItem
             key={p.id}

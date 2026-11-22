@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import { Button } from "@/components/ui/button";
 import { Connections } from "@/screens/Connections";
 import { Queue } from "@/screens/Queue";
+import { ReconnectBanner } from "@/screens/ReconnectBanner";
 import { Slots } from "@/screens/Slots";
 import { Upload } from "@/screens/Upload";
 import { PAYHIP_URL, PROMO_CTA } from "@/lib/brand";
@@ -76,6 +77,7 @@ export function App() {
         </nav>
       </header>
       <main>
+        {screen !== "connections" && <ReconnectBanner key={screen} onOpenConnections={() => go("connections")} />}
         {screen === "queue" && <Queue onOpenSlots={() => go("slots")} />}
         {screen === "upload" && <Upload onQueued={() => go("queue")} onOpenSlots={() => go("slots")} />}
         {screen === "slots" && <Slots />}
