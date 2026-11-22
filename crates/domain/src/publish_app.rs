@@ -917,6 +917,97 @@ mod tests {
     }
 
     #[test]
+    fn time_is_read_fresh_for_each_post() {
+        let clock = Rc::new(Cell::new(NOW));
+        let repo = two_due();
+        let tokens = FakeTokenStore::default();
+        *tokens.token.borrow_mut() = Some(token(NOW + 400, "ya29.OLD"));
+        let refresher = refresher_ok();
+        let publisher = FakePublisher {
+            results: RefCell::new(
+                vec![Err(PublishError::Transient), Err(PublishError::Transient)].into(),
+            ),
+            advance: Some((clock.clone(), 5_000)),
+            ..FakePublisher::default()
+        };
+        let c = clock.clone();
+        pollster::block_on(publish_due(
+            &move || c.get(),
+            &repo,
+            &publisher,
+            &tokens,
+            &refresher,
+            &FakeLinks,
+        ))
+        .unwrap();
+        // Backoff is measured from the moment each post failed, not from the start of the run.
+        let not_before = |id| match repo.state(id) {
+            PublishState::Queued { not_before, .. } => not_before,
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(not_before("a"), NOW + 5_000 + 60);
+        assert_eq!(not_before("b"), NOW + 10_000 + 60);
+        // The token was fine for the first post and had expired by the second.
+        assert_eq!(refresher.calls.get(), 1);
+    }
+
+    #[test]
+    fn a_refresh_without_a_refresh_token_keeps_the_stored_one() {
+        let repo = FakeRepo::with(vec![scheduled("a", 1)]);
+        let tokens = FakeTokenStore::default();
+        *tokens.token.borrow_mut() = Some(token(NOW, "ya29.OLD"));
+        let mut renewed = token(NOW + 7200, "ya29.NEW");
+        renewed.refresh_token = String::new();
+        let refresher = FakeRefresher {
+            result: Ok(renewed),
+            calls: Cell::new(0),
+        };
+        run(
+            &repo,
+            &FakePublisher::returning(vec![ok_ref("y")]),
+            &tokens,
+            &refresher,
+        );
+        let saved = tokens.token.borrow().clone().unwrap();
+        assert_eq!(saved.access_token, "ya29.NEW");
+        assert_eq!(saved.refresh_token, "1//SECRET-REFRESH");
+    }
+
+    #[test]
+    fn a_lost_final_write_still_reports_the_external_id() {
+        let repo = FakeRepo::with(vec![scheduled("a", 1)]);
+        repo.steal_final.set(true);
+        let publisher = FakePublisher::returning(vec![ok_ref("yt9")]);
+        let report = run(&repo, &publisher, &fresh_store(), &refresher_ok());
+        assert_eq!(
+            report.outcomes[0].1,
+            Outcome::StateLost {
+                external_id: Some("yt9".into())
+            }
+        );
+        assert_eq!(report.halted, None);
+    }
+
+    #[test]
+    fn a_storage_error_on_the_final_write_still_reports_the_external_id() {
+        let repo = two_due();
+        repo.fail_final.set(true);
+        let publisher = FakePublisher::returning(vec![ok_ref("yt9")]);
+        let report = run(&repo, &publisher, &fresh_store(), &refresher_ok());
+        assert_eq!(
+            report.outcomes,
+            [(
+                "a".to_string(),
+                Outcome::StateLost {
+                    external_id: Some("yt9".into())
+                }
+            )]
+        );
+        assert_eq!(report.halted, Some(Halt::Storage));
+        assert_eq!(publisher.calls.borrow().len(), 1);
+    }
+
+    #[test]
     fn no_secret_reaches_reports_or_stored_state() {
         let repo = FakeRepo::with(vec![scheduled("a", 1), scheduled("b", 2)]);
         let tokens = fresh_store();
