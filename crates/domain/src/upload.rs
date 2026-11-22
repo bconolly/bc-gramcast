@@ -88,6 +88,8 @@ pub enum Step {
 pub struct Upload {
     total: u64,
     in_flight: Option<Chunk>,
+    /// A chunk request before the current one has been answered or lost.
+    sent_any: bool,
     sent_final: bool,
     queries: u32,
 }
@@ -112,6 +114,7 @@ impl Upload {
         Ok(Upload {
             total,
             in_flight: None,
+            sent_any: false,
             sent_final: false,
             queries: 0,
         })
@@ -128,6 +131,7 @@ impl Upload {
             return Step::Fail(PublishError::Unknown);
         };
         self.sent_final |= chunk.is_last();
+        let earlier_chunk = std::mem::replace(&mut self.sent_any, true);
         match reply.status {
             Some(308) => match confirmed_bytes(reply.range.as_deref(), self.total) {
                 // A 308 means more is needed, so all of it cannot be there; and it
@@ -139,7 +143,10 @@ impl Upload {
             // The reply was lost or the server hiccuped: find out before doing more.
             None | Some(408 | 500..=599) => self.query(budget),
             Some(404 | 410) => self.session_gone(),
-            // The provider refused this request outright, so it created nothing from it.
+            // Refused after an earlier chunk went out: the token may have lapsed mid-upload
+            // or a limit hit, which settles nothing about the video, so it is unknown.
+            Some(400..=499) if earlier_chunk => Step::Fail(PublishError::Unknown),
+            // The very first request was refused outright, so nothing was created.
             Some(s @ 400..=499) => Step::Fail(classify_refusal(reply, s, now)),
             Some(_) => Step::Fail(PublishError::Unknown),
         }
@@ -454,6 +461,35 @@ mod tests {
             }),
             Step::Fail(PublishError::RateLimited { retry_at: Some(60) })
         );
+    }
+
+    #[test]
+    fn a_refusal_after_an_earlier_chunk_went_out_is_unknown() {
+        // Mid-upload refusals (the token may have lapsed, quota may have hit) say nothing
+        // reliable about the video, and a retry would start the whole upload over.
+        for (status, reason) in [
+            (401, ApiReason::Other),
+            (403, ApiReason::Quota),
+            (403, ApiReason::Other),
+            (400, ApiReason::Other),
+            (429, ApiReason::Other),
+        ] {
+            let refusal = Reply {
+                reason,
+                ..Reply::status(status)
+            };
+            let (_, end) = drive(20 * MIB, vec![ok308(8 * MIB), refusal]);
+            assert_eq!(end, Step::Fail(PublishError::Unknown), "{status}");
+        }
+        // The same refusal of the very first chunk is still classified: nothing was sent.
+        let (_, end) = drive(20 * MIB, vec![Reply::status(401)]);
+        assert_eq!(end, Step::Fail(PublishError::Auth));
+        // A lost first reply, settled by a check that resumes, then a refusal: also Unknown.
+        let (_, end) = drive(
+            20 * MIB,
+            vec![Reply::lost(), ok308(8 * MIB), Reply::status(401)],
+        );
+        assert_eq!(end, Step::Fail(PublishError::Unknown));
     }
 
     #[test]

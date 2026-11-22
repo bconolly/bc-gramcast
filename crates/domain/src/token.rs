@@ -4,8 +4,11 @@
 use crate::app::PortError;
 use std::fmt;
 
-/// Refresh this long before the real expiry, so a token never dies mid-upload.
-pub const REFRESH_MARGIN_SECS: i64 = 5 * 60;
+/// Refresh this long before the real expiry, so a token never dies mid-upload: it is more
+/// than the longest a publish can run (`WORST_CASE_PUBLISH_SECS`), with room to spare.
+pub const REFRESH_MARGIN_SECS: i64 = 10 * 60;
+
+const _: () = assert!(REFRESH_MARGIN_SECS > crate::youtube::WORST_CASE_PUBLISH_SECS + 60);
 
 // Do NOT derive or implement Serialize (or Display) for this type: it would let the
 // tokens reach logs or responses. Debug is hand-written to redact them. The storage

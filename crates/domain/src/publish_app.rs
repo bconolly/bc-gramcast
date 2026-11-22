@@ -58,7 +58,8 @@ pub struct PublishedRef {
 /// is carried, so nothing sensitive can travel with the error.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PublishError {
-    /// The token was refused or could not be refreshed.
+    /// The token was refused or could not be refreshed. A publisher returns this only
+    /// for a refusal before any chunk was sent; later refusals are `Unknown`.
     Auth,
     /// `retry_at` (Unix seconds) is the provider's hint, if it gave one.
     RateLimited { retry_at: Option<i64> },
@@ -1183,6 +1184,25 @@ mod tests {
     }
 
     #[test]
+    fn a_token_that_would_expire_during_the_longest_publish_is_refreshed_first() {
+        use crate::youtube::WORST_CASE_PUBLISH_SECS;
+        let refreshed = |expires_in: i64| {
+            let repo = FakeRepo::with(vec![scheduled("a", NOW - 1)]);
+            let tokens = FakeTokenStore::default();
+            *tokens.token.borrow_mut() = Some(token(NOW + expires_in, "ya29.OLD"));
+            let refresher = refresher_ok();
+            let publisher = FakePublisher::returning(vec![ok_ref("y")]);
+            run(&repo, &publisher, &tokens, &refresher);
+            // Whichever token it was, the provider call got one good for the whole run.
+            assert!(publisher.seen.borrow().len() == 1);
+            refresher.calls.get()
+        };
+        assert_eq!(refreshed(WORST_CASE_PUBLISH_SECS + 30), 1);
+        assert_eq!(refreshed(WORST_CASE_PUBLISH_SECS), 1);
+        assert_eq!(refreshed(crate::token::REFRESH_MARGIN_SECS + 1), 0);
+    }
+
+    #[test]
     fn a_fresh_token_is_not_refreshed() {
         let repo = FakeRepo::with(vec![scheduled("a", NOW - 1)]);
         let refresher = refresher_ok();
@@ -1437,7 +1457,7 @@ mod tests {
         let clock = Rc::new(Cell::new(NOW));
         let repo = two_due();
         let tokens = FakeTokenStore::default();
-        *tokens.token.borrow_mut() = Some(token(NOW + 400, "ya29.OLD"));
+        *tokens.token.borrow_mut() = Some(token(NOW + 700, "ya29.OLD"));
         let refresher = refresher_ok();
         let publisher = FakePublisher {
             results: RefCell::new(
@@ -1495,7 +1515,7 @@ mod tests {
         let clock = Rc::new(Cell::new(NOW));
         let repo = two_due();
         let tokens = FakeTokenStore::default();
-        *tokens.token.borrow_mut() = Some(token(NOW + 400, "ya29.OLD"));
+        *tokens.token.borrow_mut() = Some(token(NOW + 700, "ya29.OLD"));
         // Fine at run start; expired by the time post b is reached.
         let refresher = FakeRefresher {
             result: Err(PublishError::Unknown),
