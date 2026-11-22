@@ -28,6 +28,14 @@ export interface QueuePostBody {
   slot_at: number;
 }
 
+/** Everything an edit may change. The id and video are fixed. */
+export interface EditPostBody {
+  title: string;
+  caption: string;
+  platforms: Platform[];
+  slot_at: number;
+}
+
 export interface SubmitInput {
   file: File;
   title: string;
@@ -51,6 +59,15 @@ export const SLOT_TAKEN_MESSAGE = "that slot is already taken";
 /** True for the 409 that means the chosen slot is gone (not "that video is already queued"). */
 export const isSlotTaken = (e: unknown): boolean =>
   e instanceof ApiError && e.status === 409 && e.message === SLOT_TAKEN_MESSAGE;
+
+/** The Worker's fixed 409 text for a post whose slot has arrived, so it can no longer be changed. */
+export const NOT_QUEUED_MESSAGE = "post is no longer queued";
+
+export const isNotQueued = (e: unknown): boolean =>
+  e instanceof ApiError && e.status === 409 && e.message === NOT_QUEUED_MESSAGE;
+
+/** What the owner is told when a post has left the queue under them. */
+export const NOT_QUEUED_NOTICE = "That post is no longer queued, so it was removed from the list.";
 
 const UPLOAD_FAILED = "The video could not be uploaded. Please try again.";
 const MAX_SERVER_MESSAGE = 200;
@@ -76,7 +93,7 @@ async function call(path: string, init?: RequestInit): Promise<Response> {
   return res;
 }
 
-function sendJson(method: "POST" | "PUT", path: string, body: unknown): Promise<Response> {
+function sendJson(method: "POST" | "PUT" | "PATCH", path: string, body: unknown): Promise<Response> {
   return call(path, {
     method,
     headers: { "Content-Type": "application/json" },
@@ -187,4 +204,23 @@ export async function savePattern(pattern: PatternJson): Promise<PatternJson> {
 /** The next free pattern slots, as Unix seconds in ascending order. */
 export async function getNextSlots(count: number): Promise<number[]> {
   return (await readChecked(await call(`/api/slots/next?count=${count}`), isSlots)).slots;
+}
+
+const isPost = (b: unknown): b is PostJson =>
+  isRecord(b) &&
+  typeof b.id === "string" &&
+  typeof b.title === "string" &&
+  Array.isArray(b.platforms) &&
+  Number.isInteger(b.slot_at);
+
+const postPath = (id: string) => `/api/posts/${encodeURIComponent(id)}`;
+
+/** Saves an edit. Resolves to the post as the server stored it. */
+export async function updatePost(id: string, body: EditPostBody): Promise<PostJson> {
+  return readChecked(await sendJson("PATCH", postPath(id), body), isPost);
+}
+
+/** Deletes a queued post and its video. */
+export async function deletePost(id: string): Promise<void> {
+  await call(postPath(id), { method: "DELETE" });
 }

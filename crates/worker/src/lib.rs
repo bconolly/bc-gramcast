@@ -10,7 +10,7 @@ mod entry {
     use crate::adapters::{
         AccessVerifier, D1PostRepository, D1SlotPatternRepository, R2Signer, R2Store,
     };
-    use crate::dto::{self, PatternJson, QueuePostBody, StartUploadBody};
+    use crate::dto::{self, PatchPostBody, PatternJson, QueuePostBody, StartUploadBody};
     use domain::app;
     use domain::auth::{self, AccessConfig, AuthError};
     use worker::*;
@@ -105,7 +105,7 @@ mod entry {
         Response::error(msg, code)
     }
 
-    /// Rejects non-JSON POST and PUT requests (415) before the body is read.
+    /// Rejects non-JSON POST, PUT and PATCH requests (415) before the body is read.
     fn require_json(req: &Request) -> Result<Option<Response>> {
         let header = req.headers().get("Content-Type").ok().flatten();
         if dto::is_json_content_type(header.as_deref()) {
@@ -142,94 +142,148 @@ mod entry {
             return Ok(denied);
         }
         Router::new()
-            .post_async("/api/uploads", |mut req, ctx| async move {
-                if let Some(rejected) = require_json(&req)? {
-                    return Ok(rejected);
-                }
-                let Ok(body) = req.json::<StartUploadBody>().await else {
-                    return Response::error("bad request", 400);
-                };
-                let signer = R2Signer::from_env(&ctx.env, now_secs())?;
-                let id = uuid::Uuid::new_v4().simple().to_string();
-                match app::start_upload(
-                    &signer,
-                    &id,
-                    &body.file_name,
-                    &body.content_type,
-                    body.size_bytes,
-                ) {
-                    Ok(t) => Response::from_json(&serde_json::json!({
-                        "video_key": t.video_key,
-                        "put_url": t.put_url,
-                    })),
-                    Err(e) => app_error(&e),
-                }
-            })
-            .post_async("/api/posts", |mut req, ctx| async move {
-                if let Some(rejected) = require_json(&req)? {
-                    return Ok(rejected);
-                }
-                let Ok(body) = req.json::<QueuePostBody>().await else {
-                    return Response::error("bad request", 400);
-                };
-                let id = uuid::Uuid::new_v4().simple().to_string();
-                let Some(post) = dto::to_domain(id, body) else {
-                    return Response::error("unknown platform", 422);
-                };
-                let repo = D1PostRepository::new(ctx.env.d1("DB")?);
-                let store = R2Store::new(ctx.env.bucket("VIDEOS")?);
-                match app::queue_post(&repo, &store, now_secs(), post.clone()).await {
-                    Ok(()) => Ok(Response::from_json(&dto::to_json(&post))?.with_status(201)),
-                    Err(e) => app_error(&e),
-                }
-            })
-            .get_async("/api/queue", |_req, ctx| async move {
-                let repo = D1PostRepository::new(ctx.env.d1("DB")?);
-                match app::upcoming(&repo, now_secs()).await {
-                    Ok(posts) => {
-                        let out: Vec<_> = posts.iter().map(dto::to_json).collect();
-                        Response::from_json(&out)
-                    }
-                    Err(e) => app_error(&e),
-                }
-            })
-            .get_async("/api/slots/pattern", |_req, ctx| async move {
-                let repo = D1SlotPatternRepository::new(ctx.env.d1("DB")?);
-                match app::get_pattern(&repo).await {
-                    Ok(p) => Response::from_json(&dto::pattern_to_json(&p)),
-                    Err(e) => app_error(&e),
-                }
-            })
-            .put_async("/api/slots/pattern", |mut req, ctx| async move {
-                if let Some(rejected) = require_json(&req)? {
-                    return Ok(rejected);
-                }
-                let Ok(body) = req.json::<PatternJson>().await else {
-                    return Response::error("bad request", 400);
-                };
-                let (offset, rules) = match dto::pattern_from_json(body) {
-                    Ok(parts) => parts,
-                    Err(e) => return app_error(&app::AppError::Slots(e)),
-                };
-                let repo = D1SlotPatternRepository::new(ctx.env.d1("DB")?);
-                match app::set_pattern(&repo, offset, rules).await {
-                    Ok(p) => Response::from_json(&dto::pattern_to_json(&p)),
-                    Err(e) => app_error(&e),
-                }
-            })
-            .get_async("/api/slots/next", |req, ctx| async move {
-                let url = req.url()?;
-                let Some(count) = dto::parse_next_count(url.query()) else {
-                    return Response::error("count must be a whole number from 1 to 20", 422);
-                };
-                let patterns = D1SlotPatternRepository::new(ctx.env.d1("DB")?);
-                let posts = D1PostRepository::new(ctx.env.d1("DB")?);
-                match app::next_slots(&patterns, &posts, now_secs(), count).await {
-                    Ok(slots) => Response::from_json(&serde_json::json!({ "slots": slots })),
-                    Err(e) => app_error(&e),
-                }
-            })
+            .post_async("/api/uploads", start_upload_route)
+            .post_async("/api/posts", queue_post_route)
+            .patch_async("/api/posts/:id", patch_post_route)
+            .delete_async("/api/posts/:id", delete_post_route)
+            .get_async("/api/queue", queue_route)
+            .get_async("/api/slots/pattern", get_pattern_route)
+            .put_async("/api/slots/pattern", put_pattern_route)
+            .get_async("/api/slots/next", next_slots_route)
             .run(req, env)
             .await
+    }
+
+    type Ctx = RouteContext<()>;
+
+    async fn start_upload_route(mut req: Request, ctx: Ctx) -> Result<Response> {
+        if let Some(rejected) = require_json(&req)? {
+            return Ok(rejected);
+        }
+        let Ok(body) = req.json::<StartUploadBody>().await else {
+            return Response::error("bad request", 400);
+        };
+        let signer = R2Signer::from_env(&ctx.env, now_secs())?;
+        let id = uuid::Uuid::new_v4().simple().to_string();
+        match app::start_upload(
+            &signer,
+            &id,
+            &body.file_name,
+            &body.content_type,
+            body.size_bytes,
+        ) {
+            Ok(t) => Response::from_json(&serde_json::json!({
+                "video_key": t.video_key,
+                "put_url": t.put_url,
+            })),
+            Err(e) => app_error(&e),
+        }
+    }
+
+    async fn queue_post_route(mut req: Request, ctx: Ctx) -> Result<Response> {
+        if let Some(rejected) = require_json(&req)? {
+            return Ok(rejected);
+        }
+        let Ok(body) = req.json::<QueuePostBody>().await else {
+            return Response::error("bad request", 400);
+        };
+        let id = uuid::Uuid::new_v4().simple().to_string();
+        let Some(post) = dto::to_domain(id, body) else {
+            return Response::error("unknown platform", 422);
+        };
+        let repo = D1PostRepository::new(ctx.env.d1("DB")?);
+        let store = R2Store::new(ctx.env.bucket("VIDEOS")?);
+        match app::queue_post(&repo, &store, now_secs(), post.clone()).await {
+            Ok(()) => Ok(Response::from_json(&dto::to_json(&post))?.with_status(201)),
+            Err(e) => app_error(&e),
+        }
+    }
+
+    async fn patch_post_route(mut req: Request, ctx: Ctx) -> Result<Response> {
+        if let Some(rejected) = require_json(&req)? {
+            return Ok(rejected);
+        }
+        let Some(id) = ctx.param("id").cloned() else {
+            return Response::error("post not found", 404);
+        };
+        let Ok(body) = req.json::<PatchPostBody>().await else {
+            return Response::error("bad request", 400);
+        };
+        let Some(changes) = dto::to_changes(body) else {
+            return Response::error("unknown platform", 422);
+        };
+        let repo = D1PostRepository::new(ctx.env.d1("DB")?);
+        match app::update_post(&repo, &id, changes, now_secs()).await {
+            Ok(post) => Response::from_json(&dto::to_json(&post)),
+            Err(e) => app_error(&e),
+        }
+    }
+
+    async fn delete_post_route(_req: Request, ctx: Ctx) -> Result<Response> {
+        let Some(id) = ctx.param("id").cloned() else {
+            return Response::error("post not found", 404);
+        };
+        let repo = D1PostRepository::new(ctx.env.d1("DB")?);
+        let store = R2Store::new(ctx.env.bucket("VIDEOS")?);
+        match app::delete_post(&repo, &store, &id, now_secs()).await {
+            Ok(outcome) => {
+                if outcome == app::DeleteOutcome::VideoLeftBehind {
+                    // The id passed the domain's hex check; no key or URL is logged.
+                    console_log!("{}", dto::video_left_behind_line(&id));
+                }
+                Ok(Response::empty()?.with_status(204))
+            }
+            Err(e) => app_error(&e),
+        }
+    }
+
+    async fn queue_route(_req: Request, ctx: Ctx) -> Result<Response> {
+        let repo = D1PostRepository::new(ctx.env.d1("DB")?);
+        match app::upcoming(&repo, now_secs()).await {
+            Ok(posts) => {
+                let out: Vec<_> = posts.iter().map(dto::to_json).collect();
+                Response::from_json(&out)
+            }
+            Err(e) => app_error(&e),
+        }
+    }
+
+    async fn get_pattern_route(_req: Request, ctx: Ctx) -> Result<Response> {
+        let repo = D1SlotPatternRepository::new(ctx.env.d1("DB")?);
+        match app::get_pattern(&repo).await {
+            Ok(p) => Response::from_json(&dto::pattern_to_json(&p)),
+            Err(e) => app_error(&e),
+        }
+    }
+
+    async fn put_pattern_route(mut req: Request, ctx: Ctx) -> Result<Response> {
+        if let Some(rejected) = require_json(&req)? {
+            return Ok(rejected);
+        }
+        let Ok(body) = req.json::<PatternJson>().await else {
+            return Response::error("bad request", 400);
+        };
+        let (offset, rules) = match dto::pattern_from_json(body) {
+            Ok(parts) => parts,
+            Err(e) => return app_error(&app::AppError::Slots(e)),
+        };
+        let repo = D1SlotPatternRepository::new(ctx.env.d1("DB")?);
+        match app::set_pattern(&repo, offset, rules).await {
+            Ok(p) => Response::from_json(&dto::pattern_to_json(&p)),
+            Err(e) => app_error(&e),
+        }
+    }
+
+    async fn next_slots_route(req: Request, ctx: Ctx) -> Result<Response> {
+        let url = req.url()?;
+        let Some(count) = dto::parse_next_count(url.query()) else {
+            return Response::error("count must be a whole number from 1 to 20", 422);
+        };
+        let patterns = D1SlotPatternRepository::new(ctx.env.d1("DB")?);
+        let posts = D1PostRepository::new(ctx.env.d1("DB")?);
+        match app::next_slots(&patterns, &posts, now_secs(), count).await {
+            Ok(slots) => Response::from_json(&serde_json::json!({ "slots": slots })),
+            Err(e) => app_error(&e),
+        }
     }
 }

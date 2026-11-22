@@ -84,6 +84,8 @@ Not verified yet: none of this has run against Cloudflare. The Web Crypto calls 
 ## API
 All endpoints answer only to the owner (see Run locally). Request bodies are JSON.
 - `POST /api/uploads`, `POST /api/posts`, `GET /api/queue`: upload a video and queue it.
+- `PATCH /api/posts/{id}`: edit a queued post. Body: `title`, `caption`, `platforms`, `slot_at` (all required, same rules as queueing; `id` and `video_key` cannot be sent). Answers with the saved post; 404 for an unknown id, 409 if another post holds the slot or the post is no longer queued (its slot has passed).
+- `DELETE /api/posts/{id}`: delete a queued post and its video. Answers 204; 404 for an unknown id; 409 if the post is no longer queued. The post is removed first; if the video cannot be removed the call still succeeds and the Worker logs a fixed line with the post id.
 - `GET /api/slots/pattern`: the weekly posting pattern, for example `{"utc_offset_minutes":600,"rules":[{"weekday":"wed","time":"19:00"}]}`. Before one is saved it is Brisbane (+600) with no rules.
 - `PUT /api/slots/pattern`: save the pattern (same shape; weekday `mon` to `sun`, time 24h `HH:MM`, offset -720 to 840, at most 14 rules). Answers with the normalised pattern.
 - `GET /api/slots/next?count=N`: `{"slots":[<unix seconds>, ...]}`, the next pattern slots not already taken by a queued post. `count` is 1 to 20 and defaults to 5.
@@ -97,6 +99,12 @@ All endpoints answer only to the owner (see Run locally). Request bodies are JSO
 - Static assets are served without the Worker, so Access must cover the whole hostname; the assets contain no data.
 - `next_slots` reads all posts. Later, query only posts with a future `slot_at`.
 - Re-check the object's size and type with `head()` in the publish use case: the 15 minute upload link can still overwrite the object after the post is queued.
-- Delete rejected and orphaned uploads (add an R2 lifecycle rule as a backstop).
+- Delete rejected and orphaned uploads (add an R2 lifecycle rule as a backstop). A video left behind when a post is deleted but the R2 delete fails is one of these.
+- Editing is unrestricted because nothing publishes yet. When publishing lands, block edits and deletes for posts that are publishing or published.
+- Request bodies have no size cap in the Worker yet (a PATCH or POST body is parsed whole). Add a limit, for example by checking `Content-Length`.
+- After a failed edit save, focus is not returned to the form (the Save button is disabled while saving). Opening another post's Edit drops the unsaved changes in the first form without asking.
+- Editing cannot replace the video: delete the post and upload again.
+- The delete and edit adapters (D1 `get`, `update`, `delete`, R2 `delete_object`) are compile-checked only, not run against Cloudflare.
 - Put Cloudflare Access in front of every hostname the Worker answers on (workers.dev, Preview URLs and any custom domain), or set `workers_dev = false` and `preview_urls = false`.
 - Install `worker-build` in CI from a pinned, cached copy instead of building it each run.
+- The "still queued" check in SQL uses the time the request started, so it does not stop an edit or delete that lands just after the slot passes. Close this when publishing lands (for example with a status column in the WHERE clause).

@@ -48,7 +48,7 @@ export function App() {
         </nav>
       </header>
       <main>
-        {screen === "queue" && <Queue />}
+        {screen === "queue" && <Queue onOpenSlots={() => setScreen("slots")} />}
         {screen === "upload" && <Upload onQueued={() => setScreen("queue")} onOpenSlots={() => setScreen("slots")} />}
         {screen === "slots" && <Slots />}
       </main>

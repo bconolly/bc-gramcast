@@ -1,6 +1,6 @@
 //! JSON shapes for the API, and mapping to and from the domain. No logic here.
 
-use domain::app::{AppError, InsertError, PortError};
+use domain::app::{AppError, DeleteError, InsertError, PortError, PostChanges, UpdateError};
 use domain::auth::{self, AuthError, Claims, JwtHeader};
 use domain::media::UploadError;
 use domain::queue::{Platform, QueueError, QueuedPost};
@@ -23,6 +23,38 @@ pub struct QueuePostBody {
     pub caption: String,
     pub platforms: Vec<String>,
     pub slot_at: i64,
+}
+
+/// Body of `PATCH /api/posts/{id}`: every editable field, nothing else. The id
+/// and video are not editable, so naming them is refused like any unknown field.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PatchPostBody {
+    pub title: String,
+    pub caption: String,
+    pub platforms: Vec<String>,
+    pub slot_at: i64,
+}
+
+/// Returns `None` if any platform name is unknown.
+pub fn to_changes(body: PatchPostBody) -> Option<PostChanges> {
+    let platforms = body
+        .platforms
+        .iter()
+        .map(|p| platform_from_str(p))
+        .collect::<Option<Vec<_>>>()?;
+    Some(PostChanges {
+        title: body.title,
+        caption: body.caption,
+        platforms,
+        slot_at: body.slot_at,
+    })
+}
+
+/// Logged when a post was deleted but its video object could not be removed.
+/// `id` must be a validated post id (hex): never pass a key or URL.
+pub fn video_left_behind_line(id: &str) -> String {
+    format!("post deleted; video object not removed: {id}")
 }
 
 #[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -178,6 +210,61 @@ pub fn classify_insert_error(text: &str) -> InsertError {
     }
 }
 
+/// Maps the text of a D1 failure on update. Only the slot UNIQUE violation is
+/// special; anything else stays a port error the API never shows.
+pub fn classify_update_error(text: &str) -> UpdateError {
+    if text.contains("UNIQUE constraint failed: posts.slot_at") {
+        UpdateError::SlotTaken
+    } else {
+        UpdateError::Port(PortError(text.to_string()))
+    }
+}
+
+/// Logged when the read that settles a delete (after D1 gave no change count)
+/// itself fails, so a possibly orphaned video is visible. No id: it may be unknown.
+pub const DELETE_UNCONFIRMED_LINE: &str = "delete could not be confirmed; a video may be orphaned";
+
+/// True when D1 reports at least one row changed by a write.
+pub fn write_applied(changes: Option<usize>) -> bool {
+    changes.is_some_and(|n| n > 0)
+}
+
+/// Settles an update that did not report a change. `row_slot` is the stored
+/// `slot_at` read back afterwards (`None`: no such row). The SQL only touches rows
+/// whose slot is after `now`, so a row at or before it was refused, not updated.
+pub fn update_after_miss(
+    changes: Option<usize>,
+    row_slot: Option<i64>,
+    now: i64,
+) -> Result<(), UpdateError> {
+    match (changes, row_slot) {
+        (_, None) => Err(UpdateError::NotFound),
+        (_, Some(slot)) if slot <= now => Err(UpdateError::NotQueued),
+        // No count, and the row now holds a future slot: our update landed.
+        (None, Some(_)) => Ok(()),
+        // A count of 0 with a queued row should be impossible: do not claim success.
+        (Some(_), Some(_)) => Err(UpdateError::Port(PortError(
+            "update changed no rows".into(),
+        ))),
+    }
+}
+
+/// Settles a delete that did not report a change, like `update_after_miss`.
+pub fn delete_after_miss(
+    changes: Option<usize>,
+    row_slot: Option<i64>,
+    now: i64,
+) -> Result<(), DeleteError> {
+    match (changes, row_slot) {
+        (None, None) => Ok(()),
+        (Some(_), None) => Err(DeleteError::NotFound),
+        (_, Some(slot)) if slot <= now => Err(DeleteError::NotQueued),
+        (_, Some(_)) => Err(DeleteError::Port(PortError(
+            "delete removed no rows".into(),
+        ))),
+    }
+}
+
 /// CSRF guard: a cross-site form cannot send `application/json`, so POSTs must.
 pub fn is_json_content_type(header: Option<&str>) -> bool {
     let Some(value) = header else {
@@ -191,6 +278,8 @@ pub fn is_json_content_type(header: Option<&str>) -> bool {
 /// client-sent values, and port errors never leak their detail.
 pub fn error_status(e: &AppError) -> (u16, &'static str) {
     match e {
+        AppError::NotFound => (404, "post not found"),
+        AppError::NotQueued => (409, "post is no longer queued"),
         AppError::VideoNotUploaded => (422, "video has not been uploaded"),
         AppError::Upload(u) => (
             422,
@@ -485,6 +574,156 @@ mod tests {
             r#"{"file_name":"a.mp4","content_type":"video/mp4","size_bytes":1,"admin":true}"#,
         );
         assert!(r.is_err());
+    }
+
+    fn patch_json() -> &'static str {
+        r#"{"title":"T2","caption":"C2","platforms":["youtube"],"slot_at":500}"#
+    }
+
+    #[test]
+    fn parses_a_patch_body_into_domain_changes() {
+        let b: PatchPostBody = serde_json::from_str(patch_json()).unwrap();
+        let c = to_changes(b).unwrap();
+        assert_eq!(c.title, "T2");
+        assert_eq!(c.platforms, [Platform::YouTube]);
+        assert_eq!(c.slot_at, 500);
+    }
+
+    #[test]
+    fn a_patch_body_cannot_name_the_immutable_fields_or_extras() {
+        for extra in ["video_key", "id", "admin"] {
+            let text = patch_json().replace('}', &format!(r#","{extra}":"x"}}"#));
+            assert!(
+                serde_json::from_str::<PatchPostBody>(&text).is_err(),
+                "{extra}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_patch_body_must_have_every_editable_field() {
+        let r = serde_json::from_str::<PatchPostBody>(r#"{"title":"T"}"#);
+        assert!(r.is_err());
+    }
+
+    #[test]
+    fn a_patch_with_an_unknown_platform_is_rejected() {
+        let mut b: PatchPostBody = serde_json::from_str(patch_json()).unwrap();
+        b.platforms = vec!["tiktok".into()];
+        assert!(to_changes(b).is_none());
+    }
+
+    #[test]
+    fn classifies_update_errors_by_the_unique_slot_message() {
+        assert_eq!(
+            classify_update_error("UNIQUE constraint failed: posts.slot_at | D1_ERROR"),
+            UpdateError::SlotTaken
+        );
+        let other = classify_update_error("secret detail");
+        assert_eq!(other, UpdateError::Port(PortError("secret detail".into())));
+    }
+
+    #[test]
+    fn the_leftover_video_log_line_names_only_the_post_id() {
+        let id = "0123456789abcdef0123456789abcdef";
+        assert_eq!(
+            video_left_behind_line(id),
+            "post deleted; video object not removed: 0123456789abcdef0123456789abcdef"
+        );
+    }
+
+    #[test]
+    fn a_post_no_longer_queued_is_a_fixed_409() {
+        assert_eq!(
+            error_status(&AppError::NotQueued),
+            (409, "post is no longer queued")
+        );
+    }
+
+    const NOW: i64 = 1_000;
+
+    #[test]
+    fn a_write_with_rows_changed_is_applied() {
+        assert!(write_applied(Some(1)));
+        assert!(!write_applied(Some(0)));
+        assert!(!write_applied(None));
+    }
+
+    #[test]
+    fn update_after_no_change_reads_the_row_to_decide() {
+        // Row gone: NotFound. Row there with a passed slot: NotQueued.
+        assert_eq!(
+            update_after_miss(Some(0), None, NOW),
+            Err(UpdateError::NotFound)
+        );
+        assert_eq!(
+            update_after_miss(Some(0), Some(NOW), NOW),
+            Err(UpdateError::NotQueued)
+        );
+        assert_eq!(
+            update_after_miss(Some(0), Some(NOW - 1), NOW),
+            Err(UpdateError::NotQueued)
+        );
+        // 0 changes yet a queued row cannot happen: do not claim success.
+        assert!(matches!(
+            update_after_miss(Some(0), Some(NOW + 1), NOW),
+            Err(UpdateError::Port(_))
+        ));
+    }
+
+    #[test]
+    fn update_without_a_change_count_trusts_the_reread_row() {
+        assert_eq!(update_after_miss(None, Some(NOW + 1), NOW), Ok(()));
+        assert_eq!(
+            update_after_miss(None, Some(NOW), NOW),
+            Err(UpdateError::NotQueued)
+        );
+        assert_eq!(
+            update_after_miss(None, None, NOW),
+            Err(UpdateError::NotFound)
+        );
+    }
+
+    #[test]
+    fn delete_after_no_change_reads_the_row_to_decide() {
+        assert_eq!(
+            delete_after_miss(Some(0), None, NOW),
+            Err(DeleteError::NotFound)
+        );
+        assert_eq!(
+            delete_after_miss(Some(0), Some(NOW), NOW),
+            Err(DeleteError::NotQueued)
+        );
+        assert!(matches!(
+            delete_after_miss(Some(0), Some(NOW + 1), NOW),
+            Err(DeleteError::Port(_))
+        ));
+    }
+
+    #[test]
+    fn delete_without_a_change_count_trusts_the_reread_row() {
+        assert_eq!(delete_after_miss(None, None, NOW), Ok(()));
+        assert_eq!(
+            delete_after_miss(None, Some(NOW), NOW),
+            Err(DeleteError::NotQueued)
+        );
+        assert!(matches!(
+            delete_after_miss(None, Some(NOW + 1), NOW),
+            Err(DeleteError::Port(_))
+        ));
+    }
+
+    #[test]
+    fn the_unconfirmed_delete_log_line_is_fixed() {
+        assert_eq!(
+            DELETE_UNCONFIRMED_LINE,
+            "delete could not be confirmed; a video may be orphaned"
+        );
+    }
+
+    #[test]
+    fn a_missing_post_is_a_fixed_404() {
+        assert_eq!(error_status(&AppError::NotFound), (404, "post not found"));
     }
 
     #[test]

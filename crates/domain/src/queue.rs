@@ -47,20 +47,50 @@ pub enum QueueError {
     SlotOutOfRange,
 }
 
-/// Checks a new slot is a sensible future time. Applies to new posts only, so
+/// Checks a new slot is a sensible future time (strictly after `now`). Applies to new posts only, so
 /// stored posts whose slot has since passed still load.
 pub fn validate_slot(slot_at: i64, now: i64) -> Result<(), QueueError> {
     if !(0..=MAX_SLOT_SECS).contains(&slot_at) {
         return Err(QueueError::SlotOutOfRange);
     }
-    if slot_at < now {
+    if slot_at <= now {
         return Err(QueueError::SlotInPast);
     }
     Ok(())
 }
 
+/// The rules for the editable fields of a post, shared by new and edited posts.
+pub fn validate_fields(
+    title: &str,
+    caption: &str,
+    platforms: &[Platform],
+) -> Result<(), QueueError> {
+    if platforms.is_empty() {
+        return Err(QueueError::NoPlatforms);
+    }
+    let mut seen = Vec::new();
+    for p in platforms {
+        if seen.contains(p) {
+            return Err(QueueError::DuplicatePlatform);
+        }
+        seen.push(*p);
+    }
+    if title.trim().is_empty() {
+        return Err(QueueError::EmptyTitle);
+    }
+    if title.chars().count() > MAX_TITLE_CHARS || caption.chars().count() > MAX_CAPTION_CHARS {
+        return Err(QueueError::TooLong);
+    }
+    Ok(())
+}
+
+/// A post id as the Worker makes it: a UUID in simple form, exactly 32 lowercase hex characters. Checked before an id from a URL reaches storage.
+pub fn is_post_id(id: &str) -> bool {
+    id.len() == 32 && id.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+}
+
 /// Exactly `videos/` + 1 to 64 of `[A-Za-z0-9_-]` + `.mp4`.
-fn is_valid_video_key(key: &str) -> bool {
+pub fn is_valid_video_key(key: &str) -> bool {
     let Some(name) = key
         .strip_prefix("videos/")
         .and_then(|rest| rest.strip_suffix(".mp4"))
@@ -71,6 +101,11 @@ fn is_valid_video_key(key: &str) -> bool {
 }
 
 impl QueuedPost {
+    /// The one rule for "still queued": the slot is strictly after `now`.
+    pub fn is_queued(&self, now: i64) -> bool {
+        self.slot_at > now
+    }
+
     pub fn status(&self) -> PostStatus {
         if self.caption.trim().is_empty() {
             PostStatus::NeedsCaption
@@ -93,24 +128,7 @@ impl Queue {
     }
 
     pub fn add(&mut self, post: QueuedPost) -> Result<(), QueueError> {
-        if post.platforms.is_empty() {
-            return Err(QueueError::NoPlatforms);
-        }
-        let mut seen = Vec::new();
-        for p in &post.platforms {
-            if seen.contains(p) {
-                return Err(QueueError::DuplicatePlatform);
-            }
-            seen.push(*p);
-        }
-        if post.title.trim().is_empty() {
-            return Err(QueueError::EmptyTitle);
-        }
-        if post.title.chars().count() > MAX_TITLE_CHARS
-            || post.caption.chars().count() > MAX_CAPTION_CHARS
-        {
-            return Err(QueueError::TooLong);
-        }
+        validate_fields(&post.title, &post.caption, &post.platforms)?;
         if !is_valid_video_key(&post.video_key) {
             return Err(QueueError::BadVideoKey);
         }
@@ -128,7 +146,7 @@ impl Queue {
 
     /// Posts in slot order, earliest first.
     pub fn upcoming(&self, now: i64) -> Vec<&QueuedPost> {
-        let mut out: Vec<&QueuedPost> = self.posts.iter().filter(|p| p.slot_at >= now).collect();
+        let mut out: Vec<&QueuedPost> = self.posts.iter().filter(|p| p.is_queued(now)).collect();
         out.sort_by_key(|p| p.slot_at);
         out
     }
@@ -147,6 +165,60 @@ mod tests {
             platforms: vec![Platform::Instagram, Platform::YouTube],
             slot_at,
         }
+    }
+
+    #[test]
+    fn post_ids_are_the_hex_the_generator_makes() {
+        assert!(is_post_id("0123456789abcdef0123456789abcdef"));
+        let long = "a".repeat(33);
+        let upper = "A".repeat(32);
+        let short = "a".repeat(31);
+        let odd = format!("{}'", "a".repeat(31));
+        for bad in [
+            "",
+            "a",
+            &short,
+            &long,
+            &upper,
+            &odd,
+            "g".repeat(32).as_str(),
+        ] {
+            assert!(!is_post_id(bad), "{bad}");
+        }
+    }
+
+    #[test]
+    fn validate_fields_is_the_shared_rule_set() {
+        use Platform::*;
+        assert_eq!(validate_fields("T", "", &[Instagram]), Ok(()));
+        assert_eq!(validate_fields("T", "", &[]), Err(QueueError::NoPlatforms));
+        assert_eq!(
+            validate_fields("T", "", &[YouTube, YouTube]),
+            Err(QueueError::DuplicatePlatform)
+        );
+        assert_eq!(
+            validate_fields(" ", "", &[YouTube]),
+            Err(QueueError::EmptyTitle)
+        );
+        assert_eq!(
+            validate_fields(&"x".repeat(101), "", &[YouTube]),
+            Err(QueueError::TooLong)
+        );
+    }
+
+    #[test]
+    fn a_post_is_queued_only_while_its_slot_is_after_now() {
+        let p = post("a", 100);
+        assert!(p.is_queued(99));
+        assert!(!p.is_queued(100));
+        assert!(!p.is_queued(101));
+    }
+
+    #[test]
+    fn upcoming_excludes_a_post_whose_slot_is_exactly_now() {
+        let q = Queue::from_stored(vec![post("edge", 100), post("later", 101)]);
+        let ids: Vec<&str> = q.upcoming(100).iter().map(|p| p.id.as_str()).collect();
+        assert_eq!(ids, ["later"]);
     }
 
     #[test]
@@ -256,7 +328,8 @@ mod tests {
             Err(QueueError::SlotOutOfRange)
         );
         assert_eq!(validate_slot(99, 100), Err(QueueError::SlotInPast));
-        assert_eq!(validate_slot(100, 100), Ok(()));
+        assert_eq!(validate_slot(100, 100), Err(QueueError::SlotInPast));
+        assert_eq!(validate_slot(101, 100), Ok(()));
         assert_eq!(validate_slot(MAX_SLOT_SECS, 100), Ok(()));
     }
 
