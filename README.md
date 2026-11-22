@@ -81,6 +81,30 @@ Sources: [Validate JWTs](https://developers.cloudflare.com/cloudflare-one/access
 
 Not verified yet: none of this has run against Cloudflare. The Web Crypto calls (`importKey` with a JWK, `verify` with RSASSA-PKCS1-v1_5 and SHA-256) were checked in Node 22 only, not in the Workers runtime. The real token's claims (for example whether `email` is present for your login method, and what a service token looks like) and the live key endpoint's response have not been seen. How to supply the vars at deploy time (the `--var` flag above, and whether a value set in the dashboard survives a deploy that carries empty ones) is from memory of wrangler, not checked. The 503 "sign-in not configured yet" answer is the safe state until the setup above is done.
 
+## Connect YouTube
+The owner connects their YouTube account once; the Worker keeps the token encrypted in D1. Nothing publishes yet.
+
+Secrets (set with `wrangler secret put <NAME>`, never commit them):
+
+| Secret | What it is |
+| --- | --- |
+| `YOUTUBE_CLIENT_ID` | The OAuth client id from your Google Cloud project. |
+| `YOUTUBE_CLIENT_SECRET` | That client's secret. |
+| `TOKEN_ENC_KEY` | Encrypts the stored token. Standard base64 of exactly 32 random bytes. Generate it with `openssl rand -base64 32`, then `wrangler secret put TOKEN_ENC_KEY`. Keep a copy: if it is lost or changed, the stored token cannot be read and you reconnect. |
+
+`PUBLIC_BASE_URL` (a var in `wrangler.toml`, default `https://gramcast.gramcast.workers.dev`) is the app's public address. The redirect URI is that plus `/api/connect/youtube/callback`. Register exactly that URI as an authorised redirect URI on the Google OAuth client.
+
+Steps:
+1. Apply the migration (`wrangler d1 migrations apply gramcast`), which adds `oauth_state` and `oauth_tokens`.
+2. Set the three secrets and register the redirect URI with Google.
+3. Open the app, go to Connections (`/settings`), press Connect YouTube, and allow access on Google's page. You come back to Connections showing Connected.
+
+How it works: `GET /api/connect/youtube/start` makes a single-use random state (valid 10 minutes), stores it and sends you to Google asking only for the `youtube.upload` scope, with `access_type=offline` and `prompt=consent` so Google returns a refresh token. `GET /api/connect/youtube/callback` checks and uses up the state, trades the code for tokens, encrypts them (AES-256-GCM, a fresh random nonce per write, the provider name as authenticated data) and redirects to `/settings?connected=1`, or `/settings?connect_error=<code>` where the code is one of `access_denied`, `bad_state`, `exchange_failed`, `server_error`. `GET /api/connect/status` returns only `{"youtube":{"connected":bool,"needs_reconnect":bool}}`. No route returns a token, and nothing logs a code, token, state or URL.
+
+Both connect routes are GET navigations behind the same owner sign-in as the rest of the API. The Origin check covers only POST, PUT, PATCH and DELETE, and the callback comes from Google, so what protects it is the single-use state. There is no PKCE (support for this flow was not confirmed).
+
+Not verified: none of this has run against Google or Cloudflare. The D1 statements were run against SQLite and the Web Crypto call shapes against Node, not in the Workers runtime or D1. Whether the Access cookie is sent on the redirect back from Google, and the exact fields in Google's token reply, are untested here. The granted scope in the reply is not checked.
+
 ## API
 All endpoints answer only to the owner (see Run locally). Request bodies are JSON.
 - `POST /api/uploads`, `POST /api/posts`, `GET /api/queue`: upload a video and queue it.
@@ -88,6 +112,7 @@ All endpoints answer only to the owner (see Run locally). Request bodies are JSO
 - `DELETE /api/posts/{id}`: delete a queued post and its video. Answers 204; 404 for an unknown id; 409 if the post is no longer queued. The post is removed first; if the video cannot be removed the call still succeeds and the Worker logs a fixed line with the post id.
 - `GET /api/slots/pattern`: the weekly posting pattern, for example `{"utc_offset_minutes":600,"rules":[{"weekday":"wed","time":"19:00"}]}`. Before one is saved it is Brisbane (+600) with no rules.
 - `PUT /api/slots/pattern`: save the pattern (same shape; weekday `mon` to `sun`, time 24h `HH:MM`, offset -720 to 840, at most 14 rules). Answers with the normalised pattern.
+- `GET /api/connect/status`, `GET /api/connect/youtube/start`, `GET /api/connect/youtube/callback`: see Connect YouTube above.
 - `GET /api/slots/next?count=N`: `{"slots":[<unix seconds>, ...]}`, the next pattern slots not already taken by a queued post. `count` is 1 to 20 and defaults to 5.
 
 ## Known gaps for later slices
