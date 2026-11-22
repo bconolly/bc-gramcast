@@ -300,6 +300,16 @@ pub fn check_origin(
         || (is_loopback_host(Some(host)) && origin.eq_ignore_ascii_case(&format!("http://{host}")))
 }
 
+/// Guard for the owner's own navigation to `/api/connect/youtube/start`. A browser
+/// says where the request came from in `Sec-Fetch-Site`; when it is there it must be
+/// `same-origin` (a link in the app) or `none` (typed address, bookmark). A page on
+/// another site cannot start the flow for the owner. Without the header (not a
+/// browser that sends it) the request passes: the owner check still applies.
+pub fn check_navigation(sec_fetch_site: Option<&str>) -> bool {
+    sec_fetch_site
+        .is_none_or(|v| v.eq_ignore_ascii_case("same-origin") || v.eq_ignore_ascii_case("none"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -850,5 +860,16 @@ mod tests {
             assert!(!accept_jwk("RSA", None, "k", &n, bad), "{bad:?}");
         }
         assert!(accept_jwk("RSA", None, "k", &n, &[1; 8]));
+    }
+
+    #[test]
+    fn navigation_must_be_same_origin_or_typed() {
+        assert!(check_navigation(None));
+        assert!(check_navigation(Some("same-origin")));
+        assert!(check_navigation(Some("none")));
+        assert!(check_navigation(Some("SAME-ORIGIN")));
+        for bad in ["cross-site", "same-site", "", "other", " none"] {
+            assert!(!check_navigation(Some(bad)), "{bad:?}");
+        }
     }
 }

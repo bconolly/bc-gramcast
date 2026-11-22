@@ -1,10 +1,15 @@
 //! Gramcast domain. Pure Rust, no I/O, so it tests natively.
 pub mod app;
 pub mod auth;
+pub mod codec;
+pub mod connect;
+pub mod connection;
 pub mod keycache;
 pub mod media;
+pub mod oauth;
 pub mod publish;
 pub mod publish_app;
 pub mod queue;
+pub mod seal;
 pub mod slots;
 pub mod token;

@@ -224,3 +224,18 @@ export async function updatePost(id: string, body: EditPostBody): Promise<PostJs
 export async function deletePost(id: string): Promise<void> {
   await call(postPath(id), { method: "DELETE" });
 }
+
+export interface ConnectStatus {
+  youtube: { connected: boolean; needs_reconnect: boolean };
+}
+
+const isConnectStatus = (b: unknown): b is ConnectStatus =>
+  isRecord(b) &&
+  isRecord(b.youtube) &&
+  typeof b.youtube.connected === "boolean" &&
+  typeof b.youtube.needs_reconnect === "boolean";
+
+/** Whether YouTube is connected. The Worker never sends a token, only these two flags. */
+export async function getConnectStatus(): Promise<ConnectStatus> {
+  return readChecked(await call("/api/connect/status"), isConnectStatus);
+}

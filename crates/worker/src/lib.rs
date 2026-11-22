@@ -1,9 +1,14 @@
 //! Cloudflare Worker: validates and maps HTTP to the domain use cases.
 
+pub mod connect_dto;
 pub mod dto;
 
 #[cfg(target_arch = "wasm32")]
 mod adapters;
+#[cfg(target_arch = "wasm32")]
+mod connect_routes;
+#[cfg(target_arch = "wasm32")]
+mod oauth_adapters;
 
 #[cfg(target_arch = "wasm32")]
 mod entry {
@@ -150,6 +155,12 @@ mod entry {
             .get_async("/api/slots/pattern", get_pattern_route)
             .put_async("/api/slots/pattern", put_pattern_route)
             .get_async("/api/slots/next", next_slots_route)
+            .get_async("/api/connect/youtube/start", crate::connect_routes::start)
+            .get_async(
+                "/api/connect/youtube/callback",
+                crate::connect_routes::callback,
+            )
+            .get_async("/api/connect/status", crate::connect_routes::status)
             .run(req, env)
             .await
     }

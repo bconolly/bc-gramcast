@@ -32,7 +32,7 @@ struct PostRow {
 }
 
 /// Rows changed by a write, from D1's result metadata, if it reports them.
-fn changes(result: &worker::D1Result) -> Result<Option<usize>, PortError> {
+pub(crate) fn changes(result: &worker::D1Result) -> Result<Option<usize>, PortError> {
     let meta = result.meta().map_err(port_err)?;
     Ok(meta.and_then(|m| m.changes))
 }
@@ -337,7 +337,7 @@ thread_local! {
     static KEYS: RefCell<KeyCache<JsValue>> = const { RefCell::new(KeyCache::new_const()) };
 }
 
-fn now_secs() -> i64 {
+pub(crate) fn now_secs() -> i64 {
     (worker::Date::now().as_millis() / 1000) as i64
 }
 
@@ -478,7 +478,7 @@ fn unavailable(text: &str) -> VerifyError {
     VerifyError::Unavailable(port(text))
 }
 
-fn object(fields: &[(&str, JsValue)]) -> Result<Object, JsValue> {
+pub(crate) fn object(fields: &[(&str, JsValue)]) -> Result<Object, JsValue> {
     let o = Object::new();
     for (k, v) in fields {
         Reflect::set(&o, &JsValue::from_str(k), v)?;
@@ -486,13 +486,17 @@ fn object(fields: &[(&str, JsValue)]) -> Result<Object, JsValue> {
     Ok(o)
 }
 
-fn subtle() -> Result<JsValue, JsValue> {
+pub(crate) fn subtle() -> Result<JsValue, JsValue> {
     let crypto = Reflect::get(&js_sys::global(), &JsValue::from_str("crypto"))?;
     Reflect::get(&crypto, &JsValue::from_str("subtle"))
 }
 
 /// Calls `crypto.subtle[method](...args)` and awaits the promise.
-async fn call(subtle: &JsValue, method: &str, args: &[JsValue]) -> Result<JsValue, JsValue> {
+pub(crate) async fn call(
+    subtle: &JsValue,
+    method: &str,
+    args: &[JsValue],
+) -> Result<JsValue, JsValue> {
     let f: Function = Reflect::get(subtle, &JsValue::from_str(method))?.dyn_into()?;
     let list = Array::new();
     for a in args {

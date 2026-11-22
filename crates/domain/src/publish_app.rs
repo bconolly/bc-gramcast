@@ -1477,6 +1477,9 @@ mod tests {
             async fn needs_reconnect(&self) -> Result<bool, PortError> {
                 self.0.needs_reconnect().await
             }
+            async fn connection_mark(&self) -> Result<Option<bool>, PortError> {
+                self.0.connection_mark().await
+            }
         }
         let inner = FakeTokenStore::default();
         *inner.token.borrow_mut() = Some(token(NOW, "ya29.OLD"));

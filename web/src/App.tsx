@@ -1,23 +1,51 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { Button } from "@/components/ui/button";
+import { Connections } from "@/screens/Connections";
 import { Queue } from "@/screens/Queue";
 import { Slots } from "@/screens/Slots";
 import { Upload } from "@/screens/Upload";
 import { PAYHIP_URL, PROMO_CTA } from "@/lib/brand";
+import { readConnectResult, type ConnectResult } from "@/lib/connect";
 
-type Screen = "queue" | "upload" | "slots";
+type Screen = "queue" | "upload" | "slots" | "connections";
+
+// There is no router: /settings is the Connections screen, anything else starts on the queue.
+const SETTINGS_PATH = "/settings";
+const pathFor = (screen: Screen) => (screen === "connections" ? SETTINGS_PATH : "/");
 
 const NAV: { id: Screen; label: string }[] = [
   { id: "queue", label: "Queue" },
   { id: "upload", label: "Upload" },
   { id: "slots", label: "Slots" },
+  { id: "connections", label: "Connections" },
 ];
 
+function keepAddress(path: string) {
+  try {
+    window.history.replaceState(null, "", path);
+  } catch {
+    // The address is a convenience; the screen works without it.
+  }
+}
+
 export function App() {
-  const [screen, setScreen] = useState<Screen>("queue");
+  const [screen, setScreen] = useState<Screen>(() =>
+    window.location.pathname === SETTINGS_PATH ? "connections" : "queue",
+  );
+  // Read once: the Worker's redirect puts the result in the query string, which is then dropped.
+  const [connectResult, setConnectResult] = useState<ConnectResult>(() => readConnectResult(window.location.search));
+  useEffect(() => {
+    if (window.location.search !== "") keepAddress(window.location.pathname);
+  }, []);
+  const go = (next: Screen) => {
+    // The result belongs to the visit the redirect brought the owner to.
+    if (next !== "connections") setConnectResult({ connected: false, errorMessage: null });
+    setScreen(next);
+    keepAddress(pathFor(next));
+  };
   return (
     <div className="mx-auto min-h-screen max-w-2xl px-4 py-6">
-      <header className="mb-6 flex items-center justify-between gap-4">
+      <header className="mb-6 flex flex-wrap items-center justify-between gap-x-4 gap-y-2">
         <div>
           <h1 className="text-xl leading-tight font-semibold">Gramcast</h1>
           <a
@@ -33,14 +61,14 @@ export function App() {
             </span>
           </a>
         </div>
-        <nav className="flex gap-1" aria-label="Screens">
+        <nav className="flex flex-wrap gap-1" aria-label="Screens">
           {NAV.map((item) => (
             <Button
               key={item.id}
               variant={screen === item.id ? "default" : "ghost"}
               className="min-h-11"
               aria-current={screen === item.id ? "page" : undefined}
-              onClick={() => setScreen(item.id)}
+              onClick={() => go(item.id)}
             >
               {item.label}
             </Button>
@@ -48,9 +76,10 @@ export function App() {
         </nav>
       </header>
       <main>
-        {screen === "queue" && <Queue onOpenSlots={() => setScreen("slots")} />}
-        {screen === "upload" && <Upload onQueued={() => setScreen("queue")} onOpenSlots={() => setScreen("slots")} />}
+        {screen === "queue" && <Queue onOpenSlots={() => go("slots")} />}
+        {screen === "upload" && <Upload onQueued={() => go("queue")} onOpenSlots={() => go("slots")} />}
         {screen === "slots" && <Slots />}
+        {screen === "connections" && <Connections result={connectResult} />}
       </main>
       <footer className="border-border mt-10 border-t pt-4">
         <div className="border-border bg-card flex items-center gap-3 rounded-xl border p-3">
