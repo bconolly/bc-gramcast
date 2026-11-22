@@ -4,6 +4,16 @@ use crate::media::is_safe_id;
 
 /// YouTube title limit. Confirm against YouTube's current docs before release.
 pub const MAX_TITLE_CHARS: usize = 100;
+/// A post cannot be edited or deleted this close to its slot (or once the slot has
+/// passed): the publisher claims on its own clock and an edit must not race with it.
+pub const EDIT_LOCK_SECS: i64 = 120;
+
+/// The first slot time an edit or delete may still touch: only posts whose slot is
+/// strictly after this are changeable.
+pub fn edit_cutoff(now: i64) -> i64 {
+    now.saturating_add(EDIT_LOCK_SECS)
+}
+
 /// YouTube description limit, in BYTES (not characters). Neither the title nor the
 /// description may contain `<` or `>`.
 pub const MAX_YOUTUBE_DESCRIPTION_BYTES: usize = 5_000;
@@ -123,6 +133,11 @@ impl QueuedPost {
         self.slot_at > now
     }
 
+    /// Whether it can still be edited or deleted: the slot is after `now + EDIT_LOCK_SECS`.
+    pub fn is_editable(&self, now: i64) -> bool {
+        self.slot_at > edit_cutoff(now)
+    }
+
     pub fn status(&self) -> PostStatus {
         if self.caption.trim().is_empty() {
             PostStatus::NeedsCaption
@@ -202,6 +217,19 @@ mod tests {
         ] {
             assert!(!is_post_id(bad), "{bad}");
         }
+    }
+
+    #[test]
+    fn a_post_is_editable_only_outside_the_lock_window() {
+        let p = post("a", 10_000);
+        assert_eq!(EDIT_LOCK_SECS, 120);
+        assert!(p.is_editable(10_000 - EDIT_LOCK_SECS - 1));
+        assert!(!p.is_editable(10_000 - EDIT_LOCK_SECS));
+        assert!(!p.is_editable(10_000 - 1));
+        assert!(!p.is_editable(10_000));
+        assert!(!p.is_editable(i64::MAX));
+        assert_eq!(edit_cutoff(5), 5 + EDIT_LOCK_SECS);
+        assert_eq!(edit_cutoff(i64::MAX), i64::MAX);
     }
 
     #[test]

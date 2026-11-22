@@ -19,6 +19,30 @@ export function youtubeShortsUrl(id: string | null | undefined): string | null {
   return typeof id === "string" && VIDEO_ID.test(id) ? `${SHORTS_URL}${id}` : null;
 }
 
+/** Mirrors `EDIT_LOCK_SECS` in crates/domain/src/queue.rs: no edit or delete this close to a slot. */
+export const EDIT_LOCK_SECS = 120;
+/** The Worker's 409 text for it (crates/worker/src/dto.rs `TOO_CLOSE_MESSAGE`), capitalised. */
+export const TOO_CLOSE_MESSAGE = "Too close to its slot to change.";
+
+interface Changeable {
+  slot_at: number;
+  publish?: { state: PublishState };
+}
+
+/** Queued, and its slot is more than the lock window ahead (the Worker enforces it too). */
+export function isChangeable(post: Changeable, nowSecs: number): boolean {
+  return (post.publish?.state ?? "queued") === "queued" && post.slot_at > nowSecs + EDIT_LOCK_SECS;
+}
+
+/** Queued with its slot still ahead, but inside the lock window. */
+export function isLocked(post: Changeable, nowSecs: number): boolean {
+  return (
+    (post.publish?.state ?? "queued") === "queued" &&
+    post.slot_at > nowSecs &&
+    post.slot_at <= nowSecs + EDIT_LOCK_SECS
+  );
+}
+
 /** One fixed message per failure code the Worker can send. */
 export const FAILURE_MESSAGES: Record<string, string> = {
   auth: "YouTube stopped accepting the saved sign-in. Reconnect it in Connections, then queue this video again.",

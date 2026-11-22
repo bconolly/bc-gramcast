@@ -6,7 +6,7 @@ use domain::app::{
     DeleteError, InsertError, PortError, PostRepository, SlotPatternRepository, UpdateError,
     UploadSigner, UploadStore,
 };
-use domain::queue::QueuedPost;
+use domain::queue::{edit_cutoff, QueuedPost};
 use domain::slots::SlotPattern;
 use serde::Deserialize;
 use worker::{Bucket, D1Database, Env};
@@ -171,7 +171,7 @@ impl PostRepository for D1PostRepository {
             .map(|p| dto::platform_to_str(*p))
             .collect();
         // video_key and id are never in the SET list, so they cannot change. The WHERE
-        // is the "still queued" rule: the slot is after `now` AND the publisher has not
+        // is the "still changeable" rule: the slot is after `now` + `EDIT_LOCK_SECS` AND the publisher has not
         // claimed the post (see `dto::UPDATE_POST_SQL`). The state test is what closes
         // the gap between the request's clock and the publisher's.
         let result = self
@@ -183,7 +183,7 @@ impl PostRepository for D1PostRepository {
                 platforms.join(",").into(),
                 (post.slot_at as f64).into(),
                 post.id.as_str().into(),
-                (now as f64).into(),
+                (edit_cutoff(now) as f64).into(),
             ])
             .map_err(|e| UpdateError::Port(port_err(e)))?
             .run()
@@ -201,7 +201,7 @@ impl PostRepository for D1PostRepository {
         let result = self
             .db
             .prepare(dto::DELETE_POST_SQL)
-            .bind(&[id.into(), (now as f64).into()])
+            .bind(&[id.into(), (edit_cutoff(now) as f64).into()])
             .map_err(|e| DeleteError::Port(port_err(e)))?
             .run()
             .await

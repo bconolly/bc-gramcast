@@ -1,6 +1,7 @@
 import { render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { EDIT_LOCK_SECS } from "@/lib/publish";
 import { Queue } from "@/screens/Queue";
 
 afterEach(() => vi.unstubAllGlobals());
@@ -255,6 +256,26 @@ describe("Queue publish state", () => {
   it("explains a failure with the fixed message for its reason code", async () => {
     await load();
     expect(row("Lost post").getByText(/YouTube Studio/)).toBeInTheDocument();
+  });
+
+  it("hides Edit and Delete inside the lock window and says why, in the Worker's words", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    try {
+      const now = 1_800_000_000;
+      vi.setSystemTime(now * 1000);
+      const inWindow = { ...base, id: "w1", video_key: "videos/w1.mp4", title: "Close one", slot_at: now + EDIT_LOCK_SECS, publish: { state: "queued" } };
+      const outside = { ...base, id: "w2", video_key: "videos/w2.mp4", title: "Far one", slot_at: now + EDIT_LOCK_SECS + 1, publish: { state: "queued" } };
+      vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response(JSON.stringify([inWindow, outside]))));
+      render(<Queue />);
+      await screen.findByText("Close one");
+      expect(screen.queryByRole("button", { name: "Edit Close one" })).not.toBeInTheDocument();
+      expect(screen.queryByRole("button", { name: "Delete Close one" })).not.toBeInTheDocument();
+      expect(row("Close one").getByText("Too close to its slot to change.")).toBeInTheDocument();
+      expect(screen.getByRole("button", { name: "Edit Far one" })).toBeInTheDocument();
+      expect(row("Far one").queryByText(/too close/i)).not.toBeInTheDocument();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("offers Edit and Delete only for a post that is still queued with its slot ahead", async () => {

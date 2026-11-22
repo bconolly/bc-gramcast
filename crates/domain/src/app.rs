@@ -41,6 +41,8 @@ pub enum UpdateError {
     NotFound,
     /// The stored post's slot has arrived or passed.
     NotQueued,
+    /// The slot is still ahead but within `EDIT_LOCK_SECS`.
+    TooCloseToSlot,
     SlotTaken,
     Port(PortError),
 }
@@ -51,6 +53,8 @@ pub enum DeleteError {
     NotFound,
     /// The stored post's slot has arrived or passed.
     NotQueued,
+    /// The slot is still ahead but within `EDIT_LOCK_SECS`.
+    TooCloseToSlot,
     Port(PortError),
 }
 
@@ -97,6 +101,8 @@ pub enum AppError {
     NotFound,
     /// The post's slot has arrived or passed, so it is no longer queued.
     NotQueued,
+    /// The slot is within `EDIT_LOCK_SECS`: the publisher may claim it any moment.
+    TooCloseToSlot,
     /// The post names a video that is not in storage.
     VideoNotUploaded,
     Upload(UploadError),
@@ -173,6 +179,17 @@ pub enum DeleteOutcome {
     VideoLeftBehind,
 }
 
+/// A post is changed only while queued and outside the lock window before its slot.
+fn check_changeable(post: &QueuedPost, now: i64) -> Result<(), AppError> {
+    if !post.is_queued(now) {
+        Err(AppError::NotQueued)
+    } else if !post.is_editable(now) {
+        Err(AppError::TooCloseToSlot)
+    } else {
+        Ok(())
+    }
+}
+
 /// Replaces the title, caption, platforms and slot of a queued post, with the
 /// same rules as `queue_post`. `video_key` and `id` stay as stored.
 pub async fn update_post(
@@ -192,9 +209,7 @@ pub async fn update_post(
         .await
         .map_err(AppError::Port)?
         .ok_or(AppError::NotFound)?;
-    if !post.is_queued(now) {
-        return Err(AppError::NotQueued);
-    }
+    check_changeable(&post, now)?;
     let slot_at = changes.slot_at;
     post.title = changes.title;
     post.caption = changes.caption;
@@ -203,6 +218,7 @@ pub async fn update_post(
     repo.update(&post, now).await.map_err(|e| match e {
         UpdateError::NotFound => AppError::NotFound,
         UpdateError::NotQueued => AppError::NotQueued,
+        UpdateError::TooCloseToSlot => AppError::TooCloseToSlot,
         UpdateError::SlotTaken => AppError::Queue(QueueError::SlotTaken { slot_at }),
         UpdateError::Port(p) => AppError::Port(p),
     })?;
@@ -227,12 +243,11 @@ pub async fn delete_post(
         .await
         .map_err(AppError::Port)?
         .ok_or(AppError::NotFound)?;
-    if !post.is_queued(now) {
-        return Err(AppError::NotQueued);
-    }
+    check_changeable(&post, now)?;
     repo.delete(id, now).await.map_err(|e| match e {
         DeleteError::NotFound => AppError::NotFound,
         DeleteError::NotQueued => AppError::NotQueued,
+        DeleteError::TooCloseToSlot => AppError::TooCloseToSlot,
         DeleteError::Port(p) => AppError::Port(p),
     })?;
     // A stored key is re-checked, so storage is only asked to delete well-formed keys.
@@ -334,7 +349,7 @@ pub async fn authenticate_owner(
 mod tests {
     use super::*;
     use crate::media::MAX_UPLOAD_BYTES;
-    use crate::queue::Platform;
+    use crate::queue::{Platform, EDIT_LOCK_SECS};
     use crate::slots::{SlotRule, Weekday};
     use std::cell::RefCell;
 
@@ -405,6 +420,7 @@ mod tests {
             match posts.iter_mut().find(|p| p.id == post.id) {
                 None => Err(UpdateError::NotFound),
                 Some(stored) if !stored.is_queued(now) => Err(UpdateError::NotQueued),
+                Some(stored) if !stored.is_editable(now) => Err(UpdateError::TooCloseToSlot),
                 Some(stored) => {
                     *stored = post.clone();
                     Ok(())
@@ -416,6 +432,7 @@ mod tests {
             match posts.iter().position(|p| p.id == id) {
                 None => Err(DeleteError::NotFound),
                 Some(i) if !posts[i].is_queued(now) => Err(DeleteError::NotQueued),
+                Some(i) if !posts[i].is_editable(now) => Err(DeleteError::TooCloseToSlot),
                 Some(i) => {
                     posts.remove(i);
                     Ok(())
@@ -909,7 +926,7 @@ mod tests {
 
     #[test]
     fn delete_post_removes_the_row_then_the_video() {
-        let repo = repo_with(&[(ID_A, 100)]);
+        let repo = repo_with(&[(ID_A, 1_000)]);
         let s = store();
         let out = pollster::block_on(delete_post(&repo, &s, ID_A, 0)).unwrap();
         assert_eq!(out, DeleteOutcome::Deleted);
@@ -931,7 +948,7 @@ mod tests {
 
     #[test]
     fn delete_post_still_succeeds_when_the_video_delete_fails() {
-        let repo = repo_with(&[(ID_A, 100)]);
+        let repo = repo_with(&[(ID_A, 1_000)]);
         let mut s = store();
         s.fail_delete = true;
         let out = pollster::block_on(delete_post(&repo, &s, ID_A, 0)).unwrap();
@@ -941,7 +958,7 @@ mod tests {
 
     #[test]
     fn update_post_changes_the_editable_fields_only() {
-        let repo = repo_with(&[(ID_A, 100)]);
+        let repo = repo_with(&[(ID_A, 1_000)]);
         let updated = pollster::block_on(update_post(&repo, ID_A, changes(200), 0)).unwrap();
         assert_eq!(updated.id, ID_A);
         assert_eq!(updated.video_key, format!("videos/{ID_A}.mp4"));
@@ -953,19 +970,19 @@ mod tests {
 
     #[test]
     fn update_post_may_keep_its_own_slot() {
-        let repo = repo_with(&[(ID_A, 100)]);
-        pollster::block_on(update_post(&repo, ID_A, changes(100), 0)).unwrap();
+        let repo = repo_with(&[(ID_A, 1_000)]);
+        pollster::block_on(update_post(&repo, ID_A, changes(1_000), 0)).unwrap();
     }
 
     #[test]
     fn update_post_refuses_a_slot_taken_by_another_post() {
-        let repo = repo_with(&[(ID_A, 100), (ID_B, 200)]);
+        let repo = repo_with(&[(ID_A, 1_000), (ID_B, 200)]);
         let e = pollster::block_on(update_post(&repo, ID_A, changes(200), 0));
         assert_eq!(
             e,
             Err(AppError::Queue(QueueError::SlotTaken { slot_at: 200 }))
         );
-        assert_eq!(repo.posts.borrow()[0].slot_at, 100);
+        assert_eq!(repo.posts.borrow()[0].slot_at, 1_000);
     }
 
     #[test]
@@ -1015,7 +1032,7 @@ mod tests {
                 Ok(())
             }
             async fn get(&self, id: &str) -> Result<Option<QueuedPost>, PortError> {
-                Ok(Some(post(id, 100)))
+                Ok(Some(post(id, 1_000)))
             }
             async fn update(&self, _p: &QueuedPost, _now: i64) -> Result<(), UpdateError> {
                 Err(UpdateError::SlotTaken)
@@ -1054,7 +1071,7 @@ mod tests {
             Ok(())
         }
         async fn get(&self, id: &str) -> Result<Option<QueuedPost>, PortError> {
-            Ok(Some(post(id, 100)))
+            Ok(Some(post(id, 1_000)))
         }
         async fn update(&self, _p: &QueuedPost, _now: i64) -> Result<(), UpdateError> {
             Err(UpdateError::NotQueued)
@@ -1062,6 +1079,41 @@ mod tests {
         async fn delete(&self, _id: &str, _now: i64) -> Result<(), DeleteError> {
             Err(DeleteError::NotQueued)
         }
+    }
+
+    #[test]
+    fn a_post_inside_the_lock_window_cannot_be_edited_or_deleted() {
+        let repo = repo_with(&[(ID_A, 1_000)]);
+        let s = store();
+        // The slot is still ahead, but not by more than the lock window.
+        for now in [1_000 - EDIT_LOCK_SECS, 1_000 - 1] {
+            let e = pollster::block_on(update_post(&repo, ID_A, changes(5_000), now));
+            assert_eq!(e, Err(AppError::TooCloseToSlot), "now={now}");
+            let e = pollster::block_on(delete_post(&repo, &s, ID_A, now));
+            assert_eq!(e, Err(AppError::TooCloseToSlot), "now={now}");
+        }
+        // The window ends one second before it: still allowed.
+        let now = 1_000 - EDIT_LOCK_SECS - 1;
+        assert!(pollster::block_on(update_post(&repo, ID_A, changes(5_000), now)).is_ok());
+        assert_eq!(repo.posts.borrow()[0].title, "New title");
+        let repo = repo_with(&[(ID_A, 1_000)]);
+        assert!(pollster::block_on(delete_post(&repo, &s, ID_A, now)).is_ok());
+        // Refused deletes never touched the video; only the allowed one did.
+        assert_eq!(s.deleted.borrow().len(), 1);
+    }
+
+    #[test]
+    fn the_repository_refusing_inside_the_window_is_the_same_error() {
+        let repo = RepoSays {
+            update: || UpdateError::TooCloseToSlot,
+            delete: || DeleteError::TooCloseToSlot,
+        };
+        let e = pollster::block_on(update_post(&repo, ID_A, changes(5_000), 0));
+        assert_eq!(e, Err(AppError::TooCloseToSlot));
+        let s = store();
+        let e = pollster::block_on(delete_post(&repo, &s, ID_A, 0));
+        assert_eq!(e, Err(AppError::TooCloseToSlot));
+        assert!(s.deleted.borrow().is_empty());
     }
 
     #[test]
@@ -1093,7 +1145,7 @@ mod tests {
 
     #[test]
     fn delete_post_does_not_ask_storage_to_delete_an_odd_video_key() {
-        let repo = repo_with(&[(ID_A, 100)]);
+        let repo = repo_with(&[(ID_A, 1_000)]);
         repo.posts.borrow_mut()[0].video_key = "legacy/../odd key".into();
         let s = store();
         let out = pollster::block_on(delete_post(&repo, &s, ID_A, 0)).unwrap();
@@ -1115,7 +1167,7 @@ mod tests {
             Ok(())
         }
         async fn get(&self, id: &str) -> Result<Option<QueuedPost>, PortError> {
-            Ok(Some(post(id, 100)))
+            Ok(Some(post(id, 1_000)))
         }
         async fn update(&self, _p: &QueuedPost, _now: i64) -> Result<(), UpdateError> {
             Err((self.update)())
@@ -1161,16 +1213,19 @@ mod tests {
 
     #[test]
     fn the_repository_rule_refuses_a_slot_at_exactly_now() {
-        let repo = repo_with(&[(ID_A, 100)]);
+        let repo = repo_with(&[(ID_A, 1_000)]);
         let stored = repo.posts.borrow()[0].clone();
         assert_eq!(
-            pollster::block_on(repo.update(&stored, 100)),
+            pollster::block_on(repo.update(&stored, 1_000)),
             Err(UpdateError::NotQueued)
         );
         assert_eq!(
-            pollster::block_on(repo.delete(ID_A, 100)),
+            pollster::block_on(repo.delete(ID_A, 1_000)),
             Err(DeleteError::NotQueued)
         );
-        assert_eq!(pollster::block_on(repo.delete(ID_A, 99)), Ok(()));
+        assert_eq!(
+            pollster::block_on(repo.delete(ID_A, 1_000 - EDIT_LOCK_SECS - 1)),
+            Ok(())
+        );
     }
 }

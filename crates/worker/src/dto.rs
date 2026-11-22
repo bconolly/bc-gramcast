@@ -4,7 +4,7 @@ use domain::app::{AppError, DeleteError, InsertError, PortError, PostChanges, Up
 use domain::auth::{self, AuthError, Claims, JwtHeader};
 use domain::media::UploadError;
 use domain::publish::{is_valid_external_id, PublishState, ScheduledPost};
-use domain::queue::{Platform, QueueError, QueuedPost};
+use domain::queue::{edit_cutoff, Platform, QueueError, QueuedPost};
 use domain::slots::{SlotError, SlotPattern, SlotRule, Weekday};
 use serde::{Deserialize, Serialize};
 
@@ -267,6 +267,10 @@ pub fn classify_update_error(text: &str) -> UpdateError {
 /// itself fails, so a possibly orphaned video is visible. No id: it may be unknown.
 pub const DELETE_UNCONFIRMED_LINE: &str = "delete could not be confirmed; a video may be orphaned";
 
+/// The fixed 409 text for an edit or delete inside the lock window. The web UI shows the
+/// same words where it hides the buttons.
+pub const TOO_CLOSE_MESSAGE: &str = "too close to its slot to change";
+
 /// True when D1 reports at least one row changed by a write.
 pub fn write_applied(changes: Option<usize>) -> bool {
     changes.is_some_and(|n| n > 0)
@@ -286,7 +290,8 @@ pub fn row_claimed(state: &str, attempts: f64) -> bool {
     !(state == "queued" && attempts == 0.0)
 }
 
-/// Edit and delete touch a row only while its slot is after `now` AND the publisher has
+/// Edit and delete touch a row only while its slot is after the lock cutoff (`now` plus
+/// `EDIT_LOCK_SECS`, bound as the slot parameter) AND the publisher has
 /// not claimed it (the state columns of migration 0004). The slot test alone left a gap:
 /// the publisher claims on the Worker clock, which can pass the slot after this request
 /// began.
@@ -306,6 +311,7 @@ pub fn update_after_miss(
     match (changes, row) {
         (_, None) => Err(UpdateError::NotFound),
         (_, Some(r)) if r.claimed || r.slot_at <= now => Err(UpdateError::NotQueued),
+        (_, Some(r)) if r.slot_at <= edit_cutoff(now) => Err(UpdateError::TooCloseToSlot),
         // No count, and the row is open with a future slot: our update landed.
         (None, Some(_)) => Ok(()),
         // A count of 0 with an open row should be impossible: do not claim success.
@@ -326,6 +332,7 @@ pub fn delete_after_miss(
         (None, None) => Ok(()),
         (Some(_), None) => Err(DeleteError::NotFound),
         (_, Some(r)) if r.claimed || r.slot_at <= now => Err(DeleteError::NotQueued),
+        (_, Some(r)) if r.slot_at <= edit_cutoff(now) => Err(DeleteError::TooCloseToSlot),
         (_, Some(_)) => Err(DeleteError::Port(PortError(
             "delete removed no rows".into(),
         ))),
@@ -347,6 +354,7 @@ pub fn error_status(e: &AppError) -> (u16, &'static str) {
     match e {
         AppError::NotFound => (404, "post not found"),
         AppError::NotQueued => (409, "post is no longer queued"),
+        AppError::TooCloseToSlot => (409, TOO_CLOSE_MESSAGE),
         AppError::VideoNotUploaded => (422, "video has not been uploaded"),
         AppError::Upload(u) => (
             422,
@@ -616,6 +624,7 @@ mod tests {
     use domain::app::{InsertError, PortError};
     use domain::media::UploadError;
     use domain::publish::FailReason;
+    use domain::queue::EDIT_LOCK_SECS;
 
     fn body() -> QueuePostBody {
         QueuePostBody {
@@ -778,12 +787,16 @@ mod tests {
     }
 
     const OPEN: RowGuard = RowGuard {
-        slot_at: NOW + 1,
+        slot_at: NOW + EDIT_LOCK_SECS + 1,
         claimed: false,
     };
     const CLAIMED: RowGuard = RowGuard {
         slot_at: NOW + 1,
         claimed: true,
+    };
+    const INSIDE_WINDOW: RowGuard = RowGuard {
+        slot_at: NOW + EDIT_LOCK_SECS,
+        claimed: false,
     };
     const PASSED: RowGuard = RowGuard {
         slot_at: NOW,
@@ -882,6 +895,38 @@ mod tests {
             delete_after_miss(None, Some(OPEN), NOW),
             Err(DeleteError::Port(_))
         ));
+    }
+
+    #[test]
+    fn a_row_inside_the_lock_window_is_refused_as_too_close() {
+        for changes in [Some(0), None] {
+            assert_eq!(
+                update_after_miss(changes, Some(INSIDE_WINDOW), NOW),
+                Err(UpdateError::TooCloseToSlot)
+            );
+            assert_eq!(
+                delete_after_miss(changes, Some(INSIDE_WINDOW), NOW),
+                Err(DeleteError::TooCloseToSlot),
+                "its video must stay"
+            );
+        }
+        // A claimed row is NotQueued even inside the window, and a passed slot stays NotQueued.
+        let claimed_inside = RowGuard {
+            claimed: true,
+            ..INSIDE_WINDOW
+        };
+        assert_eq!(
+            update_after_miss(None, Some(claimed_inside), NOW),
+            Err(UpdateError::NotQueued)
+        );
+        assert_eq!(
+            delete_after_miss(Some(0), Some(PASSED), NOW),
+            Err(DeleteError::NotQueued)
+        );
+        assert_eq!(
+            error_status(&AppError::TooCloseToSlot),
+            (409, "too close to its slot to change")
+        );
     }
 
     #[test]

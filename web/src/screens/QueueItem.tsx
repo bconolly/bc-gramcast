@@ -2,7 +2,7 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card } from "@/components/ui/card";
 import type { Platform, PostJson } from "@/lib/api";
-import { failureMessage, youtubeShortsUrl, type PublishInfo } from "@/lib/publish";
+import { TOO_CLOSE_MESSAGE, failureMessage, isChangeable, isLocked, youtubeShortsUrl, type PublishInfo } from "@/lib/publish";
 import { formatSlot } from "@/lib/rules";
 import { DeleteConfirm } from "@/screens/DeleteConfirm";
 import { EditPostForm } from "@/screens/EditPostForm";
@@ -100,9 +100,11 @@ function Actions({ id, title, onMode }: { id: string; title: string; onMode: (mo
   );
 }
 
-/** Only a post that is still queued, with its slot ahead, can be changed (the Worker enforces it too). */
-export const canChange = (post: PostJson) =>
-  (post.publish ?? QUEUED).state === "queued" && post.slot_at > Date.now() / 1000;
+/** Only a queued post, with its slot more than the lock window ahead, can be changed (the Worker enforces it too). */
+export const canChange = (post: PostJson) => isChangeable(post, Date.now() / 1000);
+
+/** Queued with its slot ahead but inside the lock window: the buttons are replaced by a reason. */
+const tooClose = (post: PostJson) => isLocked(post, Date.now() / 1000);
 
 export function QueueItem({ post, mode, onMode, onSaved, onDeleted, onOpenSlots }: Props) {
   const close = () => onMode("view");
@@ -115,6 +117,9 @@ export function QueueItem({ post, mode, onMode, onSaved, onDeleted, onOpenSlots 
         </div>
         <PublishDetail publish={publish} />
         {mode === "view" && canChange(post) && <Actions id={post.id} title={post.title} onMode={onMode} />}
+        {mode === "view" && tooClose(post) && (
+          <p className="text-sm text-muted-foreground">{TOO_CLOSE_MESSAGE}</p>
+        )}
         {mode === "edit" && (
           <EditPostForm post={post} onSaved={onSaved}
             onCancel={close}
