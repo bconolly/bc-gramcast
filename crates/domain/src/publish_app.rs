@@ -303,6 +303,16 @@ where
     }
 
     async fn load_fresh_token(&self) -> Result<StoredToken, PublishError> {
+        // The provider kept refusing the stored token: nothing runs until the owner
+        // reconnects (which saves a new token and clears the mark).
+        if self
+            .tokens
+            .needs_reconnect()
+            .await
+            .map_err(|_| PublishError::Transient)?
+        {
+            return Err(PublishError::Auth);
+        }
         let mut token = self
             .tokens
             .load()
@@ -317,6 +327,11 @@ where
         if !token.needs_refresh((self.clock)()) {
             return Ok(());
         }
+        self.refresh(token).await
+    }
+
+    /// Refreshes whether or not the token looks expired.
+    async fn refresh(&self, token: &mut StoredToken) -> Result<(), PublishError> {
         let mut fresh = self.refresher.refresh(token).await?;
         // Providers often leave the refresh token out of a refresh response.
         if fresh.refresh_token.is_empty() {
@@ -348,7 +363,10 @@ where
             return Ok(Step::of(Outcome::AlreadyClaimed));
         }
 
-        let result = self.upload(&p.post, token).await;
+        let mut result = self.upload(&p.post, token).await;
+        if result == Err(PublishError::Auth) {
+            result = self.retry_after_refresh(&p.post, token).await;
+        }
         let now = (self.clock)();
         let external_id = result.as_ref().ok().map(|r| r.external_id.clone());
         let halt = result.as_ref().err().copied().and_then(error_halt);
@@ -391,6 +409,27 @@ where
                 ..lost
             }),
         }
+    }
+
+    /// The provider refused the token. That is safe to retry (nothing was created), so
+    /// force one refresh and try once more. If the provider still refuses, mark the
+    /// token so later runs stop at once; a failed mark is ignored because the post is
+    /// requeued and the run halts either way. A refresh that fails for any reason but
+    /// `Auth` is a plain `Transient` for this post: nothing was uploaded on this try.
+    async fn retry_after_refresh(
+        &self,
+        post: &QueuedPost,
+        token: &mut StoredToken,
+    ) -> Result<PublishedRef, PublishError> {
+        let result = match self.refresh(token).await {
+            Ok(()) => self.upload(post, token).await,
+            Err(PublishError::Auth) => Err(PublishError::Auth),
+            Err(_) => Err(PublishError::Transient),
+        };
+        if result == Err(PublishError::Auth) {
+            let _ = self.tokens.mark_needs_reconnect().await;
+        }
+        result
     }
 
     /// Between "claimed" and "provider answered": token, video link, upload.
@@ -684,10 +723,13 @@ mod tests {
     }
 
     #[test]
-    fn an_auth_failure_requeues_the_post_without_using_an_attempt() {
+    fn auth_twice_requeues_the_post_without_an_attempt_and_marks_the_token() {
         let repo = FakeRepo::with(vec![scheduled("a", NOW - 1)]);
-        let publisher = FakePublisher::returning(vec![Err(PublishError::Auth)]);
-        let report = run(&repo, &publisher, &fresh_store(), &refresher_ok());
+        let tokens = fresh_store();
+        let refresher = refresher_ok();
+        let publisher =
+            FakePublisher::returning(vec![Err(PublishError::Auth), Err(PublishError::Auth)]);
+        let report = run(&repo, &publisher, &tokens, &refresher);
         assert_eq!(report.outcomes[0].1, Outcome::Retrying(FailReason::Auth));
         assert_eq!(
             repo.state("a"),
@@ -696,6 +738,93 @@ mod tests {
                 not_before: NOW
             }
         );
+        assert_eq!(refresher.calls.get(), 1);
+        assert!(tokens.reconnect.get());
+    }
+
+    #[test]
+    fn auth_once_forces_a_refresh_and_the_retry_uses_the_new_token() {
+        let repo = FakeRepo::with(vec![scheduled("a", NOW - 1)]);
+        let tokens = fresh_store();
+        let publisher = FakePublisher::returning(vec![Err(PublishError::Auth), ok_ref("yt1")]);
+        let report = run(&repo, &publisher, &tokens, &refresher_ok());
+        assert_eq!(
+            report.outcomes[0].1,
+            Outcome::Published {
+                external_id: "yt1".into()
+            }
+        );
+        let seen = publisher.seen.borrow();
+        assert_eq!(seen[0].0, "ya29.SECRET");
+        assert_eq!(seen[1].0, "ya29.NEW-SECRET");
+        assert!(!tokens.reconnect.get());
+        assert_eq!(report.halted, None);
+    }
+
+    #[test]
+    fn auth_then_a_refresh_the_provider_refuses_marks_the_token() {
+        let repo = FakeRepo::with(vec![scheduled("a", NOW - 1)]);
+        let tokens = fresh_store();
+        let refresher = FakeRefresher {
+            result: Err(PublishError::Auth),
+            calls: Cell::new(0),
+        };
+        let publisher = FakePublisher::returning(vec![Err(PublishError::Auth)]);
+        let report = run(&repo, &publisher, &tokens, &refresher);
+        assert_eq!(report.halted, Some(Halt::NeedsReconnect));
+        assert!(tokens.reconnect.get());
+        assert_eq!(publisher.calls.borrow().len(), 1);
+    }
+
+    #[test]
+    fn auth_then_a_refresh_that_hit_trouble_is_a_retry_and_no_reconnect_mark() {
+        let repo = FakeRepo::with(vec![scheduled("a", NOW - 1)]);
+        let tokens = fresh_store();
+        let refresher = FakeRefresher {
+            result: Err(PublishError::Unknown),
+            calls: Cell::new(0),
+        };
+        let publisher = FakePublisher::returning(vec![Err(PublishError::Auth)]);
+        let report = run(&repo, &publisher, &tokens, &refresher);
+        // Nothing was uploaded, so even an Unknown from the refresher is a plain retry.
+        assert_eq!(
+            report.outcomes[0].1,
+            Outcome::Retrying(FailReason::Transient)
+        );
+        assert!(!tokens.reconnect.get());
+        assert_eq!(publisher.calls.borrow().len(), 1);
+    }
+
+    /// The provider is called at most twice in total (the call, and one retry after a
+    /// forced refresh), and a second run does not call it at all.
+    #[test]
+    fn a_token_the_provider_keeps_refusing_stops_all_later_runs() {
+        let repo = two_due();
+        let tokens = fresh_store();
+        let refresher = refresher_ok();
+        let publisher = FakePublisher::returning(vec![Err(PublishError::Auth); 4]);
+        let first = run(&repo, &publisher, &tokens, &refresher);
+        assert_eq!(first.halted, Some(Halt::NeedsReconnect));
+        assert_eq!(publisher.calls.borrow().len(), 2);
+        let second = run(&repo, &publisher, &tokens, &refresher);
+        assert_eq!(second.halted, Some(Halt::NeedsReconnect));
+        assert!(second.outcomes.is_empty());
+        assert_eq!(publisher.calls.borrow().len(), 2);
+        assert_eq!(repo.state("b"), PublishState::new_queued());
+        // A new connect saves a token, which clears the mark.
+        pollster::block_on(tokens.save(&token(NOW + 3600, "ya29.RECONNECTED"))).unwrap();
+        assert!(!tokens.reconnect.get());
+    }
+
+    #[test]
+    fn a_requeue_write_conflict_after_auth_still_halts() {
+        let repo = two_due();
+        repo.steal_final.set(true);
+        let publisher =
+            FakePublisher::returning(vec![Err(PublishError::Auth), Err(PublishError::Auth)]);
+        let report = run(&repo, &publisher, &fresh_store(), &refresher_ok());
+        assert_eq!(report.halted, Some(Halt::NeedsReconnect));
+        assert_eq!(report.outcomes.len(), 1);
     }
 
     #[test]
@@ -927,7 +1056,8 @@ mod tests {
     #[test]
     fn auth_from_the_provider_stops_the_run_and_requeues_only_that_post() {
         let repo = two_due();
-        let publisher = FakePublisher::returning(vec![Err(PublishError::Auth)]);
+        let publisher =
+            FakePublisher::returning(vec![Err(PublishError::Auth), Err(PublishError::Auth)]);
         let report = run(&repo, &publisher, &fresh_store(), &refresher_ok());
         assert_eq!(report.halted, Some(Halt::NeedsReconnect));
         assert_eq!(report.outcomes.len(), 1);
@@ -939,7 +1069,7 @@ mod tests {
             }
         );
         assert_eq!(repo.state("b"), PublishState::new_queued());
-        assert_eq!(publisher.calls.borrow().len(), 1);
+        assert_eq!(publisher.calls.borrow().len(), 2);
     }
 
     #[test]
@@ -1128,6 +1258,12 @@ mod tests {
             }
             async fn save(&self, _t: &StoredToken) -> Result<(), PortError> {
                 Err(PortError("kv down".into()))
+            }
+            async fn mark_needs_reconnect(&self) -> Result<(), PortError> {
+                self.0.mark_needs_reconnect().await
+            }
+            async fn needs_reconnect(&self) -> Result<bool, PortError> {
+                self.0.needs_reconnect().await
             }
         }
         let inner = FakeTokenStore::default();
