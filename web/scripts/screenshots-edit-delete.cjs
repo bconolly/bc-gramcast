@@ -48,6 +48,8 @@ const QUEUE = [
 ];
 
 // Brisbane (+10:00) pattern and the next free slots it gives.
+// The browser runs in Brisbane (same offset as the pattern) so the queue times and the
+// slot list agree. No listed free slot equals a queued post's own slot.
 const PATTERN = {
   utc_offset_minutes: 600,
   rules: [
@@ -69,7 +71,7 @@ function fail(message) {
 }
 
 async function shoot(browser, base, label, viewport) {
-  const ctx = await browser.newContext({ viewport, deviceScaleFactor: 2, timezoneId: "Australia/Sydney", locale: "en-AU" });
+  const ctx = await browser.newContext({ viewport, deviceScaleFactor: 2, timezoneId: "Australia/Brisbane", locale: "en-AU" });
   const page = await ctx.newPage();
   page.on("console", (m) => m.type() === "error" && fail(`console error: ${m.text()}`));
   page.on("pageerror", (e) => fail(`page error: ${e.message}`));

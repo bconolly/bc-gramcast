@@ -15,11 +15,15 @@ const POSTS = [
 const json = (body: unknown, status = 200) => new Response(JSON.stringify(body), { status });
 
 /** Serves the queue, no weekly slots, and answers PATCH with `patch`. */
-function serve(patch: (init: RequestInit) => Promise<Response> | Response = () => json(POSTS[0])) {
+function serve(
+  patch: (init: RequestInit) => Promise<Response> | Response = () => json(POSTS[0]),
+  nextSlots: number[][] = [[]],
+) {
+  let lookups = 0;
   const fn = vi.fn(async (url: string, init?: RequestInit) => {
     if (url === "/api/queue") return json(POSTS);
     if (url === "/api/slots/pattern") return json({ utc_offset_minutes: 600, rules: [] });
-    if (url.startsWith("/api/slots/next")) return json({ slots: [] });
+    if (url.startsWith("/api/slots/next")) return json({ slots: nextSlots[Math.min(lookups++, nextSlots.length - 1)] });
     return patch(init ?? {});
   });
   vi.stubGlobal("fetch", fn);
@@ -52,6 +56,43 @@ describe("Queue edit", () => {
     expect(form.getByLabelText("YouTube")).toBeChecked();
     expect(form.getByLabelText("When")).toHaveValue("2099-03-05T07:04");
     expect(form.getByRole("button", { name: "Save" })).toBeInTheDocument();
+    expect(form.getByLabelText("Instagram").closest("label")).toHaveClass("min-h-11");
+  });
+
+  it("moves focus to the title when the form opens", async () => {
+    serve();
+    const form = await openEdit(userEvent.setup());
+    expect(form.getByLabelText("Title")).toHaveFocus();
+  });
+
+  it("returns focus to the post's Edit button after Cancel", async () => {
+    serve();
+    const user = userEvent.setup();
+    const form = await openEdit(user);
+    await user.click(form.getByRole("button", { name: "Cancel" }));
+    expect(screen.getByRole("button", { name: "Edit Sunday reel" })).toHaveFocus();
+  });
+
+  it("returns focus to the post's Edit button after Save", async () => {
+    serve();
+    const user = userEvent.setup();
+    const form = await openEdit(user);
+    await user.click(form.getByRole("button", { name: "Save" }));
+    expect(await screen.findByRole("button", { name: "Edit Sunday reel" })).toHaveFocus();
+  });
+
+  it("when a 409 moves a chosen slot, picks the next free one and says so", async () => {
+    const [s1, s2, s3] = [Date.UTC(2099, 2, 5, 22, 30), Date.UTC(2099, 2, 8, 20, 30), Date.UTC(2099, 2, 11, 9, 0)].map((ms) => ms / 1000);
+    const fn = serve(() => new Response("that slot is already taken", { status: 409 }), [[s1!, s2!], [s2!, s3!]]);
+    const user = userEvent.setup();
+    const form = await openEdit(user);
+    await user.click(await form.findByRole("radio", { name: "Fri 06/03/2099 08:30" }));
+    await user.click(form.getByRole("button", { name: "Save" }));
+    const alert = await form.findByRole("alert");
+    expect(alert).toHaveTextContent("that slot is already taken");
+    expect(alert).toHaveTextContent("We have picked the next free slot.");
+    expect(await form.findByRole("radio", { name: "Mon 09/03/2099 06:30" })).toBeChecked();
+    expect(JSON.parse(patchCalls(fn)[0]![1]!.body as string).slot_at).toBe(s1);
   });
 
   it("Cancel closes the form without calling the server", async () => {

@@ -129,10 +129,8 @@ describe("Queue delete", () => {
     expect(screen.getByText("Second post")).toBeInTheDocument();
   });
 
-  it.each([
-    ["storage error", 500],
-    ["post not found", 404],
-  ])("keeps the row and shows the server's message when delete fails (%s)", async (message, status) => {
+  it("keeps the row and shows the server's message when delete fails", async () => {
+    const [message, status] = ["storage error", 500] as const;
     serve(() => new Response(message, { status }));
     const user = userEvent.setup();
     render(<Queue />);
@@ -141,5 +139,62 @@ describe("Queue delete", () => {
     expect(await screen.findByRole("alert")).toHaveTextContent(message);
     expect(screen.getByText("Sunday reel")).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Delete post" })).toBeEnabled();
+  });
+
+  it("removes the row and says so when the post was already deleted elsewhere (404)", async () => {
+    serve(() => new Response("post not found", { status: 404 }));
+    const user = userEvent.setup();
+    render(<Queue />);
+    await user.click(await screen.findByRole("button", { name: "Delete Sunday reel" }));
+    await user.click(screen.getByRole("button", { name: "Delete post" }));
+    await waitFor(() => expect(screen.queryByText("Sunday reel")).not.toBeInTheDocument());
+    expect(screen.getByRole("status")).toHaveTextContent("That post was already deleted.");
+    expect(screen.getByText("Second post")).toBeInTheDocument();
+  });
+
+  it("announces the delete politely and moves focus to the next row's Edit button", async () => {
+    serve();
+    const user = userEvent.setup();
+    render(<Queue />);
+    await user.click(await screen.findByRole("button", { name: "Delete Sunday reel" }));
+    await user.click(screen.getByRole("button", { name: "Delete post" }));
+    const status = await screen.findByRole("status");
+    expect(status).toHaveTextContent("Post deleted");
+    expect(status).toHaveAttribute("aria-live", "polite");
+    expect(screen.getByRole("button", { name: "Edit Second post" })).toHaveFocus();
+  });
+
+  it("moves focus to the previous row's Edit button when the last row is deleted", async () => {
+    serve();
+    const user = userEvent.setup();
+    render(<Queue />);
+    await user.click(await screen.findByRole("button", { name: "Delete Second post" }));
+    await user.click(screen.getByRole("button", { name: "Delete post" }));
+    await waitFor(() => expect(screen.queryByText("Second post")).not.toBeInTheDocument());
+    expect(screen.getByRole("button", { name: "Edit Sunday reel" })).toHaveFocus();
+  });
+
+  it("moves focus to the empty message when the only post is deleted", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (url: string) =>
+        url === "/api/queue" ? new Response(JSON.stringify([POSTS[0]])) : new Response(null, { status: 204 }),
+      ),
+    );
+    const user = userEvent.setup();
+    render(<Queue />);
+    await user.click(await screen.findByRole("button", { name: "Delete Sunday reel" }));
+    await user.click(screen.getByRole("button", { name: "Delete post" }));
+    expect(await screen.findByText("Nothing queued yet.")).toHaveFocus();
+    expect(screen.getByRole("status")).toHaveTextContent("Post deleted");
+  });
+
+  it("returns focus to the Delete button after Cancel", async () => {
+    serve();
+    const user = userEvent.setup();
+    render(<Queue />);
+    await user.click(await screen.findByRole("button", { name: "Delete Sunday reel" }));
+    await user.click(screen.getByRole("button", { name: "Cancel" }));
+    expect(screen.getByRole("button", { name: "Delete Sunday reel" })).toHaveFocus();
   });
 });

@@ -1,11 +1,12 @@
 import { useState } from "react";
 import { Button } from "@/components/ui/button";
-import { deletePost } from "@/lib/api";
+import { ApiError, deletePost } from "@/lib/api";
 
 interface Props {
   id: string;
   title: string;
-  onDeleted: () => void;
+  /** `notice` is set when the post was already gone, so the owner is told why. */
+  onDeleted: (notice?: string) => void;
   onCancel: () => void;
 }
 
@@ -21,6 +22,10 @@ export function DeleteConfirm({ id, title, onDeleted, onCancel }: Props) {
       await deletePost(id);
       onDeleted();
     } catch (e) {
+      if (e instanceof ApiError && e.status === 404) {
+        onDeleted("That post was already deleted.");
+        return;
+      }
       setError(e instanceof Error ? e.message : "Something went wrong.");
       setBusy(false);
     }

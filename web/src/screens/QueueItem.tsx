@@ -44,17 +44,19 @@ interface Props {
   mode: Mode;
   onMode: (mode: Mode) => void;
   onSaved: (post: PostJson) => void;
-  onDeleted: (id: string) => void;
+  onDeleted: (id: string, notice?: string) => void;
   onOpenSlots: () => void;
 }
 
-function Actions({ title, onMode }: { title: string; onMode: (mode: Mode) => void }) {
+function Actions({ id, title, onMode }: { id: string; title: string; onMode: (mode: Mode) => void }) {
   return (
     <div className="flex gap-3">
-      <Button type="button" variant="outline" className="h-11 min-h-11" aria-label={`Edit ${title}`} onClick={() => onMode("edit")}>
+      <Button type="button" variant="outline" className="h-11 min-h-11" id={`edit-${id}`}
+        aria-label={`Edit ${title}`} onClick={() => onMode("edit")}>
         Edit
       </Button>
-      <Button type="button" variant="outline" className="h-11 min-h-11" aria-label={`Delete ${title}`} onClick={() => onMode("delete")}>
+      <Button type="button" variant="outline" className="h-11 min-h-11" id={`delete-${id}`}
+        aria-label={`Delete ${title}`} onClick={() => onMode("delete")}>
         Delete
       </Button>
     </div>
@@ -69,12 +71,12 @@ export function QueueItem({ post, mode, onMode, onSaved, onDeleted, onOpenSlots 
         <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
           <Summary post={post} />
         </div>
-        {mode === "view" && <Actions title={post.title} onMode={onMode} />}
+        {mode === "view" && <Actions id={post.id} title={post.title} onMode={onMode} />}
         {mode === "edit" && (
           <EditPostForm post={post} onSaved={onSaved} onCancel={close} onOpenSlots={onOpenSlots} />
         )}
         {mode === "delete" && (
-          <DeleteConfirm id={post.id} title={post.title} onDeleted={() => onDeleted(post.id)} onCancel={close} />
+          <DeleteConfirm id={post.id} title={post.title} onDeleted={(notice) => onDeleted(post.id, notice)} onCancel={close} />
         )}
       </Card>
     </li>

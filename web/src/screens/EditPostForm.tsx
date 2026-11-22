@@ -61,7 +61,7 @@ export function EditPostForm({ post, onSaved, onCancel, onOpenSlots }: Props) {
   return (
     <form aria-label={`Edit ${post.title}`} onSubmit={onSubmit} noValidate className="space-y-5 border-t pt-4">
       <CountedField id={`title-${post.id}`} label="Title" n={charCount(title)} max={MAX_TITLE_CHARS}>
-        <Input id={`title-${post.id}`} value={title} onChange={(e) => setTitle(e.target.value)} />
+        <Input id={`title-${post.id}`} autoFocus value={title} onChange={(e) => setTitle(e.target.value)} />
       </CountedField>
       <CountedField id={`caption-${post.id}`} label="Caption" n={charCount(caption)} max={MAX_CAPTION_CHARS}>
         <Textarea id={`caption-${post.id}`} value={caption} onChange={(e) => setCaption(e.target.value)} />

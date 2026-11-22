@@ -54,7 +54,7 @@ export function PlatformPicker({
       <legend className="text-sm font-medium">Platforms</legend>
       <div className="flex gap-6">
         {PLATFORMS.map((p) => (
-          <label key={p.id} className="flex items-center gap-2 text-sm">
+          <label key={p.id} className="flex min-h-11 items-center gap-2 text-sm">
             <input
               type="checkbox"
               className="size-4 accent-primary"
