@@ -1,10 +1,10 @@
-import { useState } from "react";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card } from "@/components/ui/card";
 import type { Platform, PostJson } from "@/lib/api";
 import { formatSlot } from "@/lib/rules";
 import { DeleteConfirm } from "@/screens/DeleteConfirm";
+import { EditPostForm } from "@/screens/EditPostForm";
 
 const PLATFORM_NAMES: Record<Platform, string> = { instagram: "Instagram", youtube: "YouTube" };
 
@@ -37,38 +37,44 @@ function Summary({ post }: { post: PostJson }) {
   );
 }
 
+export type Mode = "view" | "edit" | "delete";
+
 interface Props {
   post: PostJson;
+  mode: Mode;
+  onMode: (mode: Mode) => void;
+  onSaved: (post: PostJson) => void;
   onDeleted: (id: string) => void;
+  onOpenSlots: () => void;
 }
 
-export function QueueItem({ post, onDeleted }: Props) {
-  const [deleting, setDeleting] = useState(false);
+function Actions({ title, onMode }: { title: string; onMode: (mode: Mode) => void }) {
+  return (
+    <div className="flex gap-3">
+      <Button type="button" variant="outline" className="h-11 min-h-11" aria-label={`Edit ${title}`} onClick={() => onMode("edit")}>
+        Edit
+      </Button>
+      <Button type="button" variant="outline" className="h-11 min-h-11" aria-label={`Delete ${title}`} onClick={() => onMode("delete")}>
+        Delete
+      </Button>
+    </div>
+  );
+}
+
+export function QueueItem({ post, mode, onMode, onSaved, onDeleted, onOpenSlots }: Props) {
+  const close = () => onMode("view");
   return (
     <li>
       <Card className="space-y-3 p-4">
         <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
           <Summary post={post} />
         </div>
-        {deleting ? (
-          <DeleteConfirm
-            id={post.id}
-            title={post.title}
-            onDeleted={() => onDeleted(post.id)}
-            onCancel={() => setDeleting(false)}
-          />
-        ) : (
-          <div className="flex gap-3">
-            <Button
-              type="button"
-              variant="outline"
-              className="h-11 min-h-11"
-              aria-label={`Delete ${post.title}`}
-              onClick={() => setDeleting(true)}
-            >
-              Delete
-            </Button>
-          </div>
+        {mode === "view" && <Actions title={post.title} onMode={onMode} />}
+        {mode === "edit" && (
+          <EditPostForm post={post} onSaved={onSaved} onCancel={close} onOpenSlots={onOpenSlots} />
+        )}
+        {mode === "delete" && (
+          <DeleteConfirm id={post.id} title={post.title} onDeleted={() => onDeleted(post.id)} onCancel={close} />
         )}
       </Card>
     </li>
