@@ -9,7 +9,10 @@
 
 use crate::publish::is_valid_external_id;
 use crate::publish_app::{PublishError, PublishedRef};
-use crate::youtube::CHUNK_BYTES;
+use crate::youtube::{
+    classify_refusal, Reply, SubrequestBudget, CHUNK_BYTES, CHUNK_SUBREQUESTS, MAX_PUBLISH_BYTES,
+    STATUS_CHECK_RESERVE,
+};
 
 /// One PUT of the upload: bytes `start..=end` of `total`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -67,6 +70,27 @@ pub fn confirmed_bytes(range: Option<&str>, total: u64) -> Option<u64> {
     (received <= total).then_some(received)
 }
 
+/// What the adapter does next.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Step {
+    /// Read this range from R2 and PUT it with its `Content-Range`.
+    Send(Chunk),
+    /// An empty PUT with `status_content_range(total)`, to learn where the upload stands.
+    Query,
+    /// The provider accepted the whole video: read its `id` and call `finish`.
+    Complete,
+    Fail(PublishError),
+}
+
+#[derive(Debug)]
+pub struct Upload {
+    total: u64,
+    in_flight: Option<Chunk>,
+    sent_any: bool,
+    sent_final: bool,
+    queries: u32,
+}
+
 /// The video resource's `id`, as we are willing to store it. A success reply without a
 /// usable id is `Unknown`: the video may exist.
 pub fn finish(id: Option<&str>) -> Result<PublishedRef, PublishError> {
@@ -78,11 +102,149 @@ pub fn finish(id: Option<&str>) -> Result<PublishedRef, PublishError> {
     }
 }
 
+impl Upload {
+    /// `total` is the object's size. Empty or above `MAX_PUBLISH_BYTES` is `Rejected`.
+    pub fn new(total: u64) -> Result<Upload, PublishError> {
+        if total == 0 || total > MAX_PUBLISH_BYTES {
+            return Err(PublishError::Rejected);
+        }
+        Ok(Upload {
+            total,
+            in_flight: None,
+            sent_any: false,
+            sent_final: false,
+            queries: 0,
+        })
+    }
+
+    /// The first step, after the session was started.
+    pub fn begin(&mut self, budget: &mut SubrequestBudget) -> Step {
+        self.send_from(0, budget)
+    }
+
+    /// Feeds the answer to the chunk PUT the last `Send` asked for.
+    pub fn on_chunk(&mut self, reply: &Reply, now: i64, budget: &mut SubrequestBudget) -> Step {
+        let Some(chunk) = self.in_flight.take() else {
+            return Step::Fail(PublishError::Unknown);
+        };
+        self.sent_any = true;
+        self.sent_final |= chunk.is_last();
+        match reply.status {
+            Some(308) => match confirmed_bytes(reply.range.as_deref(), self.total) {
+                // A 308 means more is needed, so all of it cannot be there; and it
+                // cannot hold more than was sent.
+                Some(n) if n < self.total && n <= chunk.end + 1 => self.send_from(n, budget),
+                _ => Step::Fail(PublishError::Unknown),
+            },
+            Some(200 | 201) if chunk.is_last() => Step::Complete,
+            // The reply was lost or the server hiccuped: find out before doing more.
+            None | Some(408 | 500..=599) => self.query(budget),
+            Some(404 | 410) => self.session_gone(),
+            // The provider refused this request outright, so it created nothing from it.
+            Some(s @ 400..=499) => Step::Fail(classify_refusal(reply, s, now)),
+            Some(_) => Step::Fail(PublishError::Unknown),
+        }
+    }
+
+    /// Feeds the answer to the status check the last `Query` asked for.
+    pub fn on_query(&mut self, reply: &Reply, budget: &mut SubrequestBudget) -> Step {
+        match reply.status {
+            Some(308) => match confirmed_bytes(reply.range.as_deref(), self.total) {
+                Some(n) if n < self.total => self.send_from(n, budget),
+                _ => Step::Fail(PublishError::Unknown),
+            },
+            Some(200 | 201) => Step::Complete,
+            None | Some(408 | 500..=599) => self.query(budget),
+            Some(404 | 410) => self.session_gone(),
+            // Whatever else, it settles nothing about whether the video exists.
+            Some(_) => Step::Fail(PublishError::Unknown),
+        }
+    }
+
+    fn send_from(&mut self, offset: u64, budget: &mut SubrequestBudget) -> Step {
+        let Some(chunk) = chunk_at(offset, self.total) else {
+            return Step::Fail(PublishError::Unknown);
+        };
+        if !budget.spend(CHUNK_SUBREQUESTS) {
+            return Step::Fail(self.unfinished());
+        }
+        self.in_flight = Some(chunk);
+        Step::Send(chunk)
+    }
+
+    fn query(&mut self, budget: &mut SubrequestBudget) -> Step {
+        if self.queries >= STATUS_CHECK_RESERVE || !budget.spend(1) {
+            return Step::Fail(self.unfinished());
+        }
+        self.queries += 1;
+        Step::Query
+    }
+
+    /// The session is gone. With the final chunk never sent nothing can exist, so a
+    /// fresh start is safe; otherwise the video may exist.
+    fn session_gone(&self) -> Step {
+        Step::Fail(if self.sent_final {
+            PublishError::Unknown
+        } else {
+            PublishError::Transient
+        })
+    }
+
+    /// Out of budget or checks: nothing sent means a retry is safe, else unknown.
+    fn unfinished(&self) -> PublishError {
+        if self.sent_any {
+            PublishError::Unknown
+        } else {
+            PublishError::Transient
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::youtube::{ApiReason, START_SUBREQUESTS, UPLOAD_SUBREQUESTS};
 
     const MIB: u64 = 1024 * 1024;
+
+    fn budget() -> SubrequestBudget {
+        let mut b = SubrequestBudget::for_upload();
+        assert!(b.spend(START_SUBREQUESTS));
+        b
+    }
+
+    fn with_range(status: u16, range: Option<&str>) -> Reply {
+        Reply {
+            range: range.map(str::to_string),
+            ..Reply::status(status)
+        }
+    }
+
+    fn ok308(upto: u64) -> Reply {
+        with_range(308, Some(&format!("bytes=0-{}", upto - 1)))
+    }
+
+    /// Runs the machine against a script of replies, recording what it asked for.
+    fn drive(total: u64, script: Vec<Reply>) -> (Vec<String>, Step) {
+        let mut up = Upload::new(total).unwrap();
+        let mut b = budget();
+        let mut replies = script.into_iter();
+        let mut log = vec![];
+        let mut step = up.begin(&mut b);
+        loop {
+            match step {
+                Step::Send(c) => {
+                    log.push(c.content_range());
+                    step = up.on_chunk(&replies.next().expect("script ran out"), 0, &mut b);
+                }
+                Step::Query => {
+                    log.push(status_content_range(total));
+                    step = up.on_query(&replies.next().expect("script ran out"), &mut b);
+                }
+                done => return (log, done),
+            }
+        }
+    }
 
     #[test]
     fn chunks_are_8_mib_and_the_last_takes_what_is_left() {
@@ -124,6 +286,241 @@ mod tests {
         ] {
             assert_eq!(confirmed_bytes(Some(bad), 100), None, "{bad:?}");
         }
+    }
+
+    #[test]
+    fn an_empty_or_oversized_video_is_rejected_before_anything_is_sent() {
+        assert_eq!(Upload::new(0).unwrap_err(), PublishError::Rejected);
+        assert_eq!(
+            Upload::new(MAX_PUBLISH_BYTES + 1).unwrap_err(),
+            PublishError::Rejected
+        );
+        assert!(Upload::new(1).is_ok());
+        assert!(Upload::new(MAX_PUBLISH_BYTES).is_ok());
+    }
+
+    #[test]
+    fn a_small_video_is_one_chunk() {
+        let (log, end) = drive(2_000_000, vec![Reply::status(200)]);
+        assert_eq!(log, ["bytes 0-1999999/2000000"]);
+        assert_eq!(end, Step::Complete);
+    }
+
+    #[test]
+    fn a_large_video_goes_chunk_by_chunk_on_308s() {
+        let (log, end) = drive(
+            20 * MIB,
+            vec![ok308(8 * MIB), ok308(16 * MIB), Reply::status(201)],
+        );
+        assert_eq!(
+            log,
+            [
+                "bytes 0-8388607/20971520",
+                "bytes 8388608-16777215/20971520",
+                "bytes 16777216-20971519/20971520"
+            ]
+        );
+        assert_eq!(end, Step::Complete);
+    }
+
+    #[test]
+    fn a_308_resumes_from_what_the_provider_holds() {
+        // It kept only 256 KiB of the first chunk, then nothing at all.
+        let (log, end) = drive(
+            10 * MIB,
+            vec![
+                ok308(256 * 1024),
+                with_range(308, None),
+                ok308(8 * MIB),
+                Reply::status(200),
+            ],
+        );
+        assert_eq!(
+            log,
+            [
+                "bytes 0-8388607/10485760",
+                "bytes 262144-8650751/10485760",
+                "bytes 0-8388607/10485760",
+                "bytes 8388608-10485759/10485760"
+            ]
+        );
+        assert_eq!(end, Step::Complete);
+    }
+
+    #[test]
+    fn a_lost_reply_is_settled_by_a_status_check_before_anything_else() {
+        let (log, end) = drive(
+            20 * MIB,
+            vec![
+                ok308(8 * MIB),
+                Reply::lost(),
+                ok308(8 * MIB + 262_144),
+                ok308(16 * MIB + 262_144),
+                Reply::status(200),
+            ],
+        );
+        assert_eq!(log[1], "bytes 8388608-16777215/20971520");
+        assert_eq!(log[2], "bytes */20971520");
+        assert_eq!(log[3], "bytes 8650752-17039359/20971520");
+        assert_eq!(end, Step::Complete);
+        // A 5xx or a 408 on a chunk is handled the same way.
+        for status in [500, 503, 408] {
+            let (log, end) = drive(
+                10 * MIB,
+                vec![with_range(status, None), ok308(8 * MIB), Reply::status(200)],
+            );
+            assert_eq!(log[1], "bytes */10485760", "{status}");
+            assert_eq!(end, Step::Complete);
+        }
+    }
+
+    #[test]
+    fn a_lost_final_reply_that_the_status_check_shows_complete_is_a_success() {
+        let (log, end) = drive(1_000, vec![Reply::lost(), Reply::status(200)]);
+        assert_eq!(log, ["bytes 0-999/1000", "bytes */1000"]);
+        assert_eq!(end, Step::Complete);
+    }
+
+    #[test]
+    fn a_session_that_is_gone_is_safe_to_restart_only_if_the_final_chunk_was_never_sent() {
+        // First chunk of two lost, then the session is gone: no final chunk, so Transient.
+        let (_, end) = drive(20 * MIB, vec![Reply::lost(), Reply::status(404)]);
+        assert_eq!(end, Step::Fail(PublishError::Transient));
+        let (_, end) = drive(20 * MIB, vec![Reply::status(404)]);
+        assert_eq!(end, Step::Fail(PublishError::Transient));
+        let (_, end) = drive(20 * MIB, vec![ok308(8 * MIB), Reply::status(410)]);
+        assert_eq!(end, Step::Fail(PublishError::Transient));
+        // The final chunk went out and then the session is gone: the video may exist.
+        let (_, end) = drive(1_000, vec![Reply::lost(), Reply::status(404)]);
+        assert_eq!(end, Step::Fail(PublishError::Unknown));
+        let (_, end) = drive(1_000, vec![Reply::status(404)]);
+        assert_eq!(end, Step::Fail(PublishError::Unknown));
+    }
+
+    #[test]
+    fn a_status_check_that_keeps_failing_ends_unknown_once_the_budget_is_spent() {
+        let mut script = vec![Reply::lost()];
+        script.extend(std::iter::repeat_with(Reply::lost).take(100));
+        let mut up = Upload::new(1_000).unwrap();
+        let mut b = budget();
+        let mut step = up.begin(&mut b);
+        let mut queries = 0;
+        for reply in script {
+            step = match step {
+                Step::Send(_) => up.on_chunk(&reply, 0, &mut b),
+                Step::Query => {
+                    queries += 1;
+                    up.on_query(&reply, &mut b)
+                }
+                _ => break,
+            };
+        }
+        assert_eq!(step, Step::Fail(PublishError::Unknown));
+        assert_eq!(
+            b.left(),
+            UPLOAD_SUBREQUESTS - START_SUBREQUESTS - CHUNK_SUBREQUESTS - queries
+        );
+        assert!(queries >= 6, "{queries}");
+    }
+
+    #[test]
+    fn an_explicit_refusal_of_a_chunk_is_classified_not_unknown() {
+        let r = |status, reason| Reply {
+            reason,
+            ..Reply::status(status)
+        };
+        let end = |reply: Reply| drive(20 * MIB, vec![reply]).1;
+        assert_eq!(
+            end(r(401, ApiReason::Other)),
+            Step::Fail(PublishError::Auth)
+        );
+        assert_eq!(
+            end(r(403, ApiReason::Quota)),
+            Step::Fail(PublishError::RateLimited { retry_at: None })
+        );
+        assert_eq!(
+            end(r(403, ApiReason::Other)),
+            Step::Fail(PublishError::Rejected)
+        );
+        assert_eq!(
+            end(r(400, ApiReason::Other)),
+            Step::Fail(PublishError::Rejected)
+        );
+        assert_eq!(
+            end(Reply {
+                retry_after: Some("60".into()),
+                ..r(429, ApiReason::Other)
+            }),
+            Step::Fail(PublishError::RateLimited { retry_at: Some(60) })
+        );
+    }
+
+    #[test]
+    fn answers_that_make_no_sense_are_unknown() {
+        // A 200 for a chunk that is not the last; a 3xx or 2xx we do not know.
+        for reply in [
+            Reply::status(200),
+            Reply::status(201),
+            Reply::status(204),
+            Reply::status(302),
+        ] {
+            let (_, end) = drive(20 * MIB, vec![reply]);
+            assert_eq!(end, Step::Fail(PublishError::Unknown));
+        }
+        // A 308 whose Range is malformed, claims more than was sent, or says all of it arrived.
+        for range in ["bytes=5-9", "bytes=0-99999999999", "junk"] {
+            let (_, end) = drive(20 * MIB, vec![with_range(308, Some(range))]);
+            assert_eq!(end, Step::Fail(PublishError::Unknown), "{range}");
+        }
+        let (_, end) = drive(20 * MIB, vec![with_range(308, Some("bytes=0-20971519"))]);
+        assert_eq!(end, Step::Fail(PublishError::Unknown));
+        // Same for the answer to a status check.
+        let (_, end) = drive(
+            1_000,
+            vec![Reply::lost(), with_range(308, Some("bytes=0-999"))],
+        );
+        assert_eq!(end, Step::Fail(PublishError::Unknown));
+        let (_, end) = drive(1_000, vec![Reply::lost(), Reply::status(401)]);
+        assert_eq!(end, Step::Fail(PublishError::Unknown));
+    }
+
+    #[test]
+    fn the_biggest_video_fits_the_budget_with_the_status_reserve_untouched() {
+        let mut up = Upload::new(MAX_PUBLISH_BYTES).unwrap();
+        let mut b = budget();
+        let mut step = up.begin(&mut b);
+        let mut sent = 0;
+        while let Step::Send(c) = step {
+            sent += 1;
+            let reply = if c.is_last() {
+                Reply::status(200)
+            } else {
+                ok308(c.end + 1)
+            };
+            step = up.on_chunk(&reply, 0, &mut b);
+        }
+        assert_eq!(step, Step::Complete);
+        assert_eq!(sent, crate::youtube::MAX_CHUNKS);
+        assert_eq!(b.left(), crate::youtube::STATUS_CHECK_RESERVE);
+    }
+
+    #[test]
+    fn a_video_that_cannot_finish_inside_the_budget_stops_with_the_right_error() {
+        // Nothing sent yet: safe to retry. Something sent: unknown.
+        let mut up = Upload::new(MIB).unwrap();
+        let mut none = SubrequestBudget::for_upload();
+        assert!(none.spend(UPLOAD_SUBREQUESTS));
+        assert_eq!(up.begin(&mut none), Step::Fail(PublishError::Transient));
+        let mut up = Upload::new(20 * MIB).unwrap();
+        let mut one = SubrequestBudget::for_upload();
+        assert!(one.spend(UPLOAD_SUBREQUESTS - CHUNK_SUBREQUESTS));
+        let Step::Send(_) = up.begin(&mut one) else {
+            panic!()
+        };
+        assert_eq!(
+            up.on_chunk(&ok308(8 * MIB), 0, &mut one),
+            Step::Fail(PublishError::Unknown)
+        );
     }
 
     #[test]
