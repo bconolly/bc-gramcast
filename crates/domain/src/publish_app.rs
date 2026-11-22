@@ -88,6 +88,8 @@ pub trait Publisher {
 }
 
 /// Port: exchanges a token for a fresh one (the provider's refresh call).
+/// Return `Auth` only when the provider says the refresh token itself is no longer
+/// valid: it marks the account as needing a reconnect until the owner signs in again.
 #[allow(async_fn_in_trait)]
 pub trait TokenRefresher {
     async fn refresh(&self, token: &StoredToken) -> Result<StoredToken, PublishError>;
@@ -343,7 +345,16 @@ where
 
     /// Refreshes whether or not the token looks expired.
     async fn refresh(&self, token: &mut StoredToken) -> Result<(), PublishError> {
-        let mut fresh = self.refresher.refresh(token).await?;
+        let mut fresh = match self.refresher.refresh(token).await {
+            Ok(t) => t,
+            Err(PublishError::Auth) => {
+                // The refresh token itself is refused (revoked or expired): only the
+                // owner reconnecting fixes it. A failed mark is ignored; the run halts anyway.
+                let _ = self.tokens.mark_needs_reconnect().await;
+                return Err(PublishError::Auth);
+            }
+            Err(e) => return Err(e),
+        };
         // Providers often leave the refresh token out of a refresh response.
         if fresh.refresh_token.is_empty() {
             fresh.refresh_token = token.refresh_token.clone();
@@ -881,8 +892,8 @@ mod tests {
         assert!(second.outcomes.is_empty());
         assert_eq!(publisher.calls.borrow().len(), 2);
         assert_eq!(repo.state("b"), PublishState::new_queued());
-        // A new connect saves a token, which clears the mark.
-        pollster::block_on(tokens.save(&token(NOW + 3600, "ya29.RECONNECTED"))).unwrap();
+        // A new owner connect clears the mark.
+        pollster::block_on(tokens.connect(&token(NOW + 3600, "ya29.RECONNECTED"))).unwrap();
         assert!(!tokens.reconnect.get());
     }
 
@@ -1314,6 +1325,36 @@ mod tests {
     }
 
     #[test]
+    fn a_refresh_the_provider_refuses_marks_the_token_so_the_next_run_stops_early() {
+        let tokens = FakeTokenStore::default();
+        *tokens.token.borrow_mut() = Some(token(NOW, "old"));
+        let refresher = FakeRefresher {
+            result: Err(PublishError::Auth),
+            calls: Cell::new(0),
+        };
+        let repo = two_due();
+        let publisher = FakePublisher::default();
+        let first = run(&repo, &publisher, &tokens, &refresher);
+        assert_eq!(first.halted, Some(Halt::NeedsReconnect));
+        assert!(tokens.reconnect.get());
+        let second = run(&repo, &publisher, &tokens, &refresher);
+        assert_eq!(second.halted, Some(Halt::NeedsReconnect));
+        assert_eq!(refresher.calls.get(), 1);
+    }
+
+    #[test]
+    fn a_refresh_that_merely_hit_trouble_does_not_mark_the_token() {
+        let tokens = FakeTokenStore::default();
+        *tokens.token.borrow_mut() = Some(token(NOW, "old"));
+        let refresher = FakeRefresher {
+            result: Err(PublishError::Transient),
+            calls: Cell::new(0),
+        };
+        run(&two_due(), &FakePublisher::default(), &tokens, &refresher);
+        assert!(!tokens.reconnect.get());
+    }
+
+    #[test]
     fn a_refresh_that_is_rate_limited_or_unknown_at_run_start_halts_without_claiming() {
         for err in [
             PublishError::RateLimited { retry_at: None },
@@ -1426,6 +1467,9 @@ mod tests {
             }
             async fn save(&self, _t: &StoredToken) -> Result<(), PortError> {
                 Err(PortError("kv down".into()))
+            }
+            async fn connect(&self, t: &StoredToken) -> Result<(), PortError> {
+                self.0.connect(t).await
             }
             async fn mark_needs_reconnect(&self) -> Result<(), PortError> {
                 self.0.mark_needs_reconnect().await

@@ -40,11 +40,14 @@ impl fmt::Debug for StoredToken {
 pub trait TokenStore {
     /// `None` until the owner has connected the account.
     async fn load(&self) -> Result<Option<StoredToken>, PortError>;
-    /// Stores the token. The connect flow (a new owner sign-in) MUST call this, and a
-    /// save clears the needs-reconnect mark, so a fresh connect is the way out of it.
+    /// Stores a refreshed token. Used by the scheduled refresh path. Must NOT clear the
+    /// needs-reconnect mark: only the owner reconnecting does that (see `connect`).
     async fn save(&self, token: &StoredToken) -> Result<(), PortError>;
+    /// Stores a token from a new owner sign-in AND clears the needs-reconnect mark.
+    /// Callable only from the owner's OAuth callback, never from the scheduled run.
+    async fn connect(&self, token: &StoredToken) -> Result<(), PortError>;
     /// Records that the provider keeps refusing the stored token, so runs stop at once
-    /// instead of retrying. Cleared by `save`.
+    /// instead of retrying. Cleared only by `connect`.
     async fn mark_needs_reconnect(&self) -> Result<(), PortError>;
     async fn needs_reconnect(&self) -> Result<bool, PortError>;
 }
@@ -65,6 +68,10 @@ pub(crate) mod fakes {
             Ok(self.token.borrow().clone())
         }
         async fn save(&self, token: &StoredToken) -> Result<(), PortError> {
+            *self.token.borrow_mut() = Some(token.clone());
+            Ok(())
+        }
+        async fn connect(&self, token: &StoredToken) -> Result<(), PortError> {
             *self.token.borrow_mut() = Some(token.clone());
             self.reconnect.set(false);
             Ok(())
@@ -125,12 +132,14 @@ mod tests {
     }
 
     #[test]
-    fn a_save_clears_the_needs_reconnect_mark() {
+    fn a_refresh_save_keeps_the_mark_and_only_connect_clears_it() {
         let s = FakeTokenStore::default();
         assert_eq!(pollster::block_on(s.needs_reconnect()), Ok(false));
         pollster::block_on(s.mark_needs_reconnect()).unwrap();
-        assert_eq!(pollster::block_on(s.needs_reconnect()), Ok(true));
         pollster::block_on(s.save(&token(1))).unwrap();
+        assert_eq!(pollster::block_on(s.needs_reconnect()), Ok(true));
+        pollster::block_on(s.connect(&token(2))).unwrap();
         assert_eq!(pollster::block_on(s.needs_reconnect()), Ok(false));
+        assert_eq!(pollster::block_on(s.load()), Ok(Some(token(2))));
     }
 }
