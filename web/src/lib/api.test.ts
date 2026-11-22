@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   ApiError,
   deletePost,
+  getConnectStatus,
   getNextSlots,
   getPattern,
   getQueue,
@@ -294,5 +295,26 @@ describe("isNotQueued", () => {
     expect(isNotQueued(gone)).toBe(true);
     expect(isNotQueued(taken)).toBe(false);
     expect(isNotQueued(new Error("post is no longer queued"))).toBe(false);
+  });
+});
+
+describe("getConnectStatus", () => {
+  it("returns the two flags from GET /api/connect/status", async () => {
+    const body = { youtube: { connected: true, needs_reconnect: false } };
+    const fetchFn = mockFetch(reply(JSON.stringify(body)));
+    expect(await getConnectStatus()).toEqual(body);
+    expect(fetchFn.mock.calls[0]?.[0]).toBe("/api/connect/status");
+  });
+
+  it("refuses a body of the wrong shape", async () => {
+    for (const body of ["{}", '{"youtube":{"connected":"yes","needs_reconnect":false}}', '{"youtube":{"connected":true}}', "null"]) {
+      mockFetch(reply(body));
+      await expect(getConnectStatus()).rejects.toThrow("Something went wrong (error 200)");
+    }
+  });
+
+  it("shows the Worker's fixed message on failure", async () => {
+    mockFetch(reply("youtube connect is not configured", 503));
+    await expect(getConnectStatus()).rejects.toThrow("youtube connect is not configured");
   });
 });
