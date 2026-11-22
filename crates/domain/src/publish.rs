@@ -47,6 +47,23 @@ impl FailReason {
     }
 }
 
+impl FailReason {
+    /// Every reason, for round trips and exhaustive checks.
+    pub const ALL: [FailReason; 6] = [
+        FailReason::Auth,
+        FailReason::RateLimited,
+        FailReason::Rejected,
+        FailReason::Transient,
+        FailReason::StuckPublishing,
+        FailReason::Unknown,
+    ];
+
+    /// The reverse of `code`: only the six fixed codes, nothing else.
+    pub fn from_code(code: &str) -> Option<FailReason> {
+        Self::ALL.into_iter().find(|r| r.code() == code)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PublishState {
     /// Waiting for its slot, or for `not_before` after a retryable failure.
@@ -460,6 +477,16 @@ mod tests {
             })
         );
         assert_eq!(flag_if_stuck(&PublishState::new_queued(), i64::MAX), None);
+    }
+
+    #[test]
+    fn reason_codes_round_trip_and_nothing_else_parses() {
+        for r in FailReason::ALL {
+            assert_eq!(FailReason::from_code(r.code()), Some(r));
+        }
+        for bad in ["", "Auth", "AUTH", "auth ", "failed", "unknown\n"] {
+            assert_eq!(FailReason::from_code(bad), None, "{bad:?}");
+        }
     }
 
     #[test]
