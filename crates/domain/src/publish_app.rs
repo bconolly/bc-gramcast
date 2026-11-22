@@ -142,7 +142,8 @@ pub enum Outcome {
     FlaggedStuck,
     /// The final state write did not land (the post changed under us, or storage
     /// failed). `external_id` is the provider's id if the upload succeeded, so the
-    /// caller can log it: the post will sit in Publishing until it is reviewed.
+    /// caller can log it. The post stays in Publishing (even for a failure we knew about)
+    /// and is flagged for manual review once `PUBLISH_TIMEOUT_SECS` passes.
     StateLost {
         external_id: Option<String>,
     },
@@ -1192,6 +1193,104 @@ mod tests {
             Outcome::StateLost { external_id: None }
         );
         assert_eq!(report.halted, Some(Halt::RateLimited));
+        assert_eq!(publisher.calls.borrow().len(), 1);
+    }
+
+    #[test]
+    fn a_post_left_in_publishing_keeps_the_claim_time_of_its_own_turn() {
+        let clock = Rc::new(Cell::new(NOW));
+        let repo = two_due();
+        // Post a's final write goes through; post b's fails and leaves it in Publishing.
+        repo.fail_final.set(Some(1));
+        let publisher = FakePublisher {
+            results: RefCell::new(vec![ok_ref("yt1"), ok_ref("yt2")].into()),
+            advance: Some((clock.clone(), 5_000)),
+            ..FakePublisher::default()
+        };
+        let c = clock.clone();
+        let report = pollster::block_on(publish_due(
+            &move || c.get(),
+            &repo,
+            &publisher,
+            &fresh_store(),
+            &refresher_ok(),
+            &FakeLinks,
+        ))
+        .unwrap();
+        assert_eq!(report.halted, Some(Halt::Storage));
+        assert_eq!(
+            repo.state("b"),
+            PublishState::Publishing {
+                attempt: 1,
+                started_at: NOW + 5_000
+            }
+        );
+    }
+
+    #[test]
+    fn a_storage_error_while_flagging_a_stuck_post_halts_before_anything_is_claimed() {
+        let mut stuck = scheduled("stuck", 0);
+        stuck.state = PublishState::Publishing {
+            attempt: 1,
+            started_at: NOW - PUBLISH_TIMEOUT_SECS,
+        };
+        let repo = FakeRepo::with(vec![stuck, scheduled("due", 1)]);
+        repo.fail_final.set(Some(0));
+        let publisher = FakePublisher::default();
+        let report = run(&repo, &publisher, &fresh_store(), &refresher_ok());
+        assert_eq!(report.halted, Some(Halt::Storage));
+        assert!(report.outcomes.is_empty());
+        assert_eq!(repo.state("due"), PublishState::new_queued());
+        assert!(publisher.calls.borrow().is_empty());
+    }
+
+    #[test]
+    fn a_refresh_that_is_rate_limited_or_unknown_at_run_start_halts_without_claiming() {
+        for err in [
+            PublishError::RateLimited { retry_at: None },
+            PublishError::Unknown,
+            PublishError::Rejected,
+        ] {
+            let repo = two_due();
+            let tokens = FakeTokenStore::default();
+            *tokens.token.borrow_mut() = Some(token(NOW, "old"));
+            let refresher = FakeRefresher {
+                result: Err(err),
+                calls: Cell::new(0),
+            };
+            let publisher = FakePublisher::default();
+            let report = run(&repo, &publisher, &tokens, &refresher);
+            assert_eq!(report.halted, Some(Halt::TokenUnavailable), "{err:?}");
+            assert_eq!(repo.state("a"), PublishState::new_queued());
+            assert!(publisher.calls.borrow().is_empty());
+        }
+    }
+
+    /// A known outcome (here a rejection) whose final write is lost leaves the post in
+    /// Publishing. It is then flagged stuck once the timeout passes: manual review, not a
+    /// retry, which is the safe side because the real outcome was not recorded.
+    #[test]
+    fn a_post_whose_failure_was_not_recorded_is_later_flagged_stuck() {
+        let repo = FakeRepo::with(vec![scheduled("a", 1)]);
+        repo.fail_final.set(Some(0));
+        let publisher = FakePublisher::returning(vec![Err(PublishError::Rejected)]);
+        let first = run(&repo, &publisher, &fresh_store(), &refresher_ok());
+        assert_eq!(
+            first.outcomes[0].1,
+            Outcome::StateLost { external_id: None }
+        );
+        assert!(matches!(repo.state("a"), PublishState::Publishing { .. }));
+        repo.fail_final.set(None);
+        let later = pollster::block_on(publish_due(
+            &|| NOW + PUBLISH_TIMEOUT_SECS,
+            &repo,
+            &publisher,
+            &fresh_store(),
+            &refresher_ok(),
+            &FakeLinks,
+        ))
+        .unwrap();
+        assert_eq!(later.outcomes, [("a".to_string(), Outcome::FlaggedStuck)]);
         assert_eq!(publisher.calls.borrow().len(), 1);
     }
 
