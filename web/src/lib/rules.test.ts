@@ -58,11 +58,14 @@ describe("validateForm", () => {
     expect(validateForm({ ...ok, file: null })).toContain("Choose an MP4 video.");
     expect(validateForm({ ...ok, file: mp4("reel.mov") })).toContain("The video must be an MP4 file.");
   });
+  it("caps a video at what one publishing run can upload (88 MiB, as the Worker)", () => {
+    expect(MAX_UPLOAD_BYTES).toBe(88 * 1024 * 1024);
+  });
   it("rejects an empty or oversized file", () => {
     expect(validateForm({ ...ok, file: mp4("a.mp4", 0) })).toContain("The video file is empty.");
     expect(validateForm({ ...ok, file: mp4("a.mp4", MAX_UPLOAD_BYTES) })).toEqual([]);
     expect(validateForm({ ...ok, file: mp4("a.mp4", MAX_UPLOAD_BYTES + 1) })).toContain(
-      "The video is too large (100 MB limit).",
+      "The video is too large (88 MB limit).",
     );
   });
   it("rejects file names the server rejects", () => {

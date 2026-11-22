@@ -5,7 +5,8 @@ import type { Platform } from "@/lib/api";
 
 export const MAX_TITLE_CHARS = 100;
 export const MAX_CAPTION_CHARS = 2200;
-export const MAX_UPLOAD_BYTES = 100 * 1024 * 1024;
+// The largest video one publishing run can upload (crates/domain/src/youtube.rs: 11 chunks of 8 MiB).
+export const MAX_UPLOAD_BYTES = 88 * 1024 * 1024;
 export const MAX_FILE_NAME_BYTES = 255;
 export const MAX_SLOT_SECS = 4_102_444_800;
 
@@ -62,7 +63,7 @@ function fileProblem(file: File | null): string | null {
   if (badFileName(file.name)) return "The file name is not allowed.";
   if (!file.name.toLowerCase().endsWith(".mp4")) return "The video must be an MP4 file.";
   if (file.size === 0) return "The video file is empty.";
-  if (file.size > MAX_UPLOAD_BYTES) return "The video is too large (100 MB limit).";
+  if (file.size > MAX_UPLOAD_BYTES) return "The video is too large (88 MB limit).";
   return null;
 }
 
