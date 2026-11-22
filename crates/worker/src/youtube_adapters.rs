@@ -30,7 +30,8 @@ use std::time::Duration;
 use worker::js_sys::Uint8Array;
 use worker::wasm_bindgen::JsValue;
 use worker::{
-    Bucket, Delay, Headers, Method, Range, Request, RequestInit, RequestRedirect, Response,
+    Bucket, Conditional, Delay, Headers, Method, Range, Request, RequestInit, RequestRedirect,
+    Response,
 };
 
 /// Starts a resumable upload (the brief's URL, as the wire shape).
@@ -60,7 +61,7 @@ impl VideoLinks for R2Videos {
             .await
             .map_err(|_| PortError("video lookup failed".into()))?
             .ok_or_else(|| PortError("video missing".into()))?;
-        Ok(VideoAccess::new(video_key, object.size()))
+        Ok(VideoAccess::new(video_key, object.size()).with_etag(object.etag()))
     }
 }
 
@@ -149,21 +150,24 @@ impl YouTubePublisher {
         (answer.reply, answer.body)
     }
 
-    /// Reads one chunk's bytes from R2 by range. Fails if the object is missing or
-    /// not the size the chunk expects (it changed after the size was read).
-    async fn read_chunk(&self, key: &str, chunk: &Chunk) -> Option<Vec<u8>> {
-        let object = self
-            .bucket
-            .get(key)
-            .range(Range::OffsetWithLength {
-                offset: chunk.start,
-                length: chunk.byte_len(),
-            })
-            .execute()
-            .await
-            .ok()??;
+    /// Reads one chunk's bytes from R2 by range, only if the object still has the etag its
+    /// size was read at (`onlyIf` etagMatches). `None` if the object is missing, has
+    /// changed (R2 then answers with an object that has no body), or is not the size the
+    /// chunk expects. Every `None` is "not sent": the caller gives up with `out_of_time`.
+    async fn read_chunk(&self, video: &VideoAccess, chunk: &Chunk) -> Option<Vec<u8>> {
+        let mut get = self.bucket.get(video.key()).range(Range::OffsetWithLength {
+            offset: chunk.start,
+            length: chunk.byte_len(),
+        });
+        if let Some(etag) = video.etag() {
+            get = get.only_if(Conditional {
+                etag_matches: Some(etag.to_string()),
+                ..Conditional::default()
+            });
+        }
+        let object = get.execute().await.ok()??;
         let bytes = object.body()?.bytes().await.ok()?;
-        (bytes.len() as u64 == chunk.byte_len()).then_some(bytes)
+        upload::read_matches(chunk, bytes.len() as u64).then_some(bytes)
     }
 }
 
@@ -189,7 +193,7 @@ fn request(method: Method, url: &str, headers: Headers, body: Option<JsValue>) -
 /// id) and a 4xx (error reason codes), then handed on as text for the caller to take the
 /// id from; error text is reduced to reason codes here and dropped.
 async fn answer(sent: Result<Response, net::NetFail>) -> Answer {
-    let Ok(mut response) = sent else {
+    let Ok(response) = sent else {
         return Answer {
             reply: Reply::lost(),
             body: None,
@@ -200,9 +204,12 @@ async fn answer(sent: Result<Response, net::NetFail>) -> Answer {
     let header = |name: &str| response.headers().get(name).ok().flatten();
     let (range, retry_after, location) =
         (header("Range"), header("Retry-After"), header("Location"));
+    // A body is read only for a 200, 201 or 4xx, and only if it is small; the body of
+    // anything else (a 308, a 5xx) is cancelled unread.
     let text = if matches!(status, 200 | 201 | 400..=499) {
-        response.text().await.ok()
+        net::bounded_text(response).await
     } else {
+        net::discard_body(response);
         None
     };
     let client_error = (400..500).contains(&status);
@@ -252,7 +259,7 @@ impl Publisher for YouTubePublisher {
                     if now_secs() >= deadline {
                         return Err(up.out_of_time());
                     }
-                    let Some(bytes) = self.read_chunk(video.key(), &chunk).await else {
+                    let Some(bytes) = self.read_chunk(video, &chunk).await else {
                         // Not sent: only a final chunk already out makes the outcome unknown.
                         return Err(up.out_of_time());
                     };

@@ -19,6 +19,9 @@ use std::fmt;
 pub struct VideoAccess {
     key: String,
     size: u64,
+    /// The storage version tag read with the size, so every range read can insist on
+    /// the same object. Not a secret, but not shown either.
+    etag: Option<String>,
 }
 
 impl VideoAccess {
@@ -26,7 +29,18 @@ impl VideoAccess {
         Self {
             key: key.into(),
             size,
+            etag: None,
         }
+    }
+
+    /// The same video with the storage version tag its size was read at.
+    pub fn with_etag(mut self, etag: impl Into<String>) -> Self {
+        self.etag = Some(etag.into());
+        self
+    }
+
+    pub fn etag(&self) -> Option<&str> {
+        self.etag.as_deref()
     }
 
     pub fn key(&self) -> &str {
@@ -661,7 +675,10 @@ mod tests {
     #[test]
     fn video_access_debug_hides_the_key() {
         let v = VideoAccess::new("videos/SECRET-KEY.mp4", 1234);
+        let v = v.with_etag("ETAG-VALUE");
+        assert_eq!(v.etag(), Some("ETAG-VALUE"));
         let out = format!("{v:?} {v:#?}");
+        assert!(!out.contains("ETAG"), "{out}");
         assert!(!out.contains("SECRET") && !out.contains("videos/"), "{out}");
         assert!(out.contains("[redacted]") && out.contains("1234"));
         assert_eq!((v.key(), v.size()), ("videos/SECRET-KEY.mp4", 1234));

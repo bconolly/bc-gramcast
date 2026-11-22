@@ -410,9 +410,11 @@ impl CodeExchanger for GoogleExchanger {
             .with_body(Some(JsValue::from_str(&body)))
             .with_redirect(RequestRedirect::Manual);
         let request = Request::new_with_init(oauth::GOOGLE_TOKEN_URL, &init).map_err(fail)?;
-        let mut response = Fetch::Request(request).send().await.map_err(fail)?;
+        let response = Fetch::Request(request).send().await.map_err(fail)?;
         let status = response.status_code();
-        let text = response.text().await.map_err(fail)?;
+        let text = net::bounded_text(response)
+            .await
+            .ok_or_else(|| port("token request failed"))?;
         Ok(connect_dto::reply_from_body(status, &text))
     }
 }
@@ -466,12 +468,14 @@ impl TokenRefresher for GoogleRefresher {
         let request = self
             .request(&token.refresh_token)
             .ok_or(PublishError::Transient)?;
-        let mut response = net::send(request)
+        let response = net::send(request)
             .await
             .map_err(|_| PublishError::Transient)?;
         let status = response.status_code();
         let retry_after = response.headers().get("Retry-After").ok().flatten();
-        let text = response.text().await.map_err(|_| PublishError::Transient)?;
+        let text = net::bounded_text(response)
+            .await
+            .ok_or(PublishError::Transient)?;
         let reply = connect_dto::reply_from_body(status, &text);
         youtube::refresh_outcome(&reply, retry_after.as_deref(), now_secs())
     }

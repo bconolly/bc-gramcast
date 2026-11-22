@@ -229,6 +229,25 @@ pub fn is_session_uri(uri: &str) -> bool {
         .is_some_and(|after| after.is_empty() || after.starts_with('/'))
 }
 
+/// The most of a provider's answer (YouTube or the token endpoint) we will read. Their
+/// answers are small JSON; anything bigger is not read.
+pub const MAX_RESPONSE_BYTES: u64 = 64 * 1024;
+
+/// Whether a response may be read, judged by its `Content-Length` header. A missing
+/// header is allowed (the body is then read as before, unbounded: the platform gives no
+/// other check here); a header that is not a plain number, or is above
+/// `MAX_RESPONSE_BYTES`, is not.
+pub fn body_within_cap(content_length: Option<&str>) -> bool {
+    let Some(text) = content_length else {
+        return true;
+    };
+    let text = text.trim();
+    text.len() <= 10
+        && !text.is_empty()
+        && text.bytes().all(|b| b.is_ascii_digit())
+        && text.parse::<u64>().is_ok_and(|n| n <= MAX_RESPONSE_BYTES)
+}
+
 /// An absolute retry time from a `Retry-After` header, as delta-seconds added to the
 /// Worker's `now`. An HTTP-date, a negative or a non-numeric value gives `None` (the
 /// domain then waits its default); dates are not parsed here.
@@ -499,6 +518,30 @@ mod tests {
         ] {
             assert!(!is_session_uri(bad), "{bad}");
         }
+    }
+
+    #[test]
+    fn a_response_is_read_only_if_its_declared_size_is_small() {
+        assert!(body_within_cap(None));
+        assert!(body_within_cap(Some("0")));
+        assert!(body_within_cap(Some("512")));
+        assert!(body_within_cap(Some(" 65536 ")));
+        assert!(body_within_cap(Some("0065536")));
+        for bad in [
+            "65537",
+            "99999999999",
+            "",
+            " ",
+            "-1",
+            "1e3",
+            "12 34",
+            "0x10",
+            "1.5",
+            "abc",
+        ] {
+            assert!(!body_within_cap(Some(bad)), "{bad:?}");
+        }
+        assert_eq!(MAX_RESPONSE_BYTES, 64 * 1024);
     }
 
     #[test]

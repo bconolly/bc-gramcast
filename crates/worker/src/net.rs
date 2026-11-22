@@ -2,7 +2,7 @@
 //! `domain::youtube::REQUEST_TIMEOUT_SECS`. A failure carries no detail on purpose: the
 //! underlying error can name the URL, which for an upload session is a secret.
 
-use domain::youtube::REQUEST_TIMEOUT_SECS;
+use domain::youtube::{body_within_cap, REQUEST_TIMEOUT_SECS};
 use worker::js_sys::{self, Function, Reflect};
 use worker::wasm_bindgen::{JsCast, JsValue};
 use worker::{AbortSignal, Fetch, Request, Response};
@@ -34,4 +34,26 @@ pub async fn send(request: Request) -> Result<Response, NetFail> {
         .send_with_signal(&signal)
         .await
         .map_err(|_| NetFail)
+}
+
+/// Stops the platform downloading a body we will not read. Best effort: a failure to
+/// cancel changes nothing, the response is dropped either way.
+pub fn discard_body(response: Response) {
+    let raw: worker::web_sys::Response = response.into();
+    if let Some(body) = raw.body() {
+        let _ = body.cancel();
+    }
+}
+
+/// The body as text, if its declared `Content-Length` is within `MAX_RESPONSE_BYTES`
+/// (`domain::youtube::body_within_cap`). A response with no `Content-Length` is read as
+/// before, with no limit. An oversized one is cancelled unread, and so is a read that
+/// fails: both give `None`.
+pub async fn bounded_text(mut response: Response) -> Option<String> {
+    let declared = response.headers().get("Content-Length").ok().flatten();
+    if !body_within_cap(declared.as_deref()) {
+        discard_body(response);
+        return None;
+    }
+    response.text().await.ok()
 }

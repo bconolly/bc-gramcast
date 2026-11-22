@@ -59,6 +59,12 @@ pub fn chunk_at(offset: u64, total: u64) -> Option<Chunk> {
     })
 }
 
+/// Whether the bytes read back from storage are what `chunk` expects: exactly its length.
+/// A short or long read means the object changed after its size was read.
+pub fn read_matches(chunk: &Chunk, read_len: u64) -> bool {
+    read_len == chunk.byte_len()
+}
+
 /// How many bytes the provider says it holds, from a 308's `Range` header. No header
 /// means none yet. `bytes=0-N` means `N + 1`. Anything else, or more than `total`, is
 /// `None`.
@@ -273,6 +279,15 @@ mod tests {
         // Every chunk but the last is a multiple of 256 KiB, even from an odd offset.
         let from_odd = chunk_at(262_144 + 7, 100 * MIB).unwrap();
         assert_eq!(from_odd.byte_len() % (256 * 1024), 0);
+    }
+
+    #[test]
+    fn a_read_must_be_exactly_the_chunk() {
+        let c = chunk_at(8 * MIB, 20 * MIB).unwrap();
+        assert!(read_matches(&c, 8 * MIB));
+        assert!(!read_matches(&c, 8 * MIB - 1));
+        assert!(!read_matches(&c, 8 * MIB + 1));
+        assert!(!read_matches(&c, 0));
     }
 
     #[test]
