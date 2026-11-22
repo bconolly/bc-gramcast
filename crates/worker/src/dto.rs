@@ -365,6 +365,12 @@ pub fn error_status(e: &AppError) -> (u16, &'static str) {
             QueueError::EmptyTitle => (422, "title is required"),
             QueueError::BadVideoKey => (422, "video key is not valid"),
             QueueError::TooLong => (422, "title or caption is too long"),
+            QueueError::DescriptionTooManyBytes => {
+                (422, "caption is too long for YouTube (5000 bytes at most)")
+            }
+            QueueError::AngleBrackets => {
+                (422, "YouTube does not allow < or > in a title or caption")
+            }
             QueueError::DuplicatePlatform => (422, "each platform can be chosen once"),
             QueueError::SlotInPast => (422, "slot must be in the future"),
             QueueError::SlotOutOfRange => (422, "slot is out of range"),
@@ -963,6 +969,16 @@ mod tests {
                 AppError::Queue(QueueError::BadVideoKey),
                 422,
                 "video key is not valid",
+            ),
+            (
+                AppError::Queue(QueueError::DescriptionTooManyBytes),
+                422,
+                "caption is too long for YouTube (5000 bytes at most)",
+            ),
+            (
+                AppError::Queue(QueueError::AngleBrackets),
+                422,
+                "YouTube does not allow < or > in a title or caption",
             ),
             (
                 AppError::Queue(QueueError::TooLong),

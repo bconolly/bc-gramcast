@@ -90,6 +90,21 @@ describe("validateForm", () => {
       "Caption must be 2,200 characters or fewer.",
     );
   });
+  it("applies YouTube's description and angle-bracket rules only to YouTube posts", () => {
+    const yt = { ...ok, platforms: ["youtube" as const] };
+    const wide = "\u20ac".repeat(2000); // 6,000 bytes
+    expect(validateForm({ ...yt, caption: wide })).toContain(
+      "Caption must be 5,000 bytes or fewer for YouTube.",
+    );
+    expect(validateForm({ ...ok, caption: wide })).toEqual([]);
+    expect(validateForm({ ...yt, caption: "\u20ac".repeat(1666) + "ab" })).toEqual([]);
+    for (const bad of [{ title: "a<b" }, { title: "a>b" }, { caption: "x <b>" }]) {
+      expect(validateForm({ ...yt, ...bad })).toContain(
+        "YouTube does not allow < or > in the title or caption.",
+      );
+      expect(validateForm({ ...ok, ...bad })).toEqual([]);
+    }
+  });
   it("requires a platform", () => {
     expect(validateForm({ ...ok, platforms: [] })).toContain("Choose at least one platform.");
   });

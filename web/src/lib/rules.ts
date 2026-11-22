@@ -7,6 +7,7 @@ export const MAX_TITLE_CHARS = 100;
 export const MAX_CAPTION_CHARS = 2200;
 // The largest video one publishing run can upload (crates/domain/src/youtube.rs: 11 chunks of 8 MiB).
 export const MAX_UPLOAD_BYTES = 88 * 1024 * 1024;
+export const MAX_YOUTUBE_DESCRIPTION_BYTES = 5000;
 export const MAX_FILE_NAME_BYTES = 255;
 export const MAX_SLOT_SECS = 4_102_444_800;
 
@@ -74,6 +75,18 @@ function slotProblem(slotAt: number | null, now: number): string | null {
   return null;
 }
 
+/** YouTube's description limit is in bytes; neither field may hold < or >. */
+function youtubeProblems(v: FieldValues): string[] {
+  const out: string[] = [];
+  if (new TextEncoder().encode(v.caption).length > MAX_YOUTUBE_DESCRIPTION_BYTES) {
+    out.push("Caption must be 5,000 bytes or fewer for YouTube.");
+  }
+  if (/[<>]/.test(v.title) || /[<>]/.test(v.caption)) {
+    out.push("YouTube does not allow < or > in the title or caption.");
+  }
+  return out;
+}
+
 /** The title, caption, platform and time rules, shared by new and edited posts. */
 export function validateFields(v: FieldValues): string[] {
   const problems: (string | null)[] = [];
@@ -84,6 +97,7 @@ export function validateFields(v: FieldValues): string[] {
   if (charCount(v.caption) > MAX_CAPTION_CHARS) {
     problems.push("Caption must be 2,200 characters or fewer.");
   }
+  if (v.platforms.includes("youtube")) problems.push(...youtubeProblems(v));
   if (v.platforms.length === 0) problems.push("Choose at least one platform.");
   problems.push(slotProblem(v.slotAt, v.now));
   return problems.filter((p): p is string => p !== null);
