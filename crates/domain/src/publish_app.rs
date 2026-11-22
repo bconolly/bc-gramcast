@@ -7,7 +7,7 @@ use crate::publish::{
     FailReason, PublishState, ScheduledPost,
 };
 use crate::queue::QueuedPost;
-use crate::token::{StoredToken, TokenStore};
+use crate::token::{StoredToken, TokenLoad, TokenStore};
 use std::fmt;
 
 /// Short-lived access to the video bytes (a presigned link). A secret: never logged.
@@ -326,12 +326,22 @@ where
         {
             return Err(PublishError::Auth);
         }
-        let mut token = self
+        let mut token = match self
             .tokens
             .load()
             .await
             .map_err(|_| PublishError::Transient)?
-            .ok_or(PublishError::Auth)?;
+        {
+            TokenLoad::Token(t) => t,
+            TokenLoad::Missing => return Err(PublishError::Auth),
+            TokenLoad::Unreadable => {
+                // The row exists but cannot be decrypted (a lost or changed key): only
+                // the owner reconnecting fixes it. The mark applies only if the row is
+                // still the version just read; a failed mark is ignored, the run halts anyway.
+                let _ = self.tokens.mark_needs_reconnect().await;
+                return Err(PublishError::Auth);
+            }
+        };
         self.refresh_if_needed(&mut token).await?;
         Ok(token)
     }
@@ -1467,7 +1477,7 @@ mod tests {
     /// A token store whose `save` answers as told: `Some(applied)` or an error (`None`).
     struct SaveAnswers(FakeTokenStore, Option<bool>);
     impl TokenStore for SaveAnswers {
-        async fn load(&self) -> Result<Option<StoredToken>, PortError> {
+        async fn load(&self) -> Result<TokenLoad, PortError> {
             self.0.load().await
         }
         async fn save(&self, _t: &StoredToken) -> Result<bool, PortError> {
@@ -1547,6 +1557,71 @@ mod tests {
             publisher.calls.borrow().len(),
             1,
             "no retry with the stale token"
+        );
+    }
+
+    #[test]
+    fn an_unreadable_token_marks_the_row_and_halts_for_a_reconnect() {
+        let tokens = fresh_store();
+        tokens.unreadable.set(true);
+        let repo = two_due();
+        let publisher = FakePublisher::default();
+        let refresher = refresher_ok();
+        let report = run(&repo, &publisher, &tokens, &refresher);
+        assert_eq!(report.halted, Some(Halt::NeedsReconnect));
+        assert!(report.outcomes.is_empty());
+        assert!(
+            tokens.reconnect.get(),
+            "the row is marked, so later runs stop early"
+        );
+        assert_eq!(repo.state("a"), PublishState::new_queued());
+        assert!(publisher.calls.borrow().is_empty());
+        assert_eq!(refresher.calls.get(), 0);
+    }
+
+    #[test]
+    fn an_unreadable_token_is_not_marked_if_the_owner_reconnected_since_the_load() {
+        /// Reconnects right after the load, as the owner could between two steps of a run.
+        struct ReconnectsAfterLoad(FakeTokenStore);
+        impl TokenStore for ReconnectsAfterLoad {
+            async fn load(&self) -> Result<TokenLoad, PortError> {
+                let loaded = self.0.load().await;
+                self.0.connect(&token(NOW + 3600, "ya29.NEW")).await?;
+                loaded
+            }
+            async fn save(&self, t: &StoredToken) -> Result<bool, PortError> {
+                self.0.save(t).await
+            }
+            async fn connect(&self, t: &StoredToken) -> Result<(), PortError> {
+                self.0.connect(t).await
+            }
+            async fn mark_needs_reconnect(&self) -> Result<(), PortError> {
+                self.0.mark_needs_reconnect().await
+            }
+            async fn needs_reconnect(&self) -> Result<bool, PortError> {
+                self.0.needs_reconnect().await
+            }
+            async fn connection_mark(&self) -> Result<Option<bool>, PortError> {
+                self.0.connection_mark().await
+            }
+        }
+        let inner = fresh_store();
+        inner.unreadable.set(true);
+        let store = ReconnectsAfterLoad(inner);
+        let repo = two_due();
+        let report = pollster::block_on(publish_due(
+            &|| NOW,
+            &repo,
+            &FakePublisher::default(),
+            &store,
+            &refresher_ok(),
+            &FakeLinks,
+        ))
+        .unwrap();
+        assert_eq!(report.halted, Some(Halt::NeedsReconnect));
+        assert!(
+            !store.0.reconnect.get(),
+            "the new connection must stay unmarked"
         );
     }
 

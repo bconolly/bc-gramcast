@@ -35,6 +35,16 @@ impl fmt::Debug for StoredToken {
     }
 }
 
+/// What `TokenStore::load` found. A row that exists but cannot be decrypted (a lost or
+/// changed key) is `Unreadable`, distinct from `Missing` and from a storage error, so
+/// the run can ask the owner to reconnect instead of retrying forever.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TokenLoad {
+    Missing,
+    Token(StoredToken),
+    Unreadable,
+}
+
 /// Persistence port for the owner's token (one per account).
 ///
 /// One store value serves one run. `load` remembers which stored version it read
@@ -46,8 +56,9 @@ impl fmt::Debug for StoredToken {
 /// unconditional: it is the owner's own act.
 #[allow(async_fn_in_trait)]
 pub trait TokenStore {
-    /// `None` until the owner has connected the account.
-    async fn load(&self) -> Result<Option<StoredToken>, PortError>;
+    /// `Missing` until the owner has connected the account. `Unreadable` still
+    /// remembers the version it saw, so `mark_needs_reconnect` stays conditional.
+    async fn load(&self) -> Result<TokenLoad, PortError>;
     /// Stores a refreshed token, if the row is still the version `load` read. Used by
     /// the scheduled refresh path. Must NOT clear the needs-reconnect mark: only the
     /// owner reconnecting does that (see `connect`). `Ok(true)` means the write
@@ -81,6 +92,8 @@ pub(crate) mod fakes {
         pub reconnect: Cell<bool>,
         pub version: Cell<u64>,
         pub loaded: Cell<Option<u64>>,
+        /// The row exists but cannot be decrypted (a lost key).
+        pub unreadable: Cell<bool>,
     }
     impl FakeTokenStore {
         fn still_loaded(&self) -> Result<bool, PortError> {
@@ -92,11 +105,15 @@ pub(crate) mod fakes {
         }
     }
     impl TokenStore for FakeTokenStore {
-        async fn load(&self) -> Result<Option<StoredToken>, PortError> {
+        async fn load(&self) -> Result<TokenLoad, PortError> {
             let token = self.token.borrow().clone();
             // No token, no version: like the real save, which updates an existing row only.
             self.loaded.set(token.as_ref().map(|_| self.version.get()));
-            Ok(token)
+            Ok(match token {
+                None => TokenLoad::Missing,
+                Some(_) if self.unreadable.get() => TokenLoad::Unreadable,
+                Some(t) => TokenLoad::Token(t),
+            })
         }
         async fn save(&self, token: &StoredToken) -> Result<bool, PortError> {
             if !self.still_loaded()? {
@@ -169,11 +186,11 @@ mod tests {
     #[test]
     fn the_fake_store_round_trips() {
         let s = FakeTokenStore::default();
-        assert_eq!(pollster::block_on(s.load()), Ok(None));
+        assert_eq!(pollster::block_on(s.load()), Ok(TokenLoad::Missing));
         pollster::block_on(s.connect(&token(1))).unwrap();
-        assert_eq!(pollster::block_on(s.load()), Ok(Some(token(1))));
+        assert_eq!(pollster::block_on(s.load()), Ok(TokenLoad::Token(token(1))));
         assert_eq!(pollster::block_on(s.save(&token(2))), Ok(true));
-        assert_eq!(pollster::block_on(s.load()), Ok(Some(token(2))));
+        assert_eq!(pollster::block_on(s.load()), Ok(TokenLoad::Token(token(2))));
     }
 
     #[test]
@@ -187,7 +204,7 @@ mod tests {
         assert_eq!(pollster::block_on(s.needs_reconnect()), Ok(true));
         pollster::block_on(s.connect(&token(2))).unwrap();
         assert_eq!(pollster::block_on(s.needs_reconnect()), Ok(false));
-        assert_eq!(pollster::block_on(s.load()), Ok(Some(token(2))));
+        assert_eq!(pollster::block_on(s.load()), Ok(TokenLoad::Token(token(2))));
     }
 
     #[test]
@@ -239,12 +256,26 @@ mod tests {
     #[test]
     fn loading_no_token_records_no_version() {
         let s = FakeTokenStore::default();
-        assert_eq!(pollster::block_on(s.load()), Ok(None));
+        assert_eq!(pollster::block_on(s.load()), Ok(TokenLoad::Missing));
         assert_eq!(s.loaded.get(), None);
         // As with the real UPDATE-only save: nothing was loaded, so nothing may be saved.
         assert!(pollster::block_on(s.save(&token(1))).is_err());
         assert!(pollster::block_on(s.mark_needs_reconnect()).is_err());
         assert_eq!(s.token.borrow().clone(), None);
+    }
+
+    #[test]
+    fn an_unreadable_row_is_reported_and_still_records_the_version() {
+        let s = FakeTokenStore::default();
+        pollster::block_on(s.connect(&token(1))).unwrap();
+        s.unreadable.set(true);
+        assert_eq!(pollster::block_on(s.load()), Ok(TokenLoad::Unreadable));
+        // The mark applies to the version that was read, so it is conditional as usual.
+        pollster::block_on(s.mark_needs_reconnect()).unwrap();
+        assert!(s.reconnect.get());
+        pollster::block_on(s.connect(&token(2))).unwrap();
+        s.unreadable.set(false);
+        assert_eq!(pollster::block_on(s.load()), Ok(TokenLoad::Token(token(2))));
     }
 
     #[test]

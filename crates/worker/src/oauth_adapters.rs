@@ -13,7 +13,7 @@ use domain::app::PortError;
 use domain::connect::{CodeExchanger, TokenReply};
 use domain::oauth::{self, OAuthConfig, RandomSource, StateStore};
 use domain::seal::{self, SealedToken, TokenCipher, KEY_LEN, NONCE_LEN, PROVIDER_YOUTUBE};
-use domain::token::{StoredToken, TokenStore};
+use domain::token::{StoredToken, TokenLoad, TokenStore};
 use serde::Deserialize;
 use std::cell::RefCell;
 use worker::js_sys::{self, Array, Function, Reflect, Uint8Array};
@@ -249,7 +249,7 @@ struct FlagRow {
 }
 
 impl<C: TokenCipher, R: RandomSource> TokenStore for D1TokenStore<C, R> {
-    async fn load(&self) -> Result<Option<StoredToken>, PortError> {
+    async fn load(&self) -> Result<TokenLoad, PortError> {
         let row = self
             .db
             .prepare("SELECT ciphertext, nonce FROM oauth_tokens WHERE provider = ?1")
@@ -258,17 +258,23 @@ impl<C: TokenCipher, R: RandomSource> TokenStore for D1TokenStore<C, R> {
             .first::<TokenRow>(None)
             .await
             .map_err(|_| port("token read failed"))?;
-        let Some(row) = row else { return Ok(None) };
+        let Some(row) = row else {
+            return Ok(TokenLoad::Missing);
+        };
         let version = row.nonce.clone();
         let sealed = SealedToken {
             ciphertext: row.ciphertext,
             nonce: row.nonce,
         };
-        let token = seal::open_token(&self.cipher, PROVIDER_YOUTUBE, &sealed)
-            .await
-            .map_err(|_| port("stored token unreadable"))?;
+        // The version is remembered even when the row cannot be read, so the run's
+        // needs-reconnect mark stays conditional on this exact row.
         *self.loaded.borrow_mut() = Some(version);
-        Ok(Some(token))
+        Ok(
+            match seal::open_token(&self.cipher, PROVIDER_YOUTUBE, &sealed).await {
+                Ok(token) => TokenLoad::Token(token),
+                Err(_) => TokenLoad::Unreadable,
+            },
+        )
     }
 
     async fn save(&self, token: &StoredToken) -> Result<bool, PortError> {
