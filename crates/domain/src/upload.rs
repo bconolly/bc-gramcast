@@ -566,6 +566,26 @@ mod tests {
     }
 
     #[test]
+    fn a_non_final_resend_refused_after_the_final_chunk_went_out_is_unknown() {
+        // The final chunk's reply is lost; the status check says only 4 MiB arrived, so
+        // a non-final chunk is resent from there, and it is refused. The final chunk was
+        // sent earlier, so the video may exist: Unknown, not Auth.
+        let (log, end) = drive(
+            20 * MIB,
+            vec![
+                ok308(8 * MIB),
+                ok308(16 * MIB),
+                Reply::lost(),
+                with_range(308, Some("bytes=0-4194303")),
+                refused(401, ApiReason::Other),
+            ],
+        );
+        assert_eq!(log[3], "bytes */20971520");
+        assert_eq!(log[4], "bytes 4194304-12582911/20971520");
+        assert_eq!(end, Step::Fail(PublishError::Unknown));
+    }
+
+    #[test]
     fn answers_that_make_no_sense_are_unknown() {
         // A 200 for a chunk that is not the last; a 3xx or 2xx we do not know.
         for reply in [
