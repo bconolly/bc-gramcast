@@ -8,30 +8,42 @@ use crate::publish::{
 };
 use crate::queue::QueuedPost;
 use crate::token::{StoredToken, TokenLoad, TokenStore};
+use crate::youtube::MAX_PUBLISH_BYTES;
 use std::fmt;
 
-/// Short-lived access to the video bytes (a presigned link). A secret: never logged.
-// Do NOT derive or implement Serialize (or Display) for this type: it would let the
-// link reach logs or storage. Debug is hand-written to redact it.
+/// Where a stored video is and how big it is, which is all a publisher needs to read it
+/// from storage itself. No link is ever handed out. The key is hidden from `Debug`
+/// anyway, so a stray `{:?}` shows nothing about storage.
+// Do NOT derive or implement Serialize (or Display) for this type.
 #[derive(Clone, PartialEq, Eq)]
 pub struct VideoAccess {
-    url: String,
+    key: String,
+    size: u64,
 }
 
 impl VideoAccess {
-    pub fn new(url: impl Into<String>) -> Self {
-        Self { url: url.into() }
+    pub fn new(key: impl Into<String>, size: u64) -> Self {
+        Self {
+            key: key.into(),
+            size,
+        }
     }
 
-    pub fn url(&self) -> &str {
-        &self.url
+    pub fn key(&self) -> &str {
+        &self.key
+    }
+
+    /// Size in bytes, as storage reports it.
+    pub fn size(&self) -> u64 {
+        self.size
     }
 }
 
 impl fmt::Debug for VideoAccess {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("VideoAccess")
-            .field("url", &"[redacted]")
+            .field("key", &"[redacted]")
+            .field("size", &self.size)
             .finish()
     }
 }
@@ -95,7 +107,7 @@ pub trait TokenRefresher {
     async fn refresh(&self, token: &StoredToken) -> Result<StoredToken, PublishError>;
 }
 
-/// Storage port: a short-lived read link for a stored video.
+/// Storage port: finds a stored video (its key and size, read from storage).
 #[allow(async_fn_in_trait)]
 pub trait VideoLinks {
     async fn access(&self, video_key: &str) -> Result<VideoAccess, PortError>;
@@ -508,6 +520,12 @@ where
             .access(&post.video_key)
             .await
             .map_err(|_| PublishError::Transient)?;
+        // Too big for one run's subrequest allowance (or empty): refuse it here, before
+        // anything is sent. Uploads are capped at the same size, so this is a backstop
+        // for an object that was replaced after it was queued.
+        if video.size() == 0 || video.size() > MAX_PUBLISH_BYTES {
+            return Err(PublishError::Rejected);
+        }
         let published = self.publisher.publish(post, &video, token).await?;
         // The upload succeeded but the id is not one we will store or trust: the video
         // may exist, so this is an unknown outcome, never a retry.
@@ -523,15 +541,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn video_access_debug_hides_the_link() {
-        let v = VideoAccess::new("https://r2.example/videos/a.mp4?X-Sig=SECRET");
-        let out = format!("{v:?}");
-        assert!(
-            !out.contains("SECRET") && !out.contains("r2.example"),
-            "{out}"
-        );
-        assert!(out.contains("[redacted]"));
-        assert_eq!(v.url(), "https://r2.example/videos/a.mp4?X-Sig=SECRET");
+    fn video_access_debug_hides_the_key() {
+        let v = VideoAccess::new("videos/SECRET-KEY.mp4", 1234);
+        let out = format!("{v:?} {v:#?}");
+        assert!(!out.contains("SECRET") && !out.contains("videos/"), "{out}");
+        assert!(out.contains("[redacted]") && out.contains("1234"));
+        assert_eq!((v.key(), v.size()), ("videos/SECRET-KEY.mp4", 1234));
     }
 
     #[test]
@@ -554,6 +569,7 @@ mod tests {
     use crate::publish::{MAX_ATTEMPTS, PUBLISH_TIMEOUT_SECS};
     use crate::queue::Platform;
     use crate::token::fakes::FakeTokenStore;
+    use crate::youtube::MAX_PUBLISH_BYTES;
     use std::cell::{Cell, RefCell};
     use std::collections::VecDeque;
     use std::rc::Rc;
@@ -668,7 +684,7 @@ mod tests {
             self.calls.borrow_mut().push(post.id.clone());
             self.seen.borrow_mut().push((
                 token.access_token.clone(),
-                video.url().to_string(),
+                video.key().to_string(),
                 format!("{token:?} {video:?}"),
             ));
             if let Some((clock, secs)) = &self.advance {
@@ -695,7 +711,7 @@ mod tests {
     struct FakeLinks;
     impl VideoLinks for FakeLinks {
         async fn access(&self, key: &str) -> Result<VideoAccess, PortError> {
-            Ok(VideoAccess::new(format!("https://signed/{key}?sig=SECRET")))
+            Ok(VideoAccess::new(format!("{key}?SECRET"), 1_000_000))
         }
     }
 
@@ -1671,6 +1687,43 @@ mod tests {
             }
         );
         assert!(publisher.calls.borrow().is_empty());
+    }
+
+    #[test]
+    fn a_video_too_big_or_empty_to_publish_is_rejected_without_calling_the_provider() {
+        struct Sized(u64);
+        impl VideoLinks for Sized {
+            async fn access(&self, k: &str) -> Result<VideoAccess, PortError> {
+                Ok(VideoAccess::new(k, self.0))
+            }
+        }
+        for (size, rejected) in [
+            (0, true),
+            (1, false),
+            (MAX_PUBLISH_BYTES, false),
+            (MAX_PUBLISH_BYTES + 1, true),
+            (u64::MAX, true),
+        ] {
+            let repo = FakeRepo::with(vec![scheduled("a", 1)]);
+            let publisher = FakePublisher::returning(vec![ok_ref("yt1")]);
+            let report = pollster::block_on(publish_due(
+                &|| NOW,
+                &repo,
+                &publisher,
+                &fresh_store(),
+                &refresher_ok(),
+                &Sized(size),
+            ))
+            .unwrap();
+            assert_eq!(
+                publisher.calls.borrow().len(),
+                usize::from(!rejected),
+                "{size}"
+            );
+            if rejected {
+                assert_eq!(report.outcomes[0].1, Outcome::Failed(FailReason::Rejected));
+            }
+        }
     }
 
     #[test]
