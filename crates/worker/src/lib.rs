@@ -2,6 +2,7 @@
 
 pub mod connect_dto;
 pub mod dto;
+pub mod publish_dto;
 
 #[cfg(target_arch = "wasm32")]
 mod adapters;
