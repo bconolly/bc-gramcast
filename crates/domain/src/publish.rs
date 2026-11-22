@@ -138,7 +138,7 @@ pub fn record_success(state: &PublishState, external_id: &str) -> Result<Publish
 /// Publishing -> Queued or Failed.
 /// - `Transient`: counts as an attempt; requeued with backoff until `MAX_ATTEMPTS`, then Failed.
 /// - `RateLimited`: requeued, not counted as an attempt, waiting until `retry_at` (clamped to
-///   between now and a day ahead) or an hour if the provider gave none.
+///   between a minute and a day ahead) or an hour if the provider gave none.
 /// - `Auth`: requeued at once, not counted: the owner must reconnect, and no post should
 ///   be failed for it. The caller stops the run.
 /// - `Rejected`, `Unknown`, `StuckPublishing`: Failed. Never requeued.
@@ -164,7 +164,10 @@ pub fn record_failure(
         }
         FailReason::RateLimited => {
             let wait_until = match retry_at {
-                Some(at) => at.clamp(now, now.saturating_add(MAX_RATE_LIMIT_WAIT_SECS)),
+                Some(at) => at.clamp(
+                    now.saturating_add(BACKOFF_BASE_SECS),
+                    now.saturating_add(MAX_RATE_LIMIT_WAIT_SECS),
+                ),
                 None => now.saturating_add(RATE_LIMIT_BACKOFF_SECS),
             };
             requeue(uncounted, wait_until)
@@ -397,13 +400,13 @@ mod tests {
     }
 
     #[test]
-    fn a_rate_limit_retry_at_is_used_but_kept_within_a_day() {
+    fn a_rate_limit_retry_at_is_used_but_kept_between_a_minute_and_a_day() {
         let at = |r| match record_failure(&publishing(1, 5), FailReason::RateLimited, 1000, r) {
             Ok(PublishState::Queued { not_before, .. }) => not_before,
             other => panic!("{other:?}"),
         };
         assert_eq!(at(Some(5000)), 5000);
-        assert_eq!(at(Some(10)), 1000);
+        assert_eq!(at(Some(10)), 1000 + BACKOFF_BASE_SECS);
         assert_eq!(at(Some(i64::MAX)), 1000 + MAX_RATE_LIMIT_WAIT_SECS);
     }
 
