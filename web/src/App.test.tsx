@@ -98,6 +98,19 @@ describe("App", () => {
     expect(window.location.search).toBe("");
   });
 
+  it("drops the connect banner when the owner leaves the Connections screen", async () => {
+    stubEmptyApi();
+    window.history.replaceState(null, "", "/settings?connected=1");
+    const user = userEvent.setup();
+    render(<App />);
+    expect(await screen.findByRole("status")).toHaveTextContent("YouTube is connected.");
+    await user.click(screen.getByRole("button", { name: "Queue" }));
+    await user.click(screen.getByRole("button", { name: "Connections" }));
+    expect(await screen.findByText("Not connected")).toBeInTheDocument();
+    expect(screen.queryByRole("status")).not.toBeInTheDocument();
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+  });
+
   it("keeps the address in step with the screen", async () => {
     stubEmptyApi();
     const user = userEvent.setup();

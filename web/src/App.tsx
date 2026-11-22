@@ -33,11 +33,13 @@ export function App() {
     window.location.pathname === SETTINGS_PATH ? "connections" : "queue",
   );
   // Read once: the Worker's redirect puts the result in the query string, which is then dropped.
-  const [connectResult] = useState<ConnectResult>(() => readConnectResult(window.location.search));
+  const [connectResult, setConnectResult] = useState<ConnectResult>(() => readConnectResult(window.location.search));
   useEffect(() => {
     if (window.location.search !== "") keepAddress(window.location.pathname);
   }, []);
   const go = (next: Screen) => {
+    // The result belongs to the visit the redirect brought the owner to.
+    if (next !== "connections") setConnectResult({ connected: false, errorMessage: null });
     setScreen(next);
     keepAddress(pathFor(next));
   };
