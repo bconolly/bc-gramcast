@@ -7,6 +7,9 @@ use std::fmt;
 /// Refresh this long before the real expiry, so a token never dies mid-upload.
 pub const REFRESH_MARGIN_SECS: i64 = 5 * 60;
 
+// Do NOT derive or implement Serialize (or Display) for this type: it would let the
+// tokens reach logs or responses. Debug is hand-written to redact them. The storage
+// adapter must write the fields itself, to the secret store only.
 #[derive(Clone, PartialEq, Eq)]
 pub struct StoredToken {
     pub access_token: String,

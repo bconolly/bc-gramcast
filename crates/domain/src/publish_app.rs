@@ -3,14 +3,16 @@
 
 use crate::app::PortError;
 use crate::publish::{
-    claim, flag_if_stuck, record_failure, record_success, select_due, FailReason, PublishState,
-    ScheduledPost,
+    claim, flag_if_stuck, is_valid_external_id, record_failure, record_success, select_due,
+    FailReason, PublishState, ScheduledPost,
 };
 use crate::queue::QueuedPost;
 use crate::token::{StoredToken, TokenStore};
 use std::fmt;
 
 /// Short-lived access to the video bytes (a presigned link). A secret: never logged.
+// Do NOT derive or implement Serialize (or Display) for this type: it would let the
+// link reach logs or storage. Debug is hand-written to redact it.
 #[derive(Clone, PartialEq, Eq)]
 pub struct VideoAccess {
     url: String,
@@ -112,6 +114,10 @@ pub trait PublishRepository {
     /// Writes `next` only if the post's stored state still equals `expected`,
     /// in one atomic step (an `UPDATE ... WHERE state = expected`). This is what
     /// stops two overlapping runs from publishing the same post twice.
+    ///
+    /// The comparison must cover the WHOLE state: the variant and every field
+    /// (attempts, not_before, started_at, ...), not just the status column. A
+    /// post that does not exist returns `Cas::Conflict`, not an error.
     async fn transition(
         &self,
         id: &str,
@@ -377,7 +383,13 @@ where
             .access(&post.video_key)
             .await
             .map_err(|_| PublishError::Transient)?;
-        self.publisher.publish(post, &video, token).await
+        let published = self.publisher.publish(post, &video, token).await?;
+        // The upload succeeded but the id is not one we will store or trust: the video
+        // may exist, so this is an unknown outcome, never a retry.
+        if !is_valid_external_id(&published.external_id) {
+            return Err(PublishError::Unknown);
+        }
+        Ok(published)
     }
 }
 
@@ -502,6 +514,8 @@ mod tests {
     struct FakePublisher {
         results: RefCell<VecDeque<Result<PublishedRef, PublishError>>>,
         calls: RefCell<Vec<String>>,
+        /// (access token, video url, Debug of both) as the provider call received them.
+        seen: RefCell<Vec<(String, String, String)>>,
         /// Moves the shared clock forward by `.1` seconds on every call.
         advance: Option<(Rc<Cell<i64>>, i64)>,
     }
@@ -517,10 +531,15 @@ mod tests {
         async fn publish(
             &self,
             post: &QueuedPost,
-            _video: &VideoAccess,
-            _token: &StoredToken,
+            video: &VideoAccess,
+            token: &StoredToken,
         ) -> Result<PublishedRef, PublishError> {
             self.calls.borrow_mut().push(post.id.clone());
+            self.seen.borrow_mut().push((
+                token.access_token.clone(),
+                video.url().to_string(),
+                format!("{token:?} {video:?}"),
+            ));
             if let Some((clock, secs)) = &self.advance {
                 clock.set(clock.get() + secs);
             }
@@ -666,6 +685,8 @@ mod tests {
         assert_eq!(refresher.calls.get(), 1);
         let saved = tokens.token.borrow().clone().unwrap();
         assert_eq!(saved.access_token, "ya29.NEW-SECRET");
+        // The provider call used the NEW token, not the stored one.
+        assert_eq!(publisher.seen.borrow()[0].0, "ya29.NEW-SECRET");
     }
 
     #[test]
@@ -1008,22 +1029,101 @@ mod tests {
     }
 
     #[test]
-    fn no_secret_reaches_reports_or_stored_state() {
-        let repo = FakeRepo::with(vec![scheduled("a", 1), scheduled("b", 2)]);
+    fn secrets_reach_the_provider_but_never_a_debug_string() {
+        let repo = two_due();
         let tokens = fresh_store();
-        let publisher =
-            FakePublisher::returning(vec![Err(PublishError::Transient), Err(PublishError::Auth)]);
+        let publisher = FakePublisher::returning(vec![Err(PublishError::Transient), ok_ref("yt1")]);
         let report = run(&repo, &publisher, &tokens, &refresher_ok());
+        // The fake did receive real secrets...
+        let seen = publisher.seen.borrow();
+        assert!(seen[0].0.contains("SECRET") && seen[0].1.contains("SECRET"));
+        // ...yet nothing that prints them (what the provider call was given, the
+        // report, the stored states, the token store) shows one.
         let dump = format!(
             "{report:?} {:?} {:?} {:?}",
+            seen.iter().map(|s| &s.2).collect::<Vec<_>>(),
             repo.posts.borrow(),
             tokens.token.borrow(),
-            signed_link()
         );
-        assert!(!dump.contains("SECRET"), "{dump}");
+        assert!(!dump.contains("SECRET") && !dump.contains("ya29"), "{dump}");
     }
 
-    fn signed_link() -> VideoAccess {
-        pollster::block_on(FakeLinks.access("videos/a.mp4")).unwrap()
+    #[test]
+    fn a_failing_token_save_stops_the_run_before_the_provider_is_called() {
+        struct NoSave(FakeTokenStore);
+        impl TokenStore for NoSave {
+            async fn load(&self) -> Result<Option<StoredToken>, PortError> {
+                self.0.load().await
+            }
+            async fn save(&self, _t: &StoredToken) -> Result<(), PortError> {
+                Err(PortError("kv down".into()))
+            }
+        }
+        let inner = FakeTokenStore::default();
+        *inner.token.borrow_mut() = Some(token(NOW, "ya29.OLD"));
+        let repo = two_due();
+        let publisher = FakePublisher::default();
+        let report = pollster::block_on(publish_due(
+            &|| NOW,
+            &repo,
+            &publisher,
+            &NoSave(inner),
+            &refresher_ok(),
+            &FakeLinks,
+        ))
+        .unwrap();
+        assert_eq!(report.halted, Some(Halt::TokenUnavailable));
+        assert_eq!(repo.state("a"), PublishState::new_queued());
+        assert!(publisher.calls.borrow().is_empty());
+    }
+
+    #[test]
+    fn a_video_link_failure_is_retried_without_calling_the_provider() {
+        struct NoLinks;
+        impl VideoLinks for NoLinks {
+            async fn access(&self, _k: &str) -> Result<VideoAccess, PortError> {
+                Err(PortError("r2 down".into()))
+            }
+        }
+        let repo = FakeRepo::with(vec![scheduled("a", 1)]);
+        let publisher = FakePublisher::default();
+        let report = pollster::block_on(publish_due(
+            &|| NOW,
+            &repo,
+            &publisher,
+            &fresh_store(),
+            &refresher_ok(),
+            &NoLinks,
+        ))
+        .unwrap();
+        assert_eq!(
+            report.outcomes[0].1,
+            Outcome::Retrying(FailReason::Transient)
+        );
+        assert_eq!(
+            repo.state("a"),
+            PublishState::Queued {
+                attempts: 1,
+                not_before: NOW + 60
+            }
+        );
+        assert!(publisher.calls.borrow().is_empty());
+    }
+
+    #[test]
+    fn an_external_id_of_the_wrong_shape_is_treated_as_unknown() {
+        for bad in ["", "has space", "<script>", &"a".repeat(33)] {
+            let repo = FakeRepo::with(vec![scheduled("a", 1)]);
+            let publisher = FakePublisher::returning(vec![ok_ref(bad)]);
+            let report = run(&repo, &publisher, &fresh_store(), &refresher_ok());
+            assert_eq!(report.outcomes[0].1, Outcome::Failed(FailReason::Unknown));
+            assert_eq!(
+                repo.state("a"),
+                PublishState::Failed {
+                    attempts: 1,
+                    reason: FailReason::Unknown
+                }
+            );
+        }
     }
 }
