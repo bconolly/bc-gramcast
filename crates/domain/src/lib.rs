@@ -6,3 +6,4 @@ pub mod media;
 pub mod publish;
 pub mod queue;
 pub mod slots;
+pub mod token;
