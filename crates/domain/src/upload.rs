@@ -94,8 +94,6 @@ pub enum Step {
 pub struct Upload {
     total: u64,
     in_flight: Option<Chunk>,
-    /// A chunk request before the current one has been answered or lost.
-    sent_any: bool,
     sent_final: bool,
     queries: u32,
 }
@@ -120,7 +118,6 @@ impl Upload {
         Ok(Upload {
             total,
             in_flight: None,
-            sent_any: false,
             sent_final: false,
             queries: 0,
         })
@@ -136,8 +133,8 @@ impl Upload {
         let Some(chunk) = self.in_flight.take() else {
             return Step::Fail(PublishError::Unknown);
         };
+        let final_before = self.sent_final;
         self.sent_final |= chunk.is_last();
-        let earlier_chunk = std::mem::replace(&mut self.sent_any, true);
         match reply.status {
             Some(308) => match confirmed_bytes(reply.range.as_deref(), self.total) {
                 // A 308 means more is needed, so all of it cannot be there; and it
@@ -149,10 +146,12 @@ impl Upload {
             // The reply was lost or the server hiccuped: find out before doing more.
             None | Some(408 | 500..=599) => self.query(budget),
             Some(404 | 410) => self.session_gone(),
-            // Refused after an earlier chunk went out: the token may have lapsed mid-upload
-            // or a limit hit, which settles nothing about the video, so it is unknown.
-            Some(400..=499) if earlier_chunk => Step::Fail(PublishError::Unknown),
-            // The very first request was refused outright, so nothing was created.
+            // A refusal of the final chunk (every single-chunk video, 8 MiB or less), or of
+            // any chunk once the final one has been sent, settles nothing about whether
+            // the video exists, so it is unknown.
+            Some(400..=499) if chunk.is_last() || final_before => Step::Fail(PublishError::Unknown),
+            // A non-final chunk, the final one never sent: nothing can exist yet, so the
+            // refusal is classified (and may be retried) as usual.
             Some(s @ 400..=499) => Step::Fail(classify_refusal(reply, s, now)),
             Some(_) => Step::Fail(PublishError::Unknown),
         }
@@ -478,31 +477,90 @@ mod tests {
         );
     }
 
+    fn refused(status: u16, reason: ApiReason) -> Reply {
+        Reply {
+            reason,
+            retry_after: (status == 429).then(|| "60".to_string()),
+            ..Reply::status(status)
+        }
+    }
+
     #[test]
-    fn a_refusal_after_an_earlier_chunk_went_out_is_unknown() {
-        // Mid-upload refusals (the token may have lapsed, quota may have hit) say nothing
-        // reliable about the video, and a retry would start the whole upload over.
+    fn a_refusal_of_the_final_chunk_is_unknown() {
+        // A single-chunk video (8 MiB or less) sends its final chunk first: a refusal of
+        // it may still have let the video through, so it is not classified.
         for (status, reason) in [
             (401, ApiReason::Other),
-            (403, ApiReason::Quota),
-            (403, ApiReason::Other),
-            (400, ApiReason::Other),
             (429, ApiReason::Other),
+            (400, ApiReason::Other),
+            (403, ApiReason::Quota),
         ] {
-            let refusal = Reply {
-                reason,
-                ..Reply::status(status)
-            };
-            let (_, end) = drive(20 * MIB, vec![ok308(8 * MIB), refusal]);
+            let (_, end) = drive(MIB, vec![refused(status, reason)]);
             assert_eq!(end, Step::Fail(PublishError::Unknown), "{status}");
         }
-        // The same refusal of the very first chunk is still classified: nothing was sent.
-        let (_, end) = drive(20 * MIB, vec![Reply::status(401)]);
-        assert_eq!(end, Step::Fail(PublishError::Auth));
-        // A lost first reply, settled by a check that resumes, then a refusal: also Unknown.
+        // The same for the last chunk of a bigger video.
         let (_, end) = drive(
             20 * MIB,
-            vec![Reply::lost(), ok308(8 * MIB), Reply::status(401)],
+            vec![
+                ok308(8 * MIB),
+                ok308(16 * MIB),
+                refused(401, ApiReason::Other),
+            ],
+        );
+        assert_eq!(end, Step::Fail(PublishError::Unknown));
+    }
+
+    #[test]
+    fn a_refusal_of_a_non_final_chunk_is_classified_as_before() {
+        // Nothing can exist before the final chunk, so these are retryable per the usual rules.
+        let end = |reply| drive(20 * MIB, vec![ok308(8 * MIB), reply]).1;
+        assert_eq!(
+            end(refused(401, ApiReason::Other)),
+            Step::Fail(PublishError::Auth)
+        );
+        assert_eq!(
+            end(refused(429, ApiReason::Other)),
+            Step::Fail(PublishError::RateLimited { retry_at: Some(60) })
+        );
+        assert_eq!(
+            end(refused(400, ApiReason::Other)),
+            Step::Fail(PublishError::Rejected)
+        );
+        assert_eq!(
+            end(refused(403, ApiReason::Quota)),
+            Step::Fail(PublishError::RateLimited { retry_at: None })
+        );
+        // The first chunk of a big video, and one after a lost reply settled by a check.
+        let (_, first) = drive(20 * MIB, vec![refused(401, ApiReason::Other)]);
+        assert_eq!(first, Step::Fail(PublishError::Auth));
+        let (_, after_lost) = drive(
+            20 * MIB,
+            vec![
+                Reply::lost(),
+                ok308(8 * MIB),
+                refused(401, ApiReason::Other),
+            ],
+        );
+        assert_eq!(after_lost, Step::Fail(PublishError::Auth));
+    }
+
+    #[test]
+    fn a_refusal_once_the_final_chunk_was_sent_is_unknown_on_every_path() {
+        // The final chunk's reply is lost; the status check is refused.
+        for status in [401, 403, 429, 400] {
+            let (_, end) = drive(MIB, vec![Reply::lost(), refused(status, ApiReason::Other)]);
+            assert_eq!(end, Step::Fail(PublishError::Unknown), "{status}");
+        }
+        // The final chunk went out, the status check asked for a resend of an earlier
+        // part, and that (non-final) chunk is refused: the final was sent before, so Unknown.
+        let (_, end) = drive(
+            10 * MIB,
+            vec![
+                ok308(8 * MIB),
+                Reply::lost(),
+                ok308(8 * MIB),
+                refused(401, ApiReason::Other),
+            ],
         );
         assert_eq!(end, Step::Fail(PublishError::Unknown));
     }

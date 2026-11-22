@@ -73,7 +73,8 @@ pub struct PublishedRef {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PublishError {
     /// The token was refused or could not be refreshed. A publisher returns this only
-    /// for a refusal before any chunk was sent; later refusals are `Unknown`.
+    /// for a refusal that cannot have created the video (not of the final chunk, and not
+    /// after the final chunk was sent); otherwise `Unknown`.
     Auth,
     /// `retry_at` (Unix seconds) is the provider's hint, if it gave one.
     RateLimited { retry_at: Option<i64> },
