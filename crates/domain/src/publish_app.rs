@@ -278,6 +278,7 @@ mod tests {
         );
     }
 
+    use crate::publish::{MAX_ATTEMPTS, PUBLISH_TIMEOUT_SECS};
     use crate::queue::Platform;
     use crate::token::fakes::FakeTokenStore;
     use std::cell::{Cell, RefCell};
@@ -507,5 +508,182 @@ mod tests {
         );
         assert_eq!(report.outcomes[0].1, Outcome::Failed(FailReason::Auth));
         assert!(publisher.calls.borrow().is_empty());
+    }
+
+    #[test]
+    fn an_expiring_token_is_refreshed_saved_and_used() {
+        let repo = FakeRepo::with(vec![scheduled("a", NOW - 1)]);
+        let tokens = FakeTokenStore::default();
+        *tokens.token.borrow_mut() = Some(token(NOW + 10, "ya29.OLD"));
+        let refresher = refresher_ok();
+        let publisher = FakePublisher::returning(vec![ok_ref("y")]);
+        run(&repo, &publisher, &tokens, &refresher);
+        assert_eq!(refresher.calls.get(), 1);
+        let saved = tokens.token.borrow().clone().unwrap();
+        assert_eq!(saved.access_token, "ya29.NEW-SECRET");
+    }
+
+    #[test]
+    fn a_fresh_token_is_not_refreshed() {
+        let repo = FakeRepo::with(vec![scheduled("a", NOW - 1)]);
+        let refresher = refresher_ok();
+        run(
+            &repo,
+            &FakePublisher::returning(vec![ok_ref("y")]),
+            &fresh_store(),
+            &refresher,
+        );
+        assert_eq!(refresher.calls.get(), 0);
+    }
+
+    #[test]
+    fn a_refresh_that_is_refused_fails_the_post_as_auth() {
+        let repo = FakeRepo::with(vec![scheduled("a", NOW - 1)]);
+        let tokens = FakeTokenStore::default();
+        *tokens.token.borrow_mut() = Some(token(NOW, "old"));
+        let refresher = FakeRefresher {
+            result: Err(PublishError::Auth),
+            calls: Cell::new(0),
+        };
+        let publisher = FakePublisher::default();
+        let report = run(&repo, &publisher, &tokens, &refresher);
+        assert_eq!(report.outcomes[0].1, Outcome::Failed(FailReason::Auth));
+        assert!(publisher.calls.borrow().is_empty());
+    }
+
+    #[test]
+    fn a_rate_limit_requeues_with_backoff() {
+        let repo = FakeRepo::with(vec![scheduled("a", NOW - 1)]);
+        let publisher = FakePublisher::returning(vec![Err(PublishError::RateLimited)]);
+        let report = run(&repo, &publisher, &fresh_store(), &refresher_ok());
+        assert_eq!(
+            report.outcomes[0].1,
+            Outcome::Retrying(FailReason::RateLimited)
+        );
+        assert_eq!(
+            repo.state("a"),
+            PublishState::Queued {
+                attempts: 1,
+                not_before: NOW + 60
+            }
+        );
+    }
+
+    #[test]
+    fn a_rejection_fails_the_post_at_once() {
+        let repo = FakeRepo::with(vec![scheduled("a", NOW - 1)]);
+        let publisher = FakePublisher::returning(vec![Err(PublishError::Rejected)]);
+        let report = run(&repo, &publisher, &fresh_store(), &refresher_ok());
+        assert_eq!(report.outcomes[0].1, Outcome::Failed(FailReason::Rejected));
+    }
+
+    #[test]
+    fn transient_failures_retry_then_fail_after_the_last_attempt() {
+        let repo = FakeRepo::with(vec![scheduled("a", 0)]);
+        let tokens = fresh_store();
+        let publisher =
+            FakePublisher::returning(vec![Err(PublishError::Transient); MAX_ATTEMPTS as usize]);
+        let mut now = NOW;
+        let mut outcomes = Vec::new();
+        for _ in 0..MAX_ATTEMPTS {
+            let r = pollster::block_on(publish_due(
+                now,
+                &repo,
+                &publisher,
+                &tokens,
+                &refresher_ok(),
+                &FakeLinks,
+            ))
+            .unwrap();
+            outcomes.push(r.outcomes[0].1.clone());
+            now += 10_000; // past any backoff
+        }
+        assert_eq!(
+            outcomes,
+            [
+                Outcome::Retrying(FailReason::Transient),
+                Outcome::Retrying(FailReason::Transient),
+                Outcome::Failed(FailReason::Transient)
+            ]
+        );
+        assert_eq!(
+            repo.state("a"),
+            PublishState::Failed {
+                attempts: MAX_ATTEMPTS,
+                reason: FailReason::Transient
+            }
+        );
+    }
+
+    #[test]
+    fn a_retry_is_not_attempted_before_its_delay_is_over() {
+        let repo = FakeRepo::with(vec![scheduled("a", 0)]);
+        let tokens = fresh_store();
+        let publisher = FakePublisher::returning(vec![Err(PublishError::Transient)]);
+        run(&repo, &publisher, &tokens, &refresher_ok());
+        let again = run(&repo, &publisher, &tokens, &refresher_ok());
+        assert!(again.outcomes.is_empty());
+    }
+
+    #[test]
+    fn a_post_stuck_in_publishing_is_flagged_and_never_retried() {
+        let mut stuck = scheduled("stuck", 0);
+        stuck.state = PublishState::Publishing {
+            attempt: 1,
+            started_at: NOW - PUBLISH_TIMEOUT_SECS,
+        };
+        let mut recent = scheduled("recent", 0);
+        recent.state = PublishState::Publishing {
+            attempt: 1,
+            started_at: NOW - 1,
+        };
+        let repo = FakeRepo::with(vec![stuck, recent]);
+        let publisher = FakePublisher::default();
+        let report = run(&repo, &publisher, &fresh_store(), &refresher_ok());
+        assert_eq!(
+            report.outcomes,
+            [("stuck".to_string(), Outcome::FlaggedStuck)]
+        );
+        assert_eq!(
+            repo.state("stuck"),
+            PublishState::Failed {
+                attempts: 1,
+                reason: FailReason::StuckPublishing
+            }
+        );
+        assert!(matches!(
+            repo.state("recent"),
+            PublishState::Publishing { .. }
+        ));
+        assert!(publisher.calls.borrow().is_empty());
+    }
+
+    #[test]
+    fn one_failure_does_not_stop_the_next_post() {
+        let repo = FakeRepo::with(vec![scheduled("a", 1), scheduled("b", 2)]);
+        let publisher = FakePublisher::returning(vec![Err(PublishError::Rejected), ok_ref("yt-b")]);
+        let report = run(&repo, &publisher, &fresh_store(), &refresher_ok());
+        assert_eq!(report.outcomes.len(), 2);
+        assert_eq!(*publisher.calls.borrow(), ["a", "b"]);
+    }
+
+    #[test]
+    fn no_secret_reaches_reports_or_stored_state() {
+        let repo = FakeRepo::with(vec![scheduled("a", 1), scheduled("b", 2)]);
+        let tokens = fresh_store();
+        let publisher =
+            FakePublisher::returning(vec![Err(PublishError::Transient), Err(PublishError::Auth)]);
+        let report = run(&repo, &publisher, &tokens, &refresher_ok());
+        let dump = format!(
+            "{report:?} {:?} {:?} {:?}",
+            repo.posts.borrow(),
+            tokens.token.borrow(),
+            signed_link()
+        );
+        assert!(!dump.contains("SECRET"), "{dump}");
+    }
+
+    fn signed_link() -> VideoAccess {
+        pollster::block_on(FakeLinks.access("videos/a.mp4")).unwrap()
     }
 }
