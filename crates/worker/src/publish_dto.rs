@@ -72,6 +72,12 @@ pub const LIST_SQL: &str = "SELECT id, video_key, title, caption, platforms, slo
      OR (state = 'queued' AND slot_at <= ?1 AND not_before <= ?1 AND platforms != 'instagram') \
      ORDER BY slot_at";
 
+/// What the Queue screen reads: every Queued or Publishing post, and Published or Failed
+/// ones whose slot is after `?1`. The domain filters again.
+pub const RECENT_SQL: &str = "SELECT id, video_key, title, caption, platforms, slot_at, \
+     state, attempts, not_before, attempt, started_at, external_id, fail_reason FROM posts \
+     WHERE state IN ('queued', 'publishing') OR slot_at > ?1 ORDER BY slot_at";
+
 /// The compare-and-set: ONE statement that writes `next` (?2 to ?8) only if the row
 /// still holds every column of `expected` (?9 to ?15). `IS` compares NULLs too. A row
 /// that is missing or changed returns nothing, which the adapter reports as a conflict.
@@ -262,6 +268,10 @@ mod tests {
     #[test]
     fn the_list_binds_only_the_run_time() {
         assert_eq!(placeholders(LIST_SQL), 1);
+        assert_eq!(placeholders(RECENT_SQL), 1);
+        // Both read the same columns, so one row type serves both.
+        let columns = |sql: &str| sql[..sql.find(" FROM").unwrap()].to_string();
+        assert_eq!(columns(LIST_SQL), columns(RECENT_SQL));
     }
 
     #[test]

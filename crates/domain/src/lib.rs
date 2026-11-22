@@ -10,6 +10,7 @@ pub mod oauth;
 pub mod publish;
 pub mod publish_app;
 pub mod queue;
+pub mod queue_view;
 pub mod seal;
 pub mod slots;
 pub mod token;

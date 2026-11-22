@@ -27,8 +27,10 @@ mod entry {
         AccessVerifier, D1PostRepository, D1SlotPatternRepository, R2Signer, R2Store,
     };
     use crate::dto::{self, PatchPostBody, PatternJson, QueuePostBody, StartUploadBody};
+    use crate::publish_adapters::D1PublishRepository;
     use domain::app;
     use domain::auth::{self, AccessConfig, AuthError};
+    use domain::queue_view;
     use worker::*;
 
     /// Fails closed. Returns the response that denies the request, or `None` to
@@ -268,13 +270,14 @@ mod entry {
     }
 
     async fn queue_route(_req: Request, ctx: Ctx) -> Result<Response> {
-        let repo = D1PostRepository::new(ctx.env.d1("DB")?);
-        match app::upcoming(&repo, now_secs()).await {
+        let repo = D1PublishRepository::new(ctx.env.d1("DB")?);
+        match queue_view::queue_view(&repo, now_secs()).await {
             Ok(posts) => {
-                let out: Vec<_> = posts.iter().map(dto::to_json).collect();
+                let out: Vec<_> = posts.iter().map(dto::scheduled_to_json).collect();
                 Response::from_json(&out)
             }
-            Err(e) => app_error(&e),
+            // The storage error is dropped: it can carry row values.
+            Err(_) => Response::error("internal error", 500),
         }
     }
 

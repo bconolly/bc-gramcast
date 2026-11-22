@@ -3,6 +3,7 @@
 use domain::app::{AppError, DeleteError, InsertError, PortError, PostChanges, UpdateError};
 use domain::auth::{self, AuthError, Claims, JwtHeader};
 use domain::media::UploadError;
+use domain::publish::{is_valid_external_id, PublishState, ScheduledPost};
 use domain::queue::{Platform, QueueError, QueuedPost};
 use domain::slots::{SlotError, SlotPattern, SlotRule, Weekday};
 use serde::{Deserialize, Serialize};
@@ -66,6 +67,7 @@ pub struct PostJson {
     pub platforms: Vec<String>,
     pub slot_at: i64,
     pub status: String,
+    pub publish: PublishJson,
 }
 
 pub fn platform_from_str(s: &str) -> Option<Platform> {
@@ -100,8 +102,49 @@ pub fn to_domain(id: String, body: QueuePostBody) -> Option<QueuedPost> {
     })
 }
 
+/// The publishing part of a post, as the Queue screen shows it: a fixed state tag, the
+/// provider's id once published (only if it passes the domain's shape check) and the
+/// fixed failure code once failed. No other detail leaves the Worker.
+#[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PublishJson {
+    pub state: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub external_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+pub fn publish_json(state: &PublishState) -> PublishJson {
+    let tag = |state: &str| PublishJson {
+        state: state.to_string(),
+        external_id: None,
+        reason: None,
+    };
+    match state {
+        PublishState::Queued { .. } => tag("queued"),
+        PublishState::Publishing { .. } => tag("publishing"),
+        PublishState::Published { external_id } => PublishJson {
+            external_id: Some(external_id.clone()).filter(|id| is_valid_external_id(id)),
+            ..tag("published")
+        },
+        PublishState::Failed { reason, .. } => PublishJson {
+            reason: Some(reason.code().to_string()),
+            ..tag("failed")
+        },
+    }
+}
+
+/// A post with its publishing state, for the Queue.
+pub fn scheduled_to_json(p: &ScheduledPost) -> PostJson {
+    PostJson {
+        publish: publish_json(&p.state),
+        ..to_json(&p.post)
+    }
+}
+
 pub fn to_json(p: &QueuedPost) -> PostJson {
     PostJson {
+        publish: publish_json(&PublishState::new_queued()),
         id: p.id.clone(),
         video_key: p.video_key.clone(),
         title: p.title.clone(),
@@ -566,6 +609,7 @@ mod tests {
     use super::*;
     use domain::app::{InsertError, PortError};
     use domain::media::UploadError;
+    use domain::publish::FailReason;
 
     fn body() -> QueuePostBody {
         QueuePostBody {
@@ -583,6 +627,60 @@ mod tests {
         let json = to_json(&post);
         assert_eq!(json.platforms, ["instagram", "youtube"]);
         assert_eq!(json.status, "ready");
+    }
+
+    #[test]
+    fn a_post_without_publish_state_is_queued_in_json() {
+        let post = to_domain("id1".into(), body()).unwrap();
+        let json = serde_json::to_value(to_json(&post)).unwrap();
+        assert_eq!(json["publish"], serde_json::json!({"state": "queued"}));
+    }
+
+    fn scheduled_json(state: PublishState) -> serde_json::Value {
+        let post = to_domain("id1".into(), body()).unwrap();
+        serde_json::to_value(scheduled_to_json(&ScheduledPost { post, state })).unwrap()
+    }
+
+    #[test]
+    fn each_publish_state_maps_to_a_fixed_tag_with_only_its_own_detail() {
+        use serde_json::json;
+        assert_eq!(
+            scheduled_json(PublishState::Queued {
+                attempts: 2,
+                not_before: 9
+            })["publish"],
+            json!({"state": "queued"})
+        );
+        assert_eq!(
+            scheduled_json(PublishState::Publishing {
+                attempt: 1,
+                started_at: 5
+            })["publish"],
+            json!({"state": "publishing"})
+        );
+        assert_eq!(
+            scheduled_json(PublishState::Published {
+                external_id: "dQw4w9WgXcQ".into()
+            })["publish"],
+            json!({"state": "published", "external_id": "dQw4w9WgXcQ"})
+        );
+        assert_eq!(
+            scheduled_json(PublishState::Failed {
+                attempts: 3,
+                reason: FailReason::StuckPublishing
+            })["publish"],
+            json!({"state": "failed", "reason": "stuck_publishing"})
+        );
+        // The post's own fields are still there.
+        assert_eq!(scheduled_json(PublishState::new_queued())["title"], "T");
+    }
+
+    #[test]
+    fn an_external_id_of_the_wrong_shape_is_never_sent() {
+        let json = scheduled_json(PublishState::Published {
+            external_id: "a b\"<".into(),
+        });
+        assert_eq!(json["publish"], serde_json::json!({"state": "published"}));
     }
 
     #[test]

@@ -9,6 +9,7 @@ use crate::publish_dto::{self, Param, RawState};
 use domain::app::PortError;
 use domain::publish::ScheduledPost;
 use domain::publish_app::{Cas, PublishRepository};
+use domain::queue_view::QueueViewRepository;
 use serde::Deserialize;
 use worker::wasm_bindgen::JsValue;
 use worker::D1Database;
@@ -80,13 +81,14 @@ fn scheduled(r: ListRow) -> Result<ScheduledPost, PortError> {
     Ok(ScheduledPost { post, state })
 }
 
-impl PublishRepository for D1PublishRepository {
-    async fn list(&self, now: i64) -> Result<Vec<ScheduledPost>, PortError> {
+impl D1PublishRepository {
+    /// Runs one of the two read statements, which bind a single time value.
+    async fn read(&self, sql: &str, at: i64) -> Result<Vec<ScheduledPost>, PortError> {
         let fail = |_| port("publish list failed");
         let rows = self
             .db
-            .prepare(publish_dto::LIST_SQL)
-            .bind(&[JsValue::from_f64(now as f64)])
+            .prepare(sql)
+            .bind(&[JsValue::from_f64(at as f64)])
             .map_err(fail)?
             .all()
             .await
@@ -94,6 +96,18 @@ impl PublishRepository for D1PublishRepository {
             .results::<ListRow>()
             .map_err(fail)?;
         rows.into_iter().map(scheduled).collect()
+    }
+}
+
+impl QueueViewRepository for D1PublishRepository {
+    async fn recent(&self, since: i64) -> Result<Vec<ScheduledPost>, PortError> {
+        self.read(publish_dto::RECENT_SQL, since).await
+    }
+}
+
+impl PublishRepository for D1PublishRepository {
+    async fn list(&self, now: i64) -> Result<Vec<ScheduledPost>, PortError> {
+        self.read(publish_dto::LIST_SQL, now).await
     }
 
     /// ONE `UPDATE ... WHERE id AND every state column = expected RETURNING id`. Only a
