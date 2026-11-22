@@ -11,7 +11,13 @@
 //! token, secret or URL.
 
 use crate::adapters::now_secs;
-use crate::oauth_adapters::{oauth_config, D1StateStore, WebCryptoRandom};
+use crate::connect_dto;
+use crate::oauth_adapters::{
+    oauth_config, AesGcmCipher, D1StateStore, D1TokenStore, GoogleExchanger, WebCryptoRandom,
+};
+use domain::app::PortError;
+use domain::connect::{self, ConnectError};
+use domain::connection;
 use domain::oauth;
 use worker::*;
 
@@ -39,6 +45,67 @@ pub async fn start(_req: Request, ctx: Ctx) -> Result<Response> {
         Ok(state) => redirect(&config.authorization_url(&state)),
         Err(e) => {
             console_log!("could not start youtube connect: {}", e.0);
+            Response::error("internal error", 500)
+        }
+    }
+}
+
+/// Builds the token store (and so needs `TOKEN_ENC_KEY`).
+async fn token_store(
+    env: &Env,
+) -> std::result::Result<D1TokenStore<AesGcmCipher, WebCryptoRandom>, PortError> {
+    let cipher = AesGcmCipher::from_env(env).await?;
+    let db = env
+        .d1("DB")
+        .map_err(|_| PortError("d1 binding missing".into()))?;
+    Ok(D1TokenStore::new(db, cipher, WebCryptoRandom))
+}
+
+/// Everything the callback needs, or the fixed reason it cannot be built.
+async fn run_callback(req: &Request, env: &Env) -> std::result::Result<(), ConnectError> {
+    let setup = |e: PortError| {
+        console_log!("connect setup failed: {}", e.0);
+        ConnectError::Server
+    };
+    let url = req.url().map_err(|_| ConnectError::BadState)?;
+    let query = connect_dto::callback_query(
+        url.query_pairs()
+            .map(|(k, v)| (k.into_owned(), v.into_owned())),
+    );
+    let config = oauth_config(env).map_err(setup)?;
+    let exchanger = GoogleExchanger::from_env(env, config).map_err(setup)?;
+    let tokens = token_store(env).await.map_err(setup)?;
+    let db = env
+        .d1("DB")
+        .map_err(|_| setup(PortError("d1 binding missing".into())))?;
+    let states = D1StateStore::new(db);
+    connect::connect_youtube_callback(&states, &exchanger, &tokens, &query.as_params(), now_secs())
+        .await
+}
+
+/// `GET /api/connect/youtube/callback`: Google sends the owner back here. Always
+/// answers 302 to the Settings page: `?connected=1`, or `?connect_error=<fixed code>`.
+pub async fn callback(req: Request, ctx: Ctx) -> Result<Response> {
+    let result = run_callback(&req, &ctx.env).await;
+    if let Err(e) = result {
+        console_log!("youtube connect refused: {}", e.code());
+    }
+    redirect(&connect_dto::redirect_location(result))
+}
+
+/// `GET /api/connect/status`: only `{youtube: {connected, needs_reconnect}}`.
+pub async fn status(_req: Request, ctx: Ctx) -> Result<Response> {
+    let tokens = match token_store(&ctx.env).await {
+        Ok(t) => t,
+        Err(e) => {
+            console_log!("connection status not configured: {}", e.0);
+            return Response::error("youtube connect is not configured", 503);
+        }
+    };
+    match connection::connection_status(&tokens).await {
+        Ok(s) => Response::from_json(&connect_dto::status_json(s)),
+        Err(_) => {
+            console_log!("connection status unavailable");
             Response::error("internal error", 500)
         }
     }
