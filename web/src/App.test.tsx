@@ -3,14 +3,19 @@ import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { App } from "@/App";
 import { PAYHIP_URL, PROMO_CTA } from "@/lib/brand";
+import { CONNECT_ERROR_MESSAGES } from "@/lib/connect";
 
-afterEach(() => vi.unstubAllGlobals());
+afterEach(() => {
+  vi.unstubAllGlobals();
+  window.history.replaceState(null, "", "/");
+});
 
 /** Answers each endpoint with a harmless empty body. */
 function stubEmptyApi() {
   const bodies: Record<string, string> = {
     "/api/slots/pattern": '{"utc_offset_minutes":600,"rules":[]}',
     "/api/slots/next?count=5": '{"slots":[]}',
+    "/api/connect/status": '{"youtube":{"connected":false,"needs_reconnect":false}}',
   };
   vi.stubGlobal(
     "fetch",
@@ -30,18 +35,18 @@ describe("App", () => {
     expect(await screen.findByText("Nothing queued yet.")).toBeInTheDocument();
   });
 
-  it("has Queue, Upload and Slots in the nav and opens the slots screen", async () => {
+  it("has Queue, Upload, Slots and Connections in the nav and opens the slots screen", async () => {
     stubEmptyApi();
     const user = userEvent.setup();
     render(<App />);
     const nav = screen.getByRole("navigation", { name: "Screens" });
-    expect(within(nav).getAllByRole("button").map((b) => b.textContent)).toEqual(["Queue", "Upload", "Slots"]);
+    expect(within(nav).getAllByRole("button").map((b) => b.textContent)).toEqual(["Queue", "Upload", "Slots", "Connections"]);
     await user.click(within(nav).getByRole("button", { name: "Slots" }));
     expect(within(nav).getByRole("button", { name: "Slots" })).toHaveAttribute("aria-current", "page");
     expect(await screen.findByLabelText("UTC offset")).toBeInTheDocument();
   });
 
-  it("links the header brand and the footer promo link to Payhip on all three screens", async () => {
+  it("links the header brand and the footer promo link to Payhip on all four screens", async () => {
     stubEmptyApi();
     const user = userEvent.setup();
     render(<App />);
@@ -76,5 +81,30 @@ describe("App", () => {
     expectBranding();
     await user.click(screen.getByRole("button", { name: "Slots" }));
     expectBranding();
+    await user.click(screen.getByRole("button", { name: "Connections" }));
+    expect(await screen.findByText("Not connected")).toBeInTheDocument();
+    expectBranding();
+  });
+
+  it("opens the Connections screen at /settings and reads the connect result", async () => {
+    stubEmptyApi();
+    window.history.replaceState(null, "", "/settings?connect_error=bad_state");
+    render(<App />);
+    const nav = screen.getByRole("navigation", { name: "Screens" });
+    expect(within(nav).getByRole("button", { name: "Connections" })).toHaveAttribute("aria-current", "page");
+    expect(await screen.findByRole("alert")).toHaveTextContent(CONNECT_ERROR_MESSAGES.bad_state ?? "?");
+    // The result is shown once: the query is dropped so a reload does not repeat it.
+    expect(window.location.pathname).toBe("/settings");
+    expect(window.location.search).toBe("");
+  });
+
+  it("keeps the address in step with the screen", async () => {
+    stubEmptyApi();
+    const user = userEvent.setup();
+    render(<App />);
+    await user.click(screen.getByRole("button", { name: "Connections" }));
+    expect(window.location.pathname).toBe("/settings");
+    await user.click(screen.getByRole("button", { name: "Queue" }));
+    expect(window.location.pathname).toBe("/");
   });
 });
