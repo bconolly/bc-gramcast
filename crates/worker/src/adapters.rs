@@ -241,7 +241,7 @@ impl UploadStore for R2Store {
 // `dto::parse_jwks`, and the token checks are `domain::auth`. This only fetches
 // the key set and calls Web Crypto (`crypto.subtle`) through js_sys, which the
 // `worker` crate re-exports, so no dependency or web-sys feature was added.
-// It cannot run natively. Nothing here logs: errors carry fixed text only.
+// It cannot run natively. It logs fixed reason text and counts only, never tokens, keys or URLs.
 
 use domain::app::{SignatureVerifier, VerifyError};
 use domain::keycache::{self, KeyCache, KeyLookup};
