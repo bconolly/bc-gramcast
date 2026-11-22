@@ -149,17 +149,36 @@ use crate::token::StoredToken;
 // `Auth` only for account-level problems; a post-specific refusal is `Rejected`.
 
 /// `error.errors[].reason` values from YouTube's JSON error body that change the
-/// classification. Taken from memory of the Data API's error list, NOT checked against
-/// Google's documentation: confirm them before relying on this. Anything not listed is
-/// treated as post-specific (`Rejected`), the cautious choice, because it is never retried.
-pub const QUOTA_REASONS: [&str; 4] = [
+/// classification, from Google's documentation except where noted. Anything not listed
+/// is post-specific (`Rejected`, never retried): that includes the documented
+/// `videos.insert` 400s (`invalidTitle`, `invalidDescription`, `invalidTags`,
+/// `invalidCategoryId`, `invalidFilename`, `invalidPublishAt`, `invalidRecordingDetails`,
+/// `invalidVideoGameRating`, `invalidVideoMetadata`, `defaultLanguageNotSet`,
+/// `mediaBodyRequired`) and the 403s `forbiddenLicenseSetting`, `forbiddenPrivacySetting`.
+///
+/// Limits that clear with time: `uploadLimitExceeded` (400, the per-channel daily upload
+/// cap) and `quotaExceeded` (403). `dailyLimitExceeded`, `rateLimitExceeded` and
+/// `userRateLimitExceeded` are NOT confirmed for `videos.insert`; kept as waits.
+pub const QUOTA_REASONS: [&str; 5] = [
+    "uploadLimitExceeded",
     "quotaExceeded",
     "dailyLimitExceeded",
     "rateLimitExceeded",
     "userRateLimitExceeded",
 ];
-/// Account-level reasons (a missing scope, no channel): the owner must reconnect.
-pub const ACCOUNT_REASONS: [&str; 2] = ["insufficientPermissions", "youtubeSignupRequired"];
+/// Account or project wide: every post would hit it, so the run stops. Documented:
+/// `youtubeSignupRequired`, `authorizationRequired` (401) and `insufficientPermissions`,
+/// `forbidden` (403). `accessNotConfigured` (the API is not enabled in the Cloud project)
+/// and `authError` are NOT in the YouTube documentation that was read: treated as
+/// project-wide so one bad project setting halts the run instead of failing a post per run.
+pub const ACCOUNT_REASONS: [&str; 6] = [
+    "youtubeSignupRequired",
+    "authorizationRequired",
+    "insufficientPermissions",
+    "forbidden",
+    "accessNotConfigured",
+    "authError",
+];
 
 /// What a 4xx body's reason codes mean, as far as this code acts on them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -249,6 +268,8 @@ impl Reply {
 pub fn classify_refusal(reply: &Reply, status: u16, now: i64) -> PublishError {
     match status {
         401 => PublishError::Auth,
+        // The per-channel daily upload cap is a 400, separate from the API quota.
+        400 if reply.reason == ApiReason::Quota => PublishError::RateLimited { retry_at: None },
         429 => PublishError::RateLimited {
             retry_at: retry_at(reply.retry_after.as_deref(), now),
         },
@@ -392,16 +413,33 @@ mod tests {
 
     #[test]
     fn reasons_are_matched_exactly_with_quota_first() {
-        assert_eq!(api_reason(["quotaExceeded"]), ApiReason::Quota);
-        assert_eq!(api_reason(["insufficientPermissions"]), ApiReason::Account);
-        assert_eq!(api_reason(["youtubeSignupRequired"]), ApiReason::Account);
+        for quota in [
+            "quotaExceeded",
+            "uploadLimitExceeded",
+            "dailyLimitExceeded",
+            "rateLimitExceeded",
+            "userRateLimitExceeded",
+        ] {
+            assert_eq!(api_reason([quota]), ApiReason::Quota, "{quota}");
+        }
+        for account in [
+            "insufficientPermissions",
+            "youtubeSignupRequired",
+            "authorizationRequired",
+            "forbidden",
+            "accessNotConfigured",
+            "authError",
+        ] {
+            assert_eq!(api_reason([account]), ApiReason::Account, "{account}");
+        }
         assert_eq!(
             api_reason(["youtubeSignupRequired", "quotaExceeded"]),
             ApiReason::Quota
         );
         for other in [
             vec![],
-            vec!["forbidden"],
+            vec!["invalidTitle"],
+            vec!["forbiddenPrivacySetting"],
             vec!["QUOTAEXCEEDED"],
             vec!["quotaExceeded "],
         ] {
@@ -533,6 +571,73 @@ mod tests {
                 "{status}"
             );
         }
+    }
+
+    #[test]
+    fn the_documented_post_specific_reasons_are_rejected_and_limits_wait() {
+        let refuse = |status, reasons: &[&str]| {
+            let reply = Reply {
+                reason: api_reason(reasons.iter().copied()),
+                ..reply(Some(status))
+            };
+            classify_start(&reply, 1_000)
+        };
+        for reason in [
+            "invalidTitle",
+            "invalidDescription",
+            "invalidTags",
+            "invalidCategoryId",
+            "invalidFilename",
+            "invalidPublishAt",
+            "invalidRecordingDetails",
+            "invalidVideoGameRating",
+            "invalidVideoMetadata",
+            "defaultLanguageNotSet",
+            "mediaBodyRequired",
+        ] {
+            assert_eq!(
+                refuse(400, &[reason]),
+                Err(PublishError::Rejected),
+                "{reason}"
+            );
+        }
+        for reason in ["forbiddenLicenseSetting", "forbiddenPrivacySetting"] {
+            assert_eq!(
+                refuse(403, &[reason]),
+                Err(PublishError::Rejected),
+                "{reason}"
+            );
+        }
+        // The per-channel daily upload cap arrives as a 400 and is a wait, not a failure.
+        assert_eq!(
+            refuse(400, &["uploadLimitExceeded"]),
+            Err(PublishError::RateLimited { retry_at: None })
+        );
+        assert_eq!(
+            refuse(403, &["quotaExceeded"]),
+            Err(PublishError::RateLimited { retry_at: None })
+        );
+        // Account or project wide: the run stops instead of failing a post per run.
+        for (status, reason) in [
+            (401, "youtubeSignupRequired"),
+            (401, "authorizationRequired"),
+            (403, "insufficientPermissions"),
+            (403, "forbidden"),
+            (403, "accessNotConfigured"),
+            (403, "authError"),
+        ] {
+            assert_eq!(
+                refuse(status, &[reason]),
+                Err(PublishError::Auth),
+                "{reason}"
+            );
+        }
+        // An account reason on a 400 is not documented: the cautious, final answer.
+        assert_eq!(
+            refuse(400, &["youtubeSignupRequired"]),
+            Err(PublishError::Rejected)
+        );
+        assert_eq!(refuse(400, &["somethingNew"]), Err(PublishError::Rejected));
     }
 
     fn token_reply(status: u16, error: Option<&str>) -> TokenReply {
