@@ -15,6 +15,8 @@ mod net;
 mod oauth_adapters;
 #[cfg(target_arch = "wasm32")]
 mod publish_adapters;
+#[cfg(target_arch = "wasm32")]
+mod youtube_adapters;
 
 #[cfg(target_arch = "wasm32")]
 mod entry {
