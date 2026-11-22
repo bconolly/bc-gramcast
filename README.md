@@ -107,3 +107,4 @@ All endpoints answer only to the owner (see Run locally). Request bodies are JSO
 - The delete and edit adapters (D1 `get`, `update`, `delete`, R2 `delete_object`) are compile-checked only, not run against Cloudflare.
 - Put Cloudflare Access in front of every hostname the Worker answers on (workers.dev, Preview URLs and any custom domain), or set `workers_dev = false` and `preview_urls = false`.
 - Install `worker-build` in CI from a pinned, cached copy instead of building it each run.
+- The "still queued" check in SQL uses the time the request started, so it does not stop an edit or delete that lands just after the slot passes. Close this when publishing lands (for example with a status column in the WHERE clause).

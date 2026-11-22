@@ -144,8 +144,9 @@ impl PostRepository for D1PostRepository {
             .map(|p| dto::platform_to_str(*p))
             .collect();
         // video_key and id are never in the SET list, so they cannot change. The
-        // slot_at > now test is the "still queued" rule again, so a post whose slot
-        // passed after the domain's check is still refused.
+        // slot_at > now test is the "still queued" rule again. `now` is the time
+        // the request started, so this guards against other writers, not against
+        // the slot passing while this request runs (a gap for the publishing slice).
         let result = self
             .db
             .prepare("UPDATE posts SET title = ?1, caption = ?2, platforms = ?3, slot_at = ?4 WHERE id = ?5 AND slot_at > ?6")
