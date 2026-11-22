@@ -432,6 +432,9 @@ mod tests {
         async fn needs_reconnect(&self) -> Result<bool, PortError> {
             Ok(false)
         }
+        async fn connection_mark(&self) -> Result<Option<bool>, PortError> {
+            Ok(None)
+        }
     }
 
     fn state() -> String {

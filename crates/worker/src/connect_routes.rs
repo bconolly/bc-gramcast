@@ -13,7 +13,8 @@
 use crate::adapters::now_secs;
 use crate::connect_dto;
 use crate::oauth_adapters::{
-    oauth_config, AesGcmCipher, D1StateStore, D1TokenStore, GoogleExchanger, WebCryptoRandom,
+    oauth_config, AesGcmCipher, D1StateStore, D1TokenStore, GoogleExchanger, NoCipher,
+    WebCryptoRandom,
 };
 use domain::app::PortError;
 use domain::connect::{self, ConnectError};
@@ -93,15 +94,11 @@ pub async fn callback(req: Request, ctx: Ctx) -> Result<Response> {
     redirect(&connect_dto::redirect_location(result))
 }
 
-/// `GET /api/connect/status`: only `{youtube: {connected, needs_reconnect}}`.
+/// `GET /api/connect/status`: only `{youtube: {connected, needs_reconnect}}`. It reads
+/// row flags and never decrypts, so it needs no `TOKEN_ENC_KEY` and still answers
+/// after the key is lost.
 pub async fn status(_req: Request, ctx: Ctx) -> Result<Response> {
-    let tokens = match token_store(&ctx.env).await {
-        Ok(t) => t,
-        Err(e) => {
-            console_log!("connection status not configured: {}", e.0);
-            return Response::error("youtube connect is not configured", 503);
-        }
-    };
+    let tokens = D1TokenStore::new(ctx.env.d1("DB")?, NoCipher, WebCryptoRandom);
     match connection::connection_status(&tokens).await {
         Ok(s) => Response::from_json(&connect_dto::status_json(s)),
         Err(_) => {

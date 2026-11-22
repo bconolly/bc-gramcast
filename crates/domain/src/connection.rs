@@ -8,15 +8,15 @@ pub struct ConnectionStatus {
     pub needs_reconnect: bool,
 }
 
-/// Connected means a token is stored. The needs-reconnect mark only counts for a
-/// stored token. A failed read of the token or the mark is an error (fail closed),
-/// never a guess.
+/// Connected means a token row exists. The needs-reconnect mark only counts for a
+/// stored token. This never reads the token itself, so a row that can no longer be
+/// decrypted (a lost or changed key) still shows as connected, and the owner can
+/// reconnect. A failed read is an error (fail closed), never a guess.
 pub async fn connection_status<T: TokenStore>(tokens: &T) -> Result<ConnectionStatus, PortError> {
-    let connected = tokens.load().await?.is_some();
-    let needs_reconnect = connected && tokens.needs_reconnect().await?;
+    let mark = tokens.connection_mark().await?;
     Ok(ConnectionStatus {
-        connected,
-        needs_reconnect,
+        connected: mark.is_some(),
+        needs_reconnect: mark == Some(true),
     })
 }
 
@@ -60,6 +60,7 @@ mod tests {
                 needs_reconnect: false
             })
         );
+        pollster::block_on(s.load()).unwrap();
         pollster::block_on(s.mark_needs_reconnect()).unwrap();
         assert_eq!(
             status(&s),
@@ -83,16 +84,13 @@ mod tests {
         );
     }
 
-    struct Failing {
-        load_fails: bool,
+    /// A store whose token cannot be read (a lost key): only the row flags work.
+    struct Unreadable {
+        mark: Result<Option<bool>, PortError>,
     }
-    impl TokenStore for Failing {
+    impl TokenStore for Unreadable {
         async fn load(&self) -> Result<Option<StoredToken>, PortError> {
-            if self.load_fails {
-                Err(PortError("load".into()))
-            } else {
-                Ok(Some(token()))
-            }
+            panic!("the status must not read the token");
         }
         async fn save(&self, _: &StoredToken) -> Result<(), PortError> {
             Ok(())
@@ -104,19 +102,35 @@ mod tests {
             Ok(())
         }
         async fn needs_reconnect(&self) -> Result<bool, PortError> {
-            Err(PortError("mark".into()))
+            panic!("the status asks the mark once, with the row");
+        }
+        async fn connection_mark(&self) -> Result<Option<bool>, PortError> {
+            match &self.mark {
+                Ok(m) => Ok(*m),
+                Err(e) => Err(PortError(e.0.clone())),
+            }
+        }
+    }
+
+    #[test]
+    fn an_unreadable_token_still_shows_as_connected() {
+        for (mark, need) in [(Some(false), false), (Some(true), true)] {
+            let s = Unreadable { mark: Ok(mark) };
+            assert_eq!(
+                status(&s),
+                Ok(ConnectionStatus {
+                    connected: true,
+                    needs_reconnect: need
+                })
+            );
         }
     }
 
     #[test]
     fn a_failed_read_is_an_error_not_a_default() {
-        assert_eq!(
-            status(&Failing { load_fails: true }),
-            Err(PortError("load".into()))
-        );
-        assert_eq!(
-            status(&Failing { load_fails: false }),
-            Err(PortError("mark".into()))
-        );
+        let s = Unreadable {
+            mark: Err(PortError("d1 down".into())),
+        };
+        assert_eq!(status(&s), Err(PortError("d1 down".into())));
     }
 }
