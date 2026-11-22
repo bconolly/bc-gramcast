@@ -1,6 +1,6 @@
 //! JSON shapes for the API, and mapping to and from the domain. No logic here.
 
-use domain::app::{AppError, InsertError, PortError, PostChanges, UpdateError};
+use domain::app::{AppError, DeleteError, InsertError, PortError, PostChanges, UpdateError};
 use domain::auth::{self, AuthError, Claims, JwtHeader};
 use domain::media::UploadError;
 use domain::queue::{Platform, QueueError, QueuedPost};
@@ -217,6 +217,51 @@ pub fn classify_update_error(text: &str) -> UpdateError {
         UpdateError::SlotTaken
     } else {
         UpdateError::Port(PortError(text.to_string()))
+    }
+}
+
+/// Logged when the read that settles a delete (after D1 gave no change count)
+/// itself fails, so a possibly orphaned video is visible. No id: it may be unknown.
+pub const DELETE_UNCONFIRMED_LINE: &str = "delete could not be confirmed; a video may be orphaned";
+
+/// True when D1 reports at least one row changed by a write.
+pub fn write_applied(changes: Option<usize>) -> bool {
+    changes.is_some_and(|n| n > 0)
+}
+
+/// Settles an update that did not report a change. `row_slot` is the stored
+/// `slot_at` read back afterwards (`None`: no such row). The SQL only touches rows
+/// whose slot is after `now`, so a row at or before it was refused, not updated.
+pub fn update_after_miss(
+    changes: Option<usize>,
+    row_slot: Option<i64>,
+    now: i64,
+) -> Result<(), UpdateError> {
+    match (changes, row_slot) {
+        (_, None) => Err(UpdateError::NotFound),
+        (_, Some(slot)) if slot <= now => Err(UpdateError::NotQueued),
+        // No count, and the row now holds a future slot: our update landed.
+        (None, Some(_)) => Ok(()),
+        // A count of 0 with a queued row should be impossible: do not claim success.
+        (Some(_), Some(_)) => Err(UpdateError::Port(PortError(
+            "update changed no rows".into(),
+        ))),
+    }
+}
+
+/// Settles a delete that did not report a change, like `update_after_miss`.
+pub fn delete_after_miss(
+    changes: Option<usize>,
+    row_slot: Option<i64>,
+    now: i64,
+) -> Result<(), DeleteError> {
+    match (changes, row_slot) {
+        (None, None) => Ok(()),
+        (Some(_), None) => Err(DeleteError::NotFound),
+        (_, Some(slot)) if slot <= now => Err(DeleteError::NotQueued),
+        (_, Some(_)) => Err(DeleteError::Port(PortError(
+            "delete removed no rows".into(),
+        ))),
     }
 }
 
@@ -592,6 +637,87 @@ mod tests {
         assert_eq!(
             error_status(&AppError::NotQueued),
             (409, "post is no longer queued")
+        );
+    }
+
+    const NOW: i64 = 1_000;
+
+    #[test]
+    fn a_write_with_rows_changed_is_applied() {
+        assert!(write_applied(Some(1)));
+        assert!(!write_applied(Some(0)));
+        assert!(!write_applied(None));
+    }
+
+    #[test]
+    fn update_after_no_change_reads_the_row_to_decide() {
+        // Row gone: NotFound. Row there with a passed slot: NotQueued.
+        assert_eq!(
+            update_after_miss(Some(0), None, NOW),
+            Err(UpdateError::NotFound)
+        );
+        assert_eq!(
+            update_after_miss(Some(0), Some(NOW), NOW),
+            Err(UpdateError::NotQueued)
+        );
+        assert_eq!(
+            update_after_miss(Some(0), Some(NOW - 1), NOW),
+            Err(UpdateError::NotQueued)
+        );
+        // 0 changes yet a queued row cannot happen: do not claim success.
+        assert!(matches!(
+            update_after_miss(Some(0), Some(NOW + 1), NOW),
+            Err(UpdateError::Port(_))
+        ));
+    }
+
+    #[test]
+    fn update_without_a_change_count_trusts_the_reread_row() {
+        assert_eq!(update_after_miss(None, Some(NOW + 1), NOW), Ok(()));
+        assert_eq!(
+            update_after_miss(None, Some(NOW), NOW),
+            Err(UpdateError::NotQueued)
+        );
+        assert_eq!(
+            update_after_miss(None, None, NOW),
+            Err(UpdateError::NotFound)
+        );
+    }
+
+    #[test]
+    fn delete_after_no_change_reads_the_row_to_decide() {
+        assert_eq!(
+            delete_after_miss(Some(0), None, NOW),
+            Err(DeleteError::NotFound)
+        );
+        assert_eq!(
+            delete_after_miss(Some(0), Some(NOW), NOW),
+            Err(DeleteError::NotQueued)
+        );
+        assert!(matches!(
+            delete_after_miss(Some(0), Some(NOW + 1), NOW),
+            Err(DeleteError::Port(_))
+        ));
+    }
+
+    #[test]
+    fn delete_without_a_change_count_trusts_the_reread_row() {
+        assert_eq!(delete_after_miss(None, None, NOW), Ok(()));
+        assert_eq!(
+            delete_after_miss(None, Some(NOW), NOW),
+            Err(DeleteError::NotQueued)
+        );
+        assert!(matches!(
+            delete_after_miss(None, Some(NOW + 1), NOW),
+            Err(DeleteError::Port(_))
+        ));
+    }
+
+    #[test]
+    fn the_unconfirmed_delete_log_line_is_fixed() {
+        assert_eq!(
+            DELETE_UNCONFIRMED_LINE,
+            "delete could not be confirmed; a video may be orphaned"
         );
     }
 
