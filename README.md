@@ -54,7 +54,7 @@ Dates: the date-time picker follows the browser's locale for display (so it may 
 
 Security headers for the static app live in `web/public/_headers` (CSP, nosniff, no-referrer). The CSP needs no `'unsafe-inline'`: the build has no inline scripts or styles.
 
-Screenshots (needs Playwright and Chromium installed): `npm --prefix web run build && node web/scripts/screenshots.cjs <out-dir>/` (the output directory is required; the script serves the build with `web/public/_headers` applied and fails on console errors, so CSP problems show up).
+Screenshots (needs the `playwright` package, which is not a devDependency, and Chromium installed; the scripts `require('playwright')`, for example from a global or a separate tools install): `npm --prefix web run build && node web/scripts/screenshots.cjs <out-dir>/` (the output directory is required; the script serves the build with `web/public/_headers` applied and fails on console errors, so CSP problems show up).
 
 `spike/cpu` measures how long one R2 presign takes in V8 WebAssembly, to check the Workers free plan's 10 ms CPU limit.
 
@@ -99,11 +99,11 @@ Steps:
 2. Set the three secrets and register the redirect URI with Google.
 3. Open the app, go to Connections (`/settings`), press Connect YouTube, and allow access on Google's page. You come back to Connections showing Connected.
 
-How it works: `GET /api/connect/youtube/start` makes a single-use random state (valid 10 minutes), stores it and sends you to Google asking only for the `youtube.upload` scope, with `access_type=offline` and `prompt=consent` so Google returns a refresh token. `GET /api/connect/youtube/callback` checks and uses up the state, trades the code for tokens, encrypts them (AES-256-GCM, a fresh random nonce per write, the provider name as authenticated data) and redirects to `/settings?connected=1`, or `/settings?connect_error=<code>` where the code is one of `access_denied`, `bad_state`, `exchange_failed`, `server_error`. `GET /api/connect/status` returns only `{"youtube":{"connected":bool,"needs_reconnect":bool}}`. No route returns a token, and nothing logs a code, token, state or URL.
+How it works: `GET /api/connect/youtube/start` makes a single-use random state (valid 10 minutes), stores it and sends you to Google asking only for the `youtube.upload` scope, with `access_type=offline` and `prompt=consent` so Google returns a refresh token. `GET /api/connect/youtube/callback` checks and uses up the state, trades the code for tokens, encrypts them (AES-256-GCM, a fresh random nonce per write, the provider name as authenticated data) and redirects to `/settings?connected=1`, or `/settings?connect_error=<code>` where the code is one of `access_denied`, `bad_state`, `exchange_failed`, `server_error`. `GET /api/connect/status` returns only `{"youtube":{"connected":bool,"needs_reconnect":bool}}`, from row presence and the flag; it never decrypts, so it still answers after the key is lost (the row then shows as connected, and you reconnect). No route returns a token, and nothing logs a code, token, state or URL.
 
-Both connect routes are GET navigations behind the same owner sign-in as the rest of the API. The Origin check covers only POST, PUT, PATCH and DELETE, and the callback comes from Google, so what protects it is the single-use state. There is no PKCE (support for this flow was not confirmed).
+`start` also refuses (403) a `Sec-Fetch-Site` that is present and not `same-origin` or `none`. A scheduled run's token refresh and its needs-reconnect mark apply only if the stored row is still the one that run loaded, so reconnecting while a run is in flight is never overwritten. If Google's reply names the granted scopes, they must include `youtube.upload`. Both connect routes are GET navigations behind the same owner sign-in as the rest of the API. The Origin check covers only POST, PUT, PATCH and DELETE, and the callback comes from Google, so what protects it is the single-use state. There is no PKCE (support for this flow was not confirmed).
 
-Not verified: none of this has run against Google or Cloudflare. The D1 statements were run against SQLite and the Web Crypto call shapes against Node, not in the Workers runtime or D1. Whether the Access cookie is sent on the redirect back from Google, and the exact fields in Google's token reply, are untested here. The granted scope in the reply is not checked.
+Not verified: none of this has run against Google or Cloudflare. `DELETE ... RETURNING` and `UPDATE ... RETURNING` in D1 are assumed to work like SQLite's (the statements ran against SQLite 3.53.1 only). The D1 statements were run against SQLite and the Web Crypto call shapes against Node, not in the Workers runtime or D1. Whether the Access cookie is sent on the redirect back from Google, and the exact fields in Google's token reply, are untested here. The granted scope in the reply is not checked.
 
 ## API
 All endpoints answer only to the owner (see Run locally). Request bodies are JSON.
@@ -112,7 +112,7 @@ All endpoints answer only to the owner (see Run locally). Request bodies are JSO
 - `DELETE /api/posts/{id}`: delete a queued post and its video. Answers 204; 404 for an unknown id; 409 if the post is no longer queued. The post is removed first; if the video cannot be removed the call still succeeds and the Worker logs a fixed line with the post id.
 - `GET /api/slots/pattern`: the weekly posting pattern, for example `{"utc_offset_minutes":600,"rules":[{"weekday":"wed","time":"19:00"}]}`. Before one is saved it is Brisbane (+600) with no rules.
 - `PUT /api/slots/pattern`: save the pattern (same shape; weekday `mon` to `sun`, time 24h `HH:MM`, offset -720 to 840, at most 14 rules). Answers with the normalised pattern.
-- `GET /api/connect/status`, `GET /api/connect/youtube/start`, `GET /api/connect/youtube/callback`: see Connect YouTube above.
+- `GET /api/connect/status`, `GET /api/connect/youtube/start`, `GET /api/connect/youtube/callback`: see Connect YouTube above. Connections screenshots: `node web/scripts/screenshots-connections.cjs <out-dir>/` (same Playwright requirement).
 - `GET /api/slots/next?count=N`: `{"slots":[<unix seconds>, ...]}`, the next pattern slots not already taken by a queued post. `count` is 1 to 20 and defaults to 5.
 
 ## Known gaps for later slices
