@@ -523,9 +523,12 @@ where
         };
         let mut result = self.upload(&p.post, token, deadline).await;
         // A forced refresh and a second upload must not stretch the post past its
-        // deadline. Auth means nothing was sent, so with no time left it is retried later.
+        // deadline. Auth means nothing was sent, so with no time left the claim is undone
+        // (no attempt spent) and the next run starts over.
         if result == Err(PublishError::Auth) && (self.clock)() >= deadline {
-            result = Err(PublishError::Transient);
+            return self
+                .release(id, &claimed, &p.state, Halt::TokenUnavailable)
+                .await;
         }
         if result == Err(PublishError::Auth) {
             match self.retry_after_refresh(&p.post, token, deadline).await {
@@ -1121,14 +1124,13 @@ mod tests {
             usize::MAX,
         ))
         .unwrap();
-        // No forced refresh and no second upload; nothing was sent, so it is retried later.
+        // No forced refresh and no second upload. Nothing was sent, so the claim is
+        // undone: no attempt is spent and the post is exactly as before.
         assert_eq!(refresher.calls.get(), 0);
         assert_eq!(publisher.calls.borrow().len(), 1);
-        assert_eq!(
-            report.outcomes[0].1,
-            Outcome::Retrying(FailReason::Transient)
-        );
-        assert_eq!(report.halted, None);
+        assert_eq!(report.outcomes, [("a".to_string(), Outcome::Released)]);
+        assert_eq!(repo.state("a"), PublishState::new_queued());
+        assert_eq!(report.halted, Some(Halt::TokenUnavailable));
         assert!(!tokens.reconnect.get());
     }
 
