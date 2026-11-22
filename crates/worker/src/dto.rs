@@ -340,6 +340,17 @@ pub fn auth_reason_code(e: &AuthError) -> &'static str {
     }
 }
 
+/// Log line for a failed key refresh. `reason` is one of the fixed `PortError`
+/// texts from `AccessVerifier::refresh`: never a response body, token, email or URL.
+pub fn key_refresh_failed_line(reason: &str) -> String {
+    format!("key refresh failed: {reason}")
+}
+
+/// Log line for the key import step: counts only, never key material or kid.
+pub fn key_import_counts_line(parsed: usize, imported: usize) -> String {
+    format!("key import: parsed={parsed} imported={imported}")
+}
+
 /// Headers added to every response the Worker returns, denials included.
 pub const API_SECURITY_HEADERS: [(&str, &str); 4] = [
     ("X-Content-Type-Options", "nosniff"),
@@ -1031,6 +1042,18 @@ mod tests {
         assert!(codes
             .iter()
             .all(|c| c.bytes().all(|b| b.is_ascii_lowercase() || b == b'_')));
+    }
+
+    #[test]
+    fn key_refresh_log_lines_are_fixed_text_and_numbers() {
+        assert_eq!(
+            key_refresh_failed_line("key fetch status"),
+            "key refresh failed: key fetch status"
+        );
+        assert_eq!(
+            key_import_counts_line(3, 0),
+            "key import: parsed=3 imported=0"
+        );
     }
 
     #[test]

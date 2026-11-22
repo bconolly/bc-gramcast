@@ -314,7 +314,13 @@ impl AccessVerifier {
             started,
             finished: false,
         };
-        let keys = self.refresh().await.ok();
+        let keys = match self.refresh().await {
+            Ok(keys) => Some(keys),
+            Err(err) => {
+                worker::console_log!("{}", dto::key_refresh_failed_line(&err.0));
+                None
+            }
+        };
         guard.finished = true;
         KEYS.with(|c| c.borrow_mut().fetched(kid, started, keys, now_secs()))
     }
@@ -341,6 +347,7 @@ impl AccessVerifier {
         }
         let body = response.text().await.map_err(|_| port("key body"))?;
         let jwks = dto::parse_jwks(&body).map_err(|_| port("key set not usable"))?;
+        let parsed = jwks.len();
         let mut imported = Vec::new();
         for jwk in jwks {
             if let Ok(key) = import_key(&jwk).await {
@@ -348,6 +355,7 @@ impl AccessVerifier {
             }
         }
         if imported.is_empty() {
+            worker::console_log!("{}", dto::key_import_counts_line(parsed, 0));
             return Err(port("no key imported"));
         }
         Ok(imported)
