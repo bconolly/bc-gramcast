@@ -81,14 +81,28 @@ impl SubrequestBudget {
 
 /// One request may take this long before it is given up on. Our own choice: a chunk is
 /// 8 MiB, which needs a few seconds even on a slow link.
-pub const REQUEST_TIMEOUT_SECS: i64 = 60;
-/// No new chunk is started after this long into an upload. Our own choice, well inside
-/// `PUBLISH_TIMEOUT_SECS` (15 minutes, also the cron invocation limit): the last request
-/// can still run for `REQUEST_TIMEOUT_SECS` past it, and a status check or two after that.
-pub const UPLOAD_DEADLINE_SECS: i64 = 10 * 60;
+pub const REQUEST_TIMEOUT_SECS: i64 = 30;
+/// Wait before asking where an upload stands after a lost reply.
+pub const STATUS_CHECK_DELAY_SECS: i64 = 2;
+/// No request is started once this long has passed since the claim. Our own choice.
+pub const UPLOAD_DEADLINE_SECS: i64 = 6 * 60;
+/// The longest a publish can run from the claim. The deadline is checked before every
+/// request (start, chunk, status check, forced refresh), so the last one begins just
+/// inside it; a status check also waits `STATUS_CHECK_DELAY_SECS` first, and the request
+/// can run for `REQUEST_TIMEOUT_SECS`. After that the outcome is written.
+pub const WORST_CASE_PUBLISH_SECS: i64 =
+    UPLOAD_DEADLINE_SECS + STATUS_CHECK_DELAY_SECS + REQUEST_TIMEOUT_SECS;
 
-const _: () =
-    assert!(UPLOAD_DEADLINE_SECS + 3 * REQUEST_TIMEOUT_SECS < crate::publish::PUBLISH_TIMEOUT_SECS);
+// Well inside the 15 minutes after which a Publishing post is flagged (and the cron
+// invocation limit), with room for the state write.
+const _: () = assert!(
+    WORST_CASE_PUBLISH_SECS + 2 * REQUEST_TIMEOUT_SECS < crate::publish::PUBLISH_TIMEOUT_SECS
+);
+
+/// The moment no further request may start, for a post claimed at `started_at`.
+pub fn upload_deadline(started_at: i64) -> i64 {
+    started_at.saturating_add(UPLOAD_DEADLINE_SECS)
+}
 
 /// Who can see the video. The default is private, so a first real test never goes public.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -350,12 +364,18 @@ mod tests {
     }
 
     #[test]
-    fn a_whole_upload_stays_well_inside_the_publish_timeout() {
-        // The deadline, the request that straddles it, and two more (a status check
-        // and the final write), all under the 15 minutes after which a post is flagged.
-        let worst = UPLOAD_DEADLINE_SECS + 3 * REQUEST_TIMEOUT_SECS;
-        assert!(worst < crate::publish::PUBLISH_TIMEOUT_SECS, "{worst}");
-        assert_eq!(UPLOAD_DEADLINE_SECS, 600);
+    fn the_worst_case_publish_is_computed_from_its_parts() {
+        assert_eq!(
+            (
+                REQUEST_TIMEOUT_SECS,
+                STATUS_CHECK_DELAY_SECS,
+                UPLOAD_DEADLINE_SECS
+            ),
+            (30, 2, 360)
+        );
+        assert_eq!(WORST_CASE_PUBLISH_SECS, 392);
+        assert_eq!(upload_deadline(1_000), 1_360);
+        assert_eq!(upload_deadline(i64::MAX), i64::MAX);
     }
 
     #[test]

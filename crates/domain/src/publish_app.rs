@@ -8,7 +8,7 @@ use crate::publish::{
 };
 use crate::queue::{is_valid_video_key, QueuedPost};
 use crate::token::{StoredToken, TokenLoad, TokenStore};
-use crate::youtube::MAX_PUBLISH_BYTES;
+use crate::youtube::{upload_deadline, MAX_PUBLISH_BYTES};
 use std::fmt;
 
 /// Where a stored video is and how big it is, which is all a publisher needs to read it
@@ -89,6 +89,9 @@ impl From<PublishError> for FailReason {
 /// Error contract: `Transient` means the provider definitely did NOT create the
 /// video. Any failure where it might have (timeout after the body was sent, a
 /// lost response, an unparsable success) must be `Unknown`.
+///
+/// `deadline` (Unix seconds) is the moment no further request may start: the claim time
+/// plus `UPLOAD_DEADLINE_SECS`. Past it the publisher gives up as the error contract says.
 #[allow(async_fn_in_trait)]
 pub trait Publisher {
     async fn publish(
@@ -96,6 +99,7 @@ pub trait Publisher {
         post: &QueuedPost,
         video: &VideoAccess,
         token: &StoredToken,
+        deadline: i64,
     ) -> Result<PublishedRef, PublishError>;
 }
 
@@ -459,9 +463,18 @@ where
             return Ok(Step::of(Outcome::AlreadyClaimed));
         }
 
-        let mut result = self.upload(&p.post, token).await;
+        let deadline = match &claimed {
+            PublishState::Publishing { started_at, .. } => upload_deadline(*started_at),
+            _ => return Ok(Step::of(Outcome::AlreadyClaimed)),
+        };
+        let mut result = self.upload(&p.post, token, deadline).await;
+        // A forced refresh and a second upload must not stretch the post past its
+        // deadline. Auth means nothing was sent, so with no time left it is retried later.
+        if result == Err(PublishError::Auth) && (self.clock)() >= deadline {
+            result = Err(PublishError::Transient);
+        }
         if result == Err(PublishError::Auth) {
-            match self.retry_after_refresh(&p.post, token).await {
+            match self.retry_after_refresh(&p.post, token, deadline).await {
                 Retried::Done(r) => result = r,
                 Retried::TokenTrouble => return self.release(id, &claimed, &p.state).await,
             }
@@ -515,9 +528,14 @@ where
     /// token so later runs stop at once; a failed mark is ignored because the post is
     /// requeued and the run halts either way. A refresh that fails for any reason but
     /// `Auth` is a token problem, not a verdict on this post (see `release`).
-    async fn retry_after_refresh(&self, post: &QueuedPost, token: &mut StoredToken) -> Retried {
+    async fn retry_after_refresh(
+        &self,
+        post: &QueuedPost,
+        token: &mut StoredToken,
+        deadline: i64,
+    ) -> Retried {
         let result = match self.refresh(token).await {
-            Ok(()) => self.upload(post, token).await,
+            Ok(()) => self.upload(post, token, deadline).await,
             Err(PublishError::Auth) => Err(PublishError::Auth),
             Err(_) => return Retried::TokenTrouble,
         };
@@ -556,6 +574,7 @@ where
         &self,
         post: &QueuedPost,
         token: &StoredToken,
+        deadline: i64,
     ) -> Result<PublishedRef, PublishError> {
         // Storage is only asked about well-formed keys, as the delete path does.
         if !is_valid_video_key(&post.video_key) {
@@ -572,7 +591,10 @@ where
         if video.size() == 0 || video.size() > MAX_PUBLISH_BYTES {
             return Err(PublishError::Rejected);
         }
-        let published = self.publisher.publish(post, &video, token).await?;
+        let published = self
+            .publisher
+            .publish(post, &video, token, deadline)
+            .await?;
         // The upload succeeded but the id is not one we will store or trust: the video
         // may exist, so this is an unknown outcome, never a retry.
         if !is_valid_external_id(&published.external_id) {
@@ -711,6 +733,8 @@ mod tests {
         seen: RefCell<Vec<(String, String, String)>>,
         /// Moves the shared clock forward by `.1` seconds on every call.
         advance: Option<(Rc<Cell<i64>>, i64)>,
+        /// The deadline each provider call was given.
+        deadlines: RefCell<Vec<i64>>,
     }
     impl FakePublisher {
         fn returning(r: Vec<Result<PublishedRef, PublishError>>) -> Self {
@@ -726,7 +750,9 @@ mod tests {
             post: &QueuedPost,
             video: &VideoAccess,
             token: &StoredToken,
+            deadline: i64,
         ) -> Result<PublishedRef, PublishError> {
+            self.deadlines.borrow_mut().push(deadline);
             self.calls.borrow_mut().push(post.id.clone());
             self.seen.borrow_mut().push((
                 token.access_token.clone(),
@@ -993,6 +1019,49 @@ mod tests {
         assert_eq!(seen[1].0, "ya29.NEW-SECRET");
         assert!(!tokens.reconnect.get());
         assert_eq!(report.halted, None);
+    }
+
+    #[test]
+    fn the_publisher_gets_a_deadline_counted_from_the_claim() {
+        let repo = FakeRepo::with(vec![scheduled("a", NOW - 1)]);
+        let publisher = FakePublisher::returning(vec![Err(PublishError::Auth), ok_ref("yt1")]);
+        run(&repo, &publisher, &fresh_store(), &refresher_ok());
+        // Both calls share the first claim's deadline: a retry cannot stretch the post.
+        let want = NOW + crate::youtube::UPLOAD_DEADLINE_SECS;
+        assert_eq!(*publisher.deadlines.borrow(), [want, want]);
+    }
+
+    #[test]
+    fn an_auth_refusal_with_no_time_left_is_not_retried() {
+        let clock = Rc::new(Cell::new(NOW));
+        let repo = FakeRepo::with(vec![scheduled("a", NOW - 1)]);
+        let tokens = fresh_store();
+        let refresher = refresher_ok();
+        let publisher = FakePublisher {
+            results: RefCell::new(vec![Err(PublishError::Auth)].into()),
+            advance: Some((clock.clone(), crate::youtube::UPLOAD_DEADLINE_SECS)),
+            ..FakePublisher::default()
+        };
+        let c = clock.clone();
+        let report = pollster::block_on(publish_due(
+            &move || c.get(),
+            &repo,
+            &publisher,
+            &tokens,
+            &refresher,
+            &FakeLinks,
+            usize::MAX,
+        ))
+        .unwrap();
+        // No forced refresh and no second upload; nothing was sent, so it is retried later.
+        assert_eq!(refresher.calls.get(), 0);
+        assert_eq!(publisher.calls.borrow().len(), 1);
+        assert_eq!(
+            report.outcomes[0].1,
+            Outcome::Retrying(FailReason::Transient)
+        );
+        assert_eq!(report.halted, None);
+        assert!(!tokens.reconnect.get());
     }
 
     #[test]

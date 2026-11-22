@@ -23,7 +23,7 @@ use domain::queue::QueuedPost;
 use domain::token::StoredToken;
 use domain::upload::{self, Chunk, Step, Upload};
 use domain::youtube::{
-    self, Privacy, Reply, SubrequestBudget, START_SUBREQUESTS, UPLOAD_DEADLINE_SECS,
+    self, Privacy, Reply, SubrequestBudget, START_SUBREQUESTS, STATUS_CHECK_DELAY_SECS,
 };
 use std::cell::RefCell;
 use std::time::Duration;
@@ -36,8 +36,7 @@ use worker::{
 /// Starts a resumable upload (the brief's URL, as the wire shape).
 const INITIATE_URL: &str =
     "https://www.googleapis.com/upload/youtube/v3/videos?uploadType=resumable&part=snippet,status";
-/// Wait before asking where an upload stands after a lost reply.
-const STATUS_CHECK_DELAY: Duration = Duration::from_secs(2);
+const STATUS_CHECK_DELAY: Duration = Duration::from_secs(STATUS_CHECK_DELAY_SECS as u64);
 
 // ---- the video in R2 ----------------------------------------------------------------
 
@@ -233,13 +232,16 @@ impl Publisher for YouTubePublisher {
         post: &QueuedPost,
         video: &VideoAccess,
         token: &StoredToken,
+        deadline: i64,
     ) -> Result<PublishedRef, PublishError> {
         // The size lookup that made `video` and the start request: nothing sent yet,
         // so running out here is safe to retry.
         if !self.budget.borrow_mut().spend(START_SUBREQUESTS) {
             return Err(PublishError::Transient);
         }
-        let started = now_secs();
+        if now_secs() >= deadline {
+            return Err(PublishError::Transient);
+        }
         let session = self.start(post, video, token).await?;
         let mut up = Upload::new(video.size())?;
         let mut last_body: Option<String> = None;
@@ -247,7 +249,7 @@ impl Publisher for YouTubePublisher {
         loop {
             match step {
                 Step::Send(chunk) => {
-                    if now_secs().saturating_sub(started) >= UPLOAD_DEADLINE_SECS {
+                    if now_secs() >= deadline {
                         return Err(up.out_of_time());
                     }
                     let Some(bytes) = self.read_chunk(video.key(), &chunk).await else {
@@ -261,6 +263,9 @@ impl Publisher for YouTubePublisher {
                     step = up.on_chunk(&reply, now_secs(), &mut self.budget.borrow_mut());
                 }
                 Step::Query => {
+                    if now_secs() >= deadline {
+                        return Err(up.out_of_time());
+                    }
                     Delay::from(STATUS_CHECK_DELAY).await;
                     let range = upload::status_content_range(video.size());
                     let (reply, body) = self.put(&session, token, &range, None).await;
