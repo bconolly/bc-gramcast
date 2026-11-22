@@ -1,6 +1,6 @@
 //! JSON shapes for the API, and mapping to and from the domain. No logic here.
 
-use domain::app::{AppError, InsertError, PortError};
+use domain::app::{AppError, InsertError, PortError, PostChanges, UpdateError};
 use domain::auth::{self, AuthError, Claims, JwtHeader};
 use domain::media::UploadError;
 use domain::queue::{Platform, QueueError, QueuedPost};
@@ -24,6 +24,35 @@ pub struct QueuePostBody {
     pub platforms: Vec<String>,
     pub slot_at: i64,
 }
+
+/// Body of `PATCH /api/posts/{id}`: every editable field, nothing else. The id
+/// and video are not editable, so naming them is refused like any unknown field.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PatchPostBody {
+    pub title: String,
+    pub caption: String,
+    pub platforms: Vec<String>,
+    pub slot_at: i64,
+}
+
+/// Returns `None` if any platform name is unknown.
+pub fn to_changes(body: PatchPostBody) -> Option<PostChanges> {
+    let platforms = body
+        .platforms
+        .iter()
+        .map(|p| platform_from_str(p))
+        .collect::<Option<Vec<_>>>()?;
+    Some(PostChanges {
+        title: body.title,
+        caption: body.caption,
+        platforms,
+        slot_at: body.slot_at,
+    })
+}
+
+/// Logged when a post was deleted but its video object could not be removed.
+pub const VIDEO_LEFT_BEHIND_LINE: &str = "post deleted; video object not removed";
 
 #[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PostJson {
@@ -175,6 +204,16 @@ pub fn classify_insert_error(text: &str) -> InsertError {
         InsertError::VideoAlreadyQueued
     } else {
         InsertError::Port(PortError(text.to_string()))
+    }
+}
+
+/// Maps the text of a D1 failure on update. Only the slot UNIQUE violation is
+/// special; anything else stays a port error the API never shows.
+pub fn classify_update_error(text: &str) -> UpdateError {
+    if text.contains("UNIQUE constraint failed: posts.slot_at") {
+        UpdateError::SlotTaken
+    } else {
+        UpdateError::Port(PortError(text.to_string()))
     }
 }
 
@@ -486,6 +525,61 @@ mod tests {
             r#"{"file_name":"a.mp4","content_type":"video/mp4","size_bytes":1,"admin":true}"#,
         );
         assert!(r.is_err());
+    }
+
+    fn patch_json() -> &'static str {
+        r#"{"title":"T2","caption":"C2","platforms":["youtube"],"slot_at":500}"#
+    }
+
+    #[test]
+    fn parses_a_patch_body_into_domain_changes() {
+        let b: PatchPostBody = serde_json::from_str(patch_json()).unwrap();
+        let c = to_changes(b).unwrap();
+        assert_eq!(c.title, "T2");
+        assert_eq!(c.platforms, [Platform::YouTube]);
+        assert_eq!(c.slot_at, 500);
+    }
+
+    #[test]
+    fn a_patch_body_cannot_name_the_immutable_fields_or_extras() {
+        for extra in ["video_key", "id", "admin"] {
+            let text = patch_json().replace('}', &format!(r#","{extra}":"x"}}"#));
+            assert!(
+                serde_json::from_str::<PatchPostBody>(&text).is_err(),
+                "{extra}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_patch_body_must_have_every_editable_field() {
+        let r = serde_json::from_str::<PatchPostBody>(r#"{"title":"T"}"#);
+        assert!(r.is_err());
+    }
+
+    #[test]
+    fn a_patch_with_an_unknown_platform_is_rejected() {
+        let mut b: PatchPostBody = serde_json::from_str(patch_json()).unwrap();
+        b.platforms = vec!["tiktok".into()];
+        assert!(to_changes(b).is_none());
+    }
+
+    #[test]
+    fn classifies_update_errors_by_the_unique_slot_message() {
+        assert_eq!(
+            classify_update_error("UNIQUE constraint failed: posts.slot_at | D1_ERROR"),
+            UpdateError::SlotTaken
+        );
+        let other = classify_update_error("secret detail");
+        assert_eq!(other, UpdateError::Port(PortError("secret detail".into())));
+    }
+
+    #[test]
+    fn the_leftover_video_log_line_is_fixed() {
+        assert_eq!(
+            VIDEO_LEFT_BEHIND_LINE,
+            "post deleted; video object not removed"
+        );
     }
 
     #[test]

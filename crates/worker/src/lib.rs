@@ -10,7 +10,7 @@ mod entry {
     use crate::adapters::{
         AccessVerifier, D1PostRepository, D1SlotPatternRepository, R2Signer, R2Store,
     };
-    use crate::dto::{self, PatternJson, QueuePostBody, StartUploadBody};
+    use crate::dto::{self, PatchPostBody, PatternJson, QueuePostBody, StartUploadBody};
     use domain::app;
     use domain::auth::{self, AccessConfig, AuthError};
     use worker::*;
@@ -105,7 +105,7 @@ mod entry {
         Response::error(msg, code)
     }
 
-    /// Rejects non-JSON POST and PUT requests (415) before the body is read.
+    /// Rejects non-JSON POST, PUT and PATCH requests (415) before the body is read.
     fn require_json(req: &Request) -> Result<Option<Response>> {
         let header = req.headers().get("Content-Type").ok().flatten();
         if dto::is_json_content_type(header.as_deref()) {
@@ -180,6 +180,41 @@ mod entry {
                 let store = R2Store::new(ctx.env.bucket("VIDEOS")?);
                 match app::queue_post(&repo, &store, now_secs(), post.clone()).await {
                     Ok(()) => Ok(Response::from_json(&dto::to_json(&post))?.with_status(201)),
+                    Err(e) => app_error(&e),
+                }
+            })
+            .patch_async("/api/posts/:id", |mut req, ctx| async move {
+                if let Some(rejected) = require_json(&req)? {
+                    return Ok(rejected);
+                }
+                let Some(id) = ctx.param("id").cloned() else {
+                    return Response::error("post not found", 404);
+                };
+                let Ok(body) = req.json::<PatchPostBody>().await else {
+                    return Response::error("bad request", 400);
+                };
+                let Some(changes) = dto::to_changes(body) else {
+                    return Response::error("unknown platform", 422);
+                };
+                let repo = D1PostRepository::new(ctx.env.d1("DB")?);
+                match app::update_post(&repo, &id, changes, now_secs()).await {
+                    Ok(post) => Response::from_json(&dto::to_json(&post)),
+                    Err(e) => app_error(&e),
+                }
+            })
+            .delete_async("/api/posts/:id", |_req, ctx| async move {
+                let Some(id) = ctx.param("id").cloned() else {
+                    return Response::error("post not found", 404);
+                };
+                let repo = D1PostRepository::new(ctx.env.d1("DB")?);
+                let store = R2Store::new(ctx.env.bucket("VIDEOS")?);
+                match app::delete_post(&repo, &store, &id).await {
+                    Ok(outcome) => {
+                        if outcome == app::DeleteOutcome::VideoLeftBehind {
+                            console_log!("{}", dto::VIDEO_LEFT_BEHIND_LINE);
+                        }
+                        Ok(Response::empty()?.with_status(204))
+                    }
                     Err(e) => app_error(&e),
                 }
             })

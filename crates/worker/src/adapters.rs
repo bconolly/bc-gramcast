@@ -3,7 +3,8 @@
 
 use crate::dto;
 use domain::app::{
-    InsertError, PortError, PostRepository, SlotPatternRepository, UploadSigner, UploadStore,
+    InsertError, PortError, PostRepository, SlotPatternRepository, UpdateError, UploadSigner,
+    UploadStore,
 };
 use domain::queue::QueuedPost;
 use domain::slots::SlotPattern;
@@ -28,6 +29,34 @@ struct PostRow {
     caption: String,
     platforms: String,
     slot_at: f64,
+}
+
+/// Rows changed by a write, from D1's result metadata.
+fn changes(result: &worker::D1Result) -> Result<usize, PortError> {
+    let meta = result.meta().map_err(port_err)?;
+    meta.and_then(|m| m.changes)
+        .ok_or_else(|| PortError("no change count from D1".into()))
+}
+
+fn row_to_post(r: PostRow) -> Result<QueuedPost, PortError> {
+    let platforms = r
+        .platforms
+        .split(',')
+        .map(dto::platform_from_str)
+        .collect::<Option<Vec<_>>>()
+        .ok_or_else(|| {
+            // Row id only: never log URLs, keys or secrets.
+            worker::console_error!("bad platforms in posts row {}", r.id);
+            PortError("bad platforms in row".into())
+        })?;
+    Ok(QueuedPost {
+        id: r.id,
+        video_key: r.video_key,
+        title: r.title,
+        caption: r.caption,
+        platforms,
+        slot_at: r.slot_at as i64,
+    })
 }
 
 fn port_err(e: impl std::fmt::Debug) -> PortError {
@@ -64,28 +93,60 @@ impl PostRepository for D1PostRepository {
             .map_err(port_err)?
             .results::<PostRow>()
             .map_err(port_err)?;
-        rows.into_iter()
-            .map(|r| {
-                let platforms = r
-                    .platforms
-                    .split(',')
-                    .map(dto::platform_from_str)
-                    .collect::<Option<Vec<_>>>()
-                    .ok_or_else(|| {
-                        // Row id only: never log URLs, keys or secrets.
-                        worker::console_error!("bad platforms in posts row {}", r.id);
-                        PortError("bad platforms in row".into())
-                    })?;
-                Ok(QueuedPost {
-                    id: r.id,
-                    video_key: r.video_key,
-                    title: r.title,
-                    caption: r.caption,
-                    platforms,
-                    slot_at: r.slot_at as i64,
-                })
-            })
-            .collect()
+        rows.into_iter().map(row_to_post).collect()
+    }
+
+    async fn get(&self, id: &str) -> Result<Option<QueuedPost>, PortError> {
+        self.db
+            .prepare(
+                "SELECT id, video_key, title, caption, platforms, slot_at FROM posts WHERE id = ?1",
+            )
+            .bind(&[id.into()])
+            .map_err(port_err)?
+            .first::<PostRow>(None)
+            .await
+            .map_err(port_err)?
+            .map(row_to_post)
+            .transpose()
+    }
+
+    async fn update(&self, post: &QueuedPost) -> Result<(), UpdateError> {
+        let platforms: Vec<&str> = post
+            .platforms
+            .iter()
+            .map(|p| dto::platform_to_str(*p))
+            .collect();
+        // video_key and id are never in the SET list, so they cannot change.
+        let result = self
+            .db
+            .prepare("UPDATE posts SET title = ?1, caption = ?2, platforms = ?3, slot_at = ?4 WHERE id = ?5")
+            .bind(&[
+                post.title.as_str().into(),
+                post.caption.as_str().into(),
+                platforms.join(",").into(),
+                (post.slot_at as f64).into(),
+                post.id.as_str().into(),
+            ])
+            .map_err(|e| UpdateError::Port(port_err(e)))?
+            .run()
+            .await
+            .map_err(|e| dto::classify_update_error(&d1_error_text(&e)))?;
+        match changes(&result).map_err(UpdateError::Port)? {
+            0 => Err(UpdateError::NotFound),
+            _ => Ok(()),
+        }
+    }
+
+    async fn delete(&self, id: &str) -> Result<bool, PortError> {
+        let result = self
+            .db
+            .prepare("DELETE FROM posts WHERE id = ?1")
+            .bind(&[id.into()])
+            .map_err(port_err)?
+            .run()
+            .await
+            .map_err(port_err)?;
+        Ok(changes(&result)? > 0)
     }
 
     async fn insert(&self, post: &QueuedPost) -> Result<(), InsertError> {
@@ -232,6 +293,12 @@ impl UploadStore for R2Store {
         // it goes through port_err, which the API never shows to the client.
         let object = self.bucket.head(key).await.map_err(port_err)?;
         Ok(object.map(|o| o.size()))
+    }
+
+    async fn delete_object(&self, key: &str) -> Result<(), PortError> {
+        // R2 delete succeeds for a missing key. The error text can carry the key,
+        // so it goes through port_err, which is never shown or logged.
+        self.bucket.delete(key).await.map_err(port_err)
     }
 }
 
