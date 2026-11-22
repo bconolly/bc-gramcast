@@ -31,11 +31,10 @@ struct PostRow {
     slot_at: f64,
 }
 
-/// Rows changed by a write, from D1's result metadata.
-fn changes(result: &worker::D1Result) -> Result<usize, PortError> {
+/// Rows changed by a write, from D1's result metadata, if it reports them.
+fn changes(result: &worker::D1Result) -> Result<Option<usize>, PortError> {
     let meta = result.meta().map_err(port_err)?;
-    meta.and_then(|m| m.changes)
-        .ok_or_else(|| PortError("no change count from D1".into()))
+    Ok(meta.and_then(|m| m.changes))
 }
 
 fn row_to_post(r: PostRow) -> Result<QueuedPost, PortError> {
@@ -132,8 +131,13 @@ impl PostRepository for D1PostRepository {
             .await
             .map_err(|e| dto::classify_update_error(&d1_error_text(&e)))?;
         match changes(&result).map_err(UpdateError::Port)? {
-            0 => Err(UpdateError::NotFound),
-            _ => Ok(()),
+            Some(0) => Err(UpdateError::NotFound),
+            Some(_) => Ok(()),
+            // No count from D1: look the row up to tell "updated" from "never there".
+            None => match self.get(&post.id).await.map_err(UpdateError::Port)? {
+                Some(_) => Ok(()),
+                None => Err(UpdateError::NotFound),
+            },
         }
     }
 
@@ -146,7 +150,14 @@ impl PostRepository for D1PostRepository {
             .run()
             .await
             .map_err(port_err)?;
-        Ok(changes(&result)? > 0)
+        match changes(&result)? {
+            Some(n) => Ok(n > 0),
+            // No count from D1: the row is gone, or the delete did not happen.
+            None => match self.get(id).await? {
+                None => Ok(true),
+                Some(_) => Err(PortError("delete had no effect".into())),
+            },
+        }
     }
 
     async fn insert(&self, post: &QueuedPost) -> Result<(), InsertError> {

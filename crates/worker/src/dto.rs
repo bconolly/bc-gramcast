@@ -52,7 +52,10 @@ pub fn to_changes(body: PatchPostBody) -> Option<PostChanges> {
 }
 
 /// Logged when a post was deleted but its video object could not be removed.
-pub const VIDEO_LEFT_BEHIND_LINE: &str = "post deleted; video object not removed";
+/// `id` must be a validated post id (hex): never pass a key or URL.
+pub fn video_left_behind_line(id: &str) -> String {
+    format!("post deleted; video object not removed: {id}")
+}
 
 #[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PostJson {
@@ -231,6 +234,7 @@ pub fn is_json_content_type(header: Option<&str>) -> bool {
 pub fn error_status(e: &AppError) -> (u16, &'static str) {
     match e {
         AppError::NotFound => (404, "post not found"),
+        AppError::NotQueued => (409, "post is no longer queued"),
         AppError::VideoNotUploaded => (422, "video has not been uploaded"),
         AppError::Upload(u) => (
             422,
@@ -575,10 +579,19 @@ mod tests {
     }
 
     #[test]
-    fn the_leftover_video_log_line_is_fixed() {
+    fn the_leftover_video_log_line_names_only_the_post_id() {
+        let id = "0123456789abcdef0123456789abcdef";
         assert_eq!(
-            VIDEO_LEFT_BEHIND_LINE,
-            "post deleted; video object not removed"
+            video_left_behind_line(id),
+            "post deleted; video object not removed: 0123456789abcdef0123456789abcdef"
+        );
+    }
+
+    #[test]
+    fn a_post_no_longer_queued_is_a_fixed_409() {
+        assert_eq!(
+            error_status(&AppError::NotQueued),
+            (409, "post is no longer queued")
         );
     }
 

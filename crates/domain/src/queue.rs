@@ -84,14 +84,13 @@ pub fn validate_fields(
     Ok(())
 }
 
-/// A post id as the Worker makes it (a UUID in simple form: lowercase hex),
-/// capped at 64 characters. Checked before an id from a URL reaches storage.
+/// A post id as the Worker makes it: a UUID in simple form, exactly 32 lowercase hex characters. Checked before an id from a URL reaches storage.
 pub fn is_post_id(id: &str) -> bool {
-    (1..=64).contains(&id.len()) && id.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+    id.len() == 32 && id.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
 }
 
 /// Exactly `videos/` + 1 to 64 of `[A-Za-z0-9_-]` + `.mp4`.
-fn is_valid_video_key(key: &str) -> bool {
+pub fn is_valid_video_key(key: &str) -> bool {
     let Some(name) = key
         .strip_prefix("videos/")
         .and_then(|rest| rest.strip_suffix(".mp4"))
@@ -166,8 +165,19 @@ mod tests {
     #[test]
     fn post_ids_are_the_hex_the_generator_makes() {
         assert!(is_post_id("0123456789abcdef0123456789abcdef"));
-        assert!(is_post_id("a"));
-        for bad in ["", "A", "a-b", "a/b", "a b", "g", "a'--", &"a".repeat(65)] {
+        let long = "a".repeat(33);
+        let upper = "A".repeat(32);
+        let short = "a".repeat(31);
+        let odd = format!("{}'", "a".repeat(31));
+        for bad in [
+            "",
+            "a",
+            &short,
+            &long,
+            &upper,
+            &odd,
+            "g".repeat(32).as_str(),
+        ] {
             assert!(!is_post_id(bad), "{bad}");
         }
     }

@@ -4,7 +4,8 @@
 use crate::auth::{AccessConfig, AuthError, Claims, JwtHeader};
 use crate::media::{UploadError, VideoUpload, MAX_UPLOAD_BYTES};
 use crate::queue::{
-    is_post_id, validate_fields, validate_slot, Platform, Queue, QueueError, QueuedPost,
+    is_post_id, is_valid_video_key, validate_fields, validate_slot, Platform, Queue, QueueError,
+    QueuedPost,
 };
 use crate::slots::{next_free_slots, SlotError, SlotPattern};
 
@@ -78,6 +79,8 @@ pub trait UploadStore {
 pub enum AppError {
     /// No post has this id (or the id is not a valid post id).
     NotFound,
+    /// The post's slot has arrived or passed, so it is no longer queued.
+    NotQueued,
     /// The post names a video that is not in storage.
     VideoNotUploaded,
     Upload(UploadError),
@@ -173,6 +176,9 @@ pub async fn update_post(
         .await
         .map_err(AppError::Port)?
         .ok_or(AppError::NotFound)?;
+    if post.slot_at <= now {
+        return Err(AppError::NotQueued);
+    }
     let slot_at = changes.slot_at;
     post.title = changes.title;
     post.caption = changes.caption;
@@ -186,7 +192,7 @@ pub async fn update_post(
     Ok(post)
 }
 
-/// Removes the row first, then the video. If the video delete fails the owner
+/// Removes a still-queued post's row first, then the video. If the video delete fails the owner
 /// still sees the post gone: the other order could leave a row pointing at a
 /// missing video that can never be queued or deleted cleanly. The leftover
 /// object is reported through `VideoLeftBehind` so the caller can log a fixed line.
@@ -194,6 +200,7 @@ pub async fn delete_post(
     repo: &impl PostRepository,
     store: &impl UploadStore,
     id: &str,
+    now: i64,
 ) -> Result<DeleteOutcome, AppError> {
     if !is_post_id(id) {
         return Err(AppError::NotFound);
@@ -203,8 +210,15 @@ pub async fn delete_post(
         .await
         .map_err(AppError::Port)?
         .ok_or(AppError::NotFound)?;
+    if post.slot_at <= now {
+        return Err(AppError::NotQueued);
+    }
     if !repo.delete(id).await.map_err(AppError::Port)? {
         return Err(AppError::NotFound);
+    }
+    // A stored key is re-checked, so storage is only asked to delete well-formed keys.
+    if !is_valid_video_key(&post.video_key) {
+        return Ok(DeleteOutcome::VideoLeftBehind);
     }
     Ok(match store.delete_object(&post.video_key).await {
         Ok(()) => DeleteOutcome::Deleted,
@@ -846,8 +860,8 @@ mod tests {
         assert_eq!(auth(&v, good_header(), c), Err(AuthError::Expired));
     }
 
-    const ID_A: &str = "aaaa";
-    const ID_B: &str = "bbbb";
+    const ID_A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const ID_B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 
     fn changes(slot_at: i64) -> PostChanges {
         PostChanges {
@@ -870,7 +884,7 @@ mod tests {
     fn delete_post_removes_the_row_then_the_video() {
         let repo = repo_with(&[(ID_A, 100)]);
         let s = store();
-        let out = pollster::block_on(delete_post(&repo, &s, ID_A)).unwrap();
+        let out = pollster::block_on(delete_post(&repo, &s, ID_A, 0)).unwrap();
         assert_eq!(out, DeleteOutcome::Deleted);
         assert!(repo.posts.borrow().is_empty());
         assert_eq!(*s.deleted.borrow(), [format!("videos/{ID_A}.mp4")]);
@@ -881,7 +895,7 @@ mod tests {
         let repo = repo_with(&[(ID_A, 100)]);
         let s = store();
         for id in [ID_B, "", "A/../x", "a'; DROP TABLE posts;--"] {
-            let e = pollster::block_on(delete_post(&repo, &s, id));
+            let e = pollster::block_on(delete_post(&repo, &s, id, 0));
             assert_eq!(e, Err(AppError::NotFound), "{id}");
         }
         assert_eq!(repo.posts.borrow().len(), 1);
@@ -893,7 +907,7 @@ mod tests {
         let repo = repo_with(&[(ID_A, 100)]);
         let mut s = store();
         s.fail_delete = true;
-        let out = pollster::block_on(delete_post(&repo, &s, ID_A)).unwrap();
+        let out = pollster::block_on(delete_post(&repo, &s, ID_A, 0)).unwrap();
         assert_eq!(out, DeleteOutcome::VideoLeftBehind);
         assert!(repo.posts.borrow().is_empty());
     }
@@ -988,5 +1002,38 @@ mod tests {
             e,
             Err(AppError::Queue(QueueError::SlotTaken { slot_at: 300 }))
         );
+    }
+
+    #[test]
+    fn delete_post_refuses_a_post_that_is_no_longer_queued() {
+        let repo = repo_with(&[(ID_A, 100)]);
+        let s = store();
+        for now in [100, 101] {
+            let e = pollster::block_on(delete_post(&repo, &s, ID_A, now));
+            assert_eq!(e, Err(AppError::NotQueued), "now={now}");
+        }
+        assert_eq!(repo.posts.borrow().len(), 1);
+        assert!(s.deleted.borrow().is_empty());
+    }
+
+    #[test]
+    fn update_post_refuses_a_post_that_is_no_longer_queued() {
+        let repo = repo_with(&[(ID_A, 100)]);
+        for now in [100, 101] {
+            let e = pollster::block_on(update_post(&repo, ID_A, changes(500), now));
+            assert_eq!(e, Err(AppError::NotQueued), "now={now}");
+        }
+        assert_eq!(repo.posts.borrow()[0].title, "Title");
+    }
+
+    #[test]
+    fn delete_post_does_not_ask_storage_to_delete_an_odd_video_key() {
+        let repo = repo_with(&[(ID_A, 100)]);
+        repo.posts.borrow_mut()[0].video_key = "legacy/../odd key".into();
+        let s = store();
+        let out = pollster::block_on(delete_post(&repo, &s, ID_A, 0)).unwrap();
+        assert_eq!(out, DeleteOutcome::VideoLeftBehind);
+        assert!(repo.posts.borrow().is_empty());
+        assert!(s.deleted.borrow().is_empty());
     }
 }
