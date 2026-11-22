@@ -202,11 +202,15 @@ pub fn api_reason<'a>(reasons: impl IntoIterator<Item = &'a str>) -> ApiReason {
 
 /// Longest upload session address we will use.
 pub const MAX_SESSION_URI_LEN: usize = 2048;
+/// The only host an upload session lives on, and the path prefix of the upload endpoint.
+pub const UPLOAD_HOST: &str = "www.googleapis.com";
+pub const UPLOAD_PATH_PREFIX: &str = "/upload/youtube/v3/videos";
 
 /// Whether the `Location` of a started session is an address we will send the video
-/// and the access token to: https, on Google's own domain, no user info, no port, no
-/// odd characters. Defence in depth: the answer comes from Google, but a bearer token
-/// must never follow a redirect-like value to another host.
+/// and the access token to: https, exactly `www.googleapis.com`, under the upload
+/// endpoint's path, no user info, no port, no fragment, no odd characters. Defence in
+/// depth: the answer comes from Google, but a bearer token must never follow a
+/// redirect-like value to another host.
 pub fn is_session_uri(uri: &str) -> bool {
     let Some(rest) = uri.strip_prefix("https://") else {
         return false;
@@ -214,9 +218,15 @@ pub fn is_session_uri(uri: &str) -> bool {
     if uri.len() > MAX_SESSION_URI_LEN || !uri.bytes().all(|b| b.is_ascii_graphic() && b != b'\\') {
         return false;
     }
-    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
-    let host = authority.to_ascii_lowercase();
-    !host.contains(['@', ':']) && (host == "googleapis.com" || host.ends_with(".googleapis.com"))
+    let Some(path_and_query) = rest.strip_prefix(UPLOAD_HOST) else {
+        return false;
+    };
+    if path_and_query.contains('#') {
+        return false;
+    }
+    let path = path_and_query.split('?').next().unwrap_or("");
+    path.strip_prefix(UPLOAD_PATH_PREFIX)
+        .is_some_and(|after| after.is_empty() || after.starts_with('/'))
 }
 
 /// An absolute retry time from a `Retry-After` header, as delta-seconds added to the
@@ -451,32 +461,40 @@ mod tests {
     fn only_googles_own_https_addresses_are_session_uris() {
         for ok in [
             "https://www.googleapis.com/upload/youtube/v3/videos?uploadType=resumable&upload_id=AB-c_9",
-            "https://www.googleapis.com/x",
-            "https://WWW.GoogleAPIs.com/x",
-            "https://upload.googleapis.com/x",
-            "https://googleapis.com",
+            "https://www.googleapis.com/upload/youtube/v3/videos",
+            "https://www.googleapis.com/upload/youtube/v3/videos/x?upload_id=1",
         ] {
             assert!(is_session_uri(ok), "{ok}");
         }
         let long = format!(
-            "https://www.googleapis.com/{}",
+            "https://www.googleapis.com/upload/youtube/v3/videos?{}",
             "a".repeat(MAX_SESSION_URI_LEN)
         );
         for bad in [
+            // Other Google hosts and paths are not the upload endpoint.
+            "https://www.googleapis.com/x",
+            "https://WWW.GoogleAPIs.com/upload/youtube/v3/videos",
+            "https://upload.googleapis.com/upload/youtube/v3/videos",
+            "https://googleapis.com/upload/youtube/v3/videos",
+            "https://www.googleapis.com",
+            "https://www.googleapis.com/upload/youtube/v3/videosX",
+            "https://www.googleapis.com/upload/youtube/v3",
+            "https://www.googleapis.com/other/upload/youtube/v3/videos",
+            "https://www.googleapis.com/upload/youtube/v3/videos#frag",
             "",
             "http://www.googleapis.com/x",
             "//www.googleapis.com/x",
-            "https://www.googleapis.com.evil.com/x",
+            "https://www.googleapis.com.evil.com/upload/youtube/v3/videos",
             "https://evilgoogleapis.com/x",
             "https://evil.com/?www.googleapis.com",
             "https://evil.com/#.googleapis.com",
-            "https://user@www.googleapis.com/x",
-            "https://www.googleapis.com@evil.com/x",
-            "https://www.googleapis.com:8443/x",
-            "https://evil.com\\@www.googleapis.com/x",
-            "https://www.googleapis.com/a b",
-            "https://www.googleapis.com/a\nb",
-            "https://www.googleapis.com/é",
+            "https://user@www.googleapis.com/upload/youtube/v3/videos",
+            "https://www.googleapis.com@evil.com/upload/youtube/v3/videos",
+            "https://www.googleapis.com:8443/upload/youtube/v3/videos",
+            "https://evil.com\\@www.googleapis.com/upload/youtube/v3/videos",
+            "https://www.googleapis.com/upload/youtube/v3/videos?a b",
+            "https://www.googleapis.com/upload/youtube/v3/videos?a\nb",
+            "https://www.googleapis.com/upload/youtube/v3/videos?é",
             &long,
         ] {
             assert!(!is_session_uri(bad), "{bad}");
