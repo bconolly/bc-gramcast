@@ -126,137 +126,259 @@ pub enum Outcome {
     Published {
         external_id: String,
     },
-    /// Failed, and put back in the queue to try again after a delay.
+    /// Put back in the queue to try again later (a transient failure, a rate
+    /// limit, or `Auth`, which did not use up an attempt).
     Retrying(FailReason),
     Failed(FailReason),
     /// Another run claimed the post first; we did nothing.
     AlreadyClaimed,
     /// Left in Publishing too long. Needs a person; see `flag_if_stuck`.
     FlaggedStuck,
-    /// The post changed under us after the provider call, so the result was not recorded.
-    StateLost,
+    /// The final state write did not land (the post changed under us, or storage
+    /// failed). `external_id` is the provider's id if the upload succeeded, so the
+    /// caller can log it: the post will sit in Publishing until it is reviewed.
+    StateLost {
+        external_id: Option<String>,
+    },
+}
+
+/// Why a run stopped before working through every due post.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Halt {
+    /// No usable token: none stored, or the provider refused it or the refresh.
+    /// The owner must reconnect the account.
+    NeedsReconnect,
+    /// The token could not be refreshed for a reason that may pass.
+    TokenUnavailable,
+    /// The provider rate-limited us; the rest wait for the next run.
+    RateLimited,
+    /// Storage failed.
+    Storage,
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct PublishReport {
     /// (post id, outcome), in the order handled.
     pub outcomes: Vec<(String, Outcome)>,
+    pub halted: Option<Halt>,
 }
 
-/// Publishes every due post, one at a time. A failure on one post never stops the rest.
-/// Only a storage failure (`PortError`) ends the run early.
+/// Publishes due posts one at a time, reading `clock` (Unix seconds) afresh for every
+/// time-dependent step. Posts that were not reached stay Queued and unclaimed. A failure
+/// on one post does not stop the next, except `Auth` and rate limits, which would hit
+/// every post and so end the run (`PublishReport::halted`).
+/// Only a failure to list posts is an `Err`; later storage errors end the run as `Halt::Storage`.
 pub async fn publish_due(
-    now: i64,
+    clock: &impl Fn() -> i64,
     repo: &impl PublishRepository,
     publisher: &impl Publisher,
     tokens: &impl TokenStore,
     refresher: &impl TokenRefresher,
     links: &impl VideoLinks,
 ) -> Result<PublishReport, PortError> {
-    let mut report = PublishReport::default();
+    let run = Run {
+        clock,
+        repo,
+        publisher,
+        tokens,
+        refresher,
+        links,
+    };
     let posts = repo.list().await?;
+    let mut report = PublishReport::default();
+    if run.flag_stuck(&posts, &mut report).await.is_err() {
+        report.halted = Some(Halt::Storage);
+        return Ok(report);
+    }
+    let due = select_due(&posts, clock());
+    if due.is_empty() {
+        return Ok(report);
+    }
+    // One token check for the run: if it fails, nothing is claimed.
+    let mut token = match run.load_fresh_token().await {
+        Ok(t) => t,
+        Err(PublishError::Auth) => {
+            report.halted = Some(Halt::NeedsReconnect);
+            return Ok(report);
+        }
+        Err(_) => {
+            report.halted = Some(Halt::TokenUnavailable);
+            return Ok(report);
+        }
+    };
+    for p in due {
+        match run.publish_one(p, &mut token).await {
+            Err(_) => {
+                report.halted = Some(Halt::Storage);
+                break;
+            }
+            Ok(step) => {
+                report.outcomes.push((p.post.id.clone(), step.outcome));
+                if step.halt.is_some() {
+                    report.halted = step.halt;
+                    break;
+                }
+            }
+        }
+    }
+    Ok(report)
+}
 
-    // Stuck posts first: they go to manual review and are never retried.
-    for p in &posts {
-        if let Some(next) = flag_if_stuck(&p.state, now) {
-            if repo.transition(&p.post.id, &p.state, &next).await? == Cas::Applied {
+struct Step {
+    outcome: Outcome,
+    halt: Option<Halt>,
+}
+
+impl Step {
+    fn of(outcome: Outcome) -> Self {
+        let halt = match outcome {
+            Outcome::Retrying(FailReason::Auth) => Some(Halt::NeedsReconnect),
+            Outcome::Retrying(FailReason::RateLimited) => Some(Halt::RateLimited),
+            _ => None,
+        };
+        Step { outcome, halt }
+    }
+}
+
+/// The ports and clock for one run.
+struct Run<'a, C, R, P, T, F, L> {
+    clock: &'a C,
+    repo: &'a R,
+    publisher: &'a P,
+    tokens: &'a T,
+    refresher: &'a F,
+    links: &'a L,
+}
+
+impl<C, R, P, T, F, L> Run<'_, C, R, P, T, F, L>
+where
+    C: Fn() -> i64,
+    R: PublishRepository,
+    P: Publisher,
+    T: TokenStore,
+    F: TokenRefresher,
+    L: VideoLinks,
+{
+    /// Stuck posts go to manual review and are never retried.
+    async fn flag_stuck(
+        &self,
+        posts: &[ScheduledPost],
+        report: &mut PublishReport,
+    ) -> Result<(), PortError> {
+        for p in posts {
+            let Some(next) = flag_if_stuck(&p.state, (self.clock)()) else {
+                continue;
+            };
+            if self.repo.transition(&p.post.id, &p.state, &next).await? == Cas::Applied {
                 report
                     .outcomes
                     .push((p.post.id.clone(), Outcome::FlaggedStuck));
             }
         }
+        Ok(())
     }
 
-    for p in select_due(&posts, now) {
-        let outcome = publish_one(now, p, repo, publisher, tokens, refresher, links).await?;
-        report.outcomes.push((p.post.id.clone(), outcome));
-    }
-    Ok(report)
-}
-
-/// Claims one post, calls the provider, and records the result.
-async fn publish_one(
-    now: i64,
-    p: &ScheduledPost,
-    repo: &impl PublishRepository,
-    publisher: &impl Publisher,
-    tokens: &impl TokenStore,
-    refresher: &impl TokenRefresher,
-    links: &impl VideoLinks,
-) -> Result<Outcome, PortError> {
-    let id = &p.post.id;
-    let Ok(claimed) = claim(&p.state, now) else {
-        return Ok(Outcome::AlreadyClaimed);
-    };
-    if repo.transition(id, &p.state, &claimed).await? == Cas::Conflict {
-        return Ok(Outcome::AlreadyClaimed);
+    async fn load_fresh_token(&self) -> Result<StoredToken, PublishError> {
+        let mut token = self
+            .tokens
+            .load()
+            .await
+            .map_err(|_| PublishError::Transient)?
+            .ok_or(PublishError::Auth)?;
+        self.refresh_if_needed(&mut token).await?;
+        Ok(token)
     }
 
-    let result = upload(now, &p.post, publisher, tokens, refresher, links).await;
-    // If the writes below fail after a successful upload, the post stays in
-    // Publishing and is flagged for manual review later rather than re-posted.
-    let (next, outcome) = match result {
-        Ok(published) => (
-            record_success(&claimed, &published.external_id),
-            Outcome::Published {
-                external_id: published.external_id,
-            },
-        ),
-        Err(e) => {
-            let reason = FailReason::from(e);
-            let retry_at = match e {
-                PublishError::RateLimited { retry_at } => retry_at,
-                _ => None,
-            };
-            let next = record_failure(&claimed, reason, now, retry_at);
-            let outcome = if matches!(next, Ok(PublishState::Queued { .. })) {
-                Outcome::Retrying(reason)
-            } else {
-                Outcome::Failed(reason)
-            };
-            (next, outcome)
+    async fn refresh_if_needed(&self, token: &mut StoredToken) -> Result<(), PublishError> {
+        if !token.needs_refresh((self.clock)()) {
+            return Ok(());
         }
-    };
-    let Ok(next) = next else {
-        return Ok(Outcome::StateLost);
-    };
-    match repo.transition(id, &claimed, &next).await? {
-        Cas::Applied => Ok(outcome),
-        Cas::Conflict => Ok(Outcome::StateLost),
-    }
-}
-
-/// Everything between "claimed" and "provider answered": token, video link, upload.
-async fn upload(
-    now: i64,
-    post: &QueuedPost,
-    publisher: &impl Publisher,
-    tokens: &impl TokenStore,
-    refresher: &impl TokenRefresher,
-    links: &impl VideoLinks,
-) -> Result<PublishedRef, PublishError> {
-    let stored = tokens
-        .load()
-        .await
-        .map_err(|_| PublishError::Transient)?
-        .ok_or(PublishError::Auth)?;
-    let token = if stored.needs_refresh(now) {
-        let fresh = refresher.refresh(&stored).await?;
+        let mut fresh = self.refresher.refresh(token).await?;
+        // Providers often leave the refresh token out of a refresh response.
+        if fresh.refresh_token.is_empty() {
+            fresh.refresh_token = token.refresh_token.clone();
+        }
         // A refresh that cannot be saved is not safe to carry on with: the
         // provider may have rotated the refresh token.
-        tokens
+        self.tokens
             .save(&fresh)
             .await
             .map_err(|_| PublishError::Transient)?;
-        fresh
-    } else {
-        stored
-    };
-    let video = links
-        .access(&post.video_key)
-        .await
-        .map_err(|_| PublishError::Transient)?;
-    publisher.publish(post, &video, &token).await
+        *token = fresh;
+        Ok(())
+    }
+
+    /// Claims one post, calls the provider, and records the result. `Err` only
+    /// when the claim itself could not be stored (nothing was sent to the provider).
+    async fn publish_one(
+        &self,
+        p: &ScheduledPost,
+        token: &mut StoredToken,
+    ) -> Result<Step, PortError> {
+        let id = &p.post.id;
+        let claimed = match claim(&p.state, (self.clock)()) {
+            Ok(c) => c,
+            Err(_) => return Ok(Step::of(Outcome::AlreadyClaimed)),
+        };
+        if self.repo.transition(id, &p.state, &claimed).await? == Cas::Conflict {
+            return Ok(Step::of(Outcome::AlreadyClaimed));
+        }
+
+        let result = self.upload(&p.post, token).await;
+        let now = (self.clock)();
+        let external_id = result.as_ref().ok().map(|r| r.external_id.clone());
+        let (next, outcome) = match result {
+            Ok(published) => (
+                record_success(&claimed, &published.external_id),
+                Outcome::Published {
+                    external_id: published.external_id,
+                },
+            ),
+            Err(e) => {
+                let reason = FailReason::from(e);
+                let retry_at = match e {
+                    PublishError::RateLimited { retry_at } => retry_at,
+                    _ => None,
+                };
+                let next = record_failure(&claimed, reason, now, retry_at);
+                let outcome = if matches!(next, Ok(PublishState::Queued { .. })) {
+                    Outcome::Retrying(reason)
+                } else {
+                    Outcome::Failed(reason)
+                };
+                (next, outcome)
+            }
+        };
+        let lost = Step::of(Outcome::StateLost { external_id });
+        // `claimed` is always Publishing, so the transitions above cannot fail;
+        // if that ever changed, report the loss rather than panic.
+        let Ok(next) = next else { return Ok(lost) };
+        // If the write fails after a successful upload the post stays in Publishing
+        // and is flagged for manual review later, never re-posted.
+        match self.repo.transition(id, &claimed, &next).await {
+            Ok(Cas::Applied) => Ok(Step::of(outcome)),
+            Ok(Cas::Conflict) => Ok(lost),
+            Err(_) => Ok(Step {
+                halt: Some(Halt::Storage),
+                ..lost
+            }),
+        }
+    }
+
+    /// Between "claimed" and "provider answered": token, video link, upload.
+    async fn upload(
+        &self,
+        post: &QueuedPost,
+        token: &mut StoredToken,
+    ) -> Result<PublishedRef, PublishError> {
+        self.refresh_if_needed(token).await?;
+        let video = self
+            .links
+            .access(&post.video_key)
+            .await
+            .map_err(|_| PublishError::Transient)?;
+        self.publisher.publish(post, &video, token).await
+    }
 }
 
 #[cfg(test)]
@@ -297,6 +419,7 @@ mod tests {
     use crate::token::fakes::FakeTokenStore;
     use std::cell::{Cell, RefCell};
     use std::collections::VecDeque;
+    use std::rc::Rc;
 
     const NOW: i64 = 10_000;
 
@@ -319,12 +442,16 @@ mod tests {
         posts: RefCell<Vec<ScheduledPost>>,
         /// Simulates another run winning the claim between our read and our write.
         steal_claim: Cell<bool>,
+        /// Simulates another writer changing the post while the provider call ran.
+        steal_final: Cell<bool>,
+        /// Storage fails when the final (Publishing -> ...) write is made.
+        fail_final: Cell<bool>,
     }
     impl FakeRepo {
         fn with(posts: Vec<ScheduledPost>) -> Self {
             Self {
                 posts: RefCell::new(posts),
-                steal_claim: Cell::new(false),
+                ..Self::default()
             }
         }
         fn state(&self, id: &str) -> PublishState {
@@ -355,6 +482,14 @@ mod tests {
                     started_at: NOW,
                 };
             }
+            if matches!(expected, PublishState::Publishing { .. }) {
+                if self.fail_final.get() {
+                    return Err(PortError("db down".into()));
+                }
+                if self.steal_final.get() {
+                    p.state = PublishState::new_queued();
+                }
+            }
             if &p.state != expected {
                 return Ok(Cas::Conflict);
             }
@@ -367,12 +502,14 @@ mod tests {
     struct FakePublisher {
         results: RefCell<VecDeque<Result<PublishedRef, PublishError>>>,
         calls: RefCell<Vec<String>>,
+        /// Moves the shared clock forward by `.1` seconds on every call.
+        advance: Option<(Rc<Cell<i64>>, i64)>,
     }
     impl FakePublisher {
         fn returning(r: Vec<Result<PublishedRef, PublishError>>) -> Self {
             Self {
                 results: RefCell::new(r.into()),
-                calls: RefCell::default(),
+                ..Self::default()
             }
         }
     }
@@ -384,6 +521,9 @@ mod tests {
             _token: &StoredToken,
         ) -> Result<PublishedRef, PublishError> {
             self.calls.borrow_mut().push(post.id.clone());
+            if let Some((clock, secs)) = &self.advance {
+                clock.set(clock.get() + secs);
+            }
             self.results
                 .borrow_mut()
                 .pop_front()
@@ -443,7 +583,12 @@ mod tests {
         refresher: &FakeRefresher,
     ) -> PublishReport {
         pollster::block_on(publish_due(
-            NOW, repo, publisher, tokens, refresher, &FakeLinks,
+            &|| NOW,
+            repo,
+            publisher,
+            tokens,
+            refresher,
+            &FakeLinks,
         ))
         .unwrap()
     }
@@ -511,20 +656,6 @@ mod tests {
     }
 
     #[test]
-    fn a_missing_token_is_an_auth_failure_and_the_provider_is_not_called() {
-        let repo = FakeRepo::with(vec![scheduled("a", NOW - 1)]);
-        let publisher = FakePublisher::default();
-        let report = run(
-            &repo,
-            &publisher,
-            &FakeTokenStore::default(),
-            &refresher_ok(),
-        );
-        assert_eq!(report.outcomes[0].1, Outcome::Retrying(FailReason::Auth));
-        assert!(publisher.calls.borrow().is_empty());
-    }
-
-    #[test]
     fn an_expiring_token_is_refreshed_saved_and_used() {
         let repo = FakeRepo::with(vec![scheduled("a", NOW - 1)]);
         let tokens = FakeTokenStore::default();
@@ -548,21 +679,6 @@ mod tests {
             &refresher,
         );
         assert_eq!(refresher.calls.get(), 0);
-    }
-
-    #[test]
-    fn a_refresh_that_is_refused_fails_the_post_as_auth() {
-        let repo = FakeRepo::with(vec![scheduled("a", NOW - 1)]);
-        let tokens = FakeTokenStore::default();
-        *tokens.token.borrow_mut() = Some(token(NOW, "old"));
-        let refresher = FakeRefresher {
-            result: Err(PublishError::Auth),
-            calls: Cell::new(0),
-        };
-        let publisher = FakePublisher::default();
-        let report = run(&repo, &publisher, &tokens, &refresher);
-        assert_eq!(report.outcomes[0].1, Outcome::Retrying(FailReason::Auth));
-        assert!(publisher.calls.borrow().is_empty());
     }
 
     #[test]
@@ -616,11 +732,11 @@ mod tests {
         let tokens = fresh_store();
         let publisher =
             FakePublisher::returning(vec![Err(PublishError::Transient); MAX_ATTEMPTS as usize]);
-        let mut now = NOW;
+        let now = Cell::new(NOW);
         let mut outcomes = Vec::new();
         for _ in 0..MAX_ATTEMPTS {
             let r = pollster::block_on(publish_due(
-                now,
+                &|| now.get(),
                 &repo,
                 &publisher,
                 &tokens,
@@ -629,7 +745,7 @@ mod tests {
             ))
             .unwrap();
             outcomes.push(r.outcomes[0].1.clone());
-            now += 10_000; // past any backoff
+            now.set(now.get() + 10_000); // past any backoff
         }
         assert_eq!(
             outcomes,
@@ -698,6 +814,106 @@ mod tests {
         let report = run(&repo, &publisher, &fresh_store(), &refresher_ok());
         assert_eq!(report.outcomes.len(), 2);
         assert_eq!(*publisher.calls.borrow(), ["a", "b"]);
+    }
+
+    fn two_due() -> FakeRepo {
+        FakeRepo::with(vec![scheduled("a", 1), scheduled("b", 2)])
+    }
+
+    #[test]
+    fn a_missing_token_stops_the_run_before_any_post_is_claimed() {
+        let repo = two_due();
+        let publisher = FakePublisher::default();
+        let report = run(
+            &repo,
+            &publisher,
+            &FakeTokenStore::default(),
+            &refresher_ok(),
+        );
+        assert_eq!(report.halted, Some(Halt::NeedsReconnect));
+        assert!(report.outcomes.is_empty());
+        assert_eq!(repo.state("a"), PublishState::new_queued());
+        assert_eq!(repo.state("b"), PublishState::new_queued());
+        assert!(publisher.calls.borrow().is_empty());
+    }
+
+    #[test]
+    fn a_refused_refresh_stops_the_run_and_leaves_posts_queued() {
+        let repo = two_due();
+        let tokens = FakeTokenStore::default();
+        *tokens.token.borrow_mut() = Some(token(NOW, "old"));
+        let refresher = FakeRefresher {
+            result: Err(PublishError::Auth),
+            calls: Cell::new(0),
+        };
+        let publisher = FakePublisher::default();
+        let report = run(&repo, &publisher, &tokens, &refresher);
+        assert_eq!(report.halted, Some(Halt::NeedsReconnect));
+        assert_eq!(repo.state("a"), PublishState::new_queued());
+        assert!(publisher.calls.borrow().is_empty());
+    }
+
+    #[test]
+    fn a_refresh_that_hit_trouble_halts_without_asking_for_a_reconnect() {
+        let repo = two_due();
+        let tokens = FakeTokenStore::default();
+        *tokens.token.borrow_mut() = Some(token(NOW, "old"));
+        let refresher = FakeRefresher {
+            result: Err(PublishError::Transient),
+            calls: Cell::new(0),
+        };
+        let report = run(&repo, &FakePublisher::default(), &tokens, &refresher);
+        assert_eq!(report.halted, Some(Halt::TokenUnavailable));
+        assert_eq!(repo.state("a"), PublishState::new_queued());
+    }
+
+    #[test]
+    fn a_run_with_nothing_due_does_not_touch_the_token() {
+        let repo = FakeRepo::with(vec![scheduled("later", NOW + 1)]);
+        let report = run(
+            &repo,
+            &FakePublisher::default(),
+            &FakeTokenStore::default(),
+            &refresher_ok(),
+        );
+        assert_eq!(report, PublishReport::default());
+    }
+
+    #[test]
+    fn auth_from_the_provider_stops_the_run_and_requeues_only_that_post() {
+        let repo = two_due();
+        let publisher = FakePublisher::returning(vec![Err(PublishError::Auth)]);
+        let report = run(&repo, &publisher, &fresh_store(), &refresher_ok());
+        assert_eq!(report.halted, Some(Halt::NeedsReconnect));
+        assert_eq!(report.outcomes.len(), 1);
+        assert_eq!(
+            repo.state("a"),
+            PublishState::Queued {
+                attempts: 0,
+                not_before: NOW
+            }
+        );
+        assert_eq!(repo.state("b"), PublishState::new_queued());
+        assert_eq!(publisher.calls.borrow().len(), 1);
+    }
+
+    #[test]
+    fn a_rate_limit_stops_the_run_and_honours_retry_at() {
+        let repo = two_due();
+        let publisher = FakePublisher::returning(vec![Err(PublishError::RateLimited {
+            retry_at: Some(NOW + 500),
+        })]);
+        let report = run(&repo, &publisher, &fresh_store(), &refresher_ok());
+        assert_eq!(report.halted, Some(Halt::RateLimited));
+        assert_eq!(
+            repo.state("a"),
+            PublishState::Queued {
+                attempts: 0,
+                not_before: NOW + 500
+            }
+        );
+        assert_eq!(repo.state("b"), PublishState::new_queued());
+        assert_eq!(publisher.calls.borrow().len(), 1);
     }
 
     #[test]
