@@ -241,4 +241,28 @@ describe("PublishingCard", () => {
     await screen.findByRole("switch", { name: "Publishing" });
     expect(screen.queryByRole("alert")).not.toBeInTheDocument();
   });
+
+  it("logs no error when the card is removed while a conflict reload is still pending", async () => {
+    const user = userEvent.setup();
+    const errors = vi.spyOn(console, "error").mockImplementation(() => {});
+    let release: (r: Response) => void = () => {};
+    const pending = new Promise<Response>((resolve) => (release = resolve));
+    let gets = 0;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (_p: string, init?: RequestInit) => {
+        if (init?.method === "PUT") return new Response("settings changed since you loaded them", { status: 409 });
+        return ++gets === 1 ? json(saved()) : pending;
+      }),
+    );
+    const { unmount } = render(<PublishingCard />);
+    await user.selectOptions(await screen.findByLabelText("Privacy"), "unlisted");
+    await user.click(screen.getByRole("button", { name: "Save" }));
+    await waitFor(() => expect(gets).toBe(2));
+    unmount();
+    release(json(saved({ updated_at: 150 })));
+    await new Promise((r) => setTimeout(r, 0));
+    expect(errors).not.toHaveBeenCalled();
+    errors.mockRestore();
+  });
 });

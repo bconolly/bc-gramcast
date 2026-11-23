@@ -78,6 +78,15 @@ export function PublishingCard() {
   const [notice, setNotice] = useState<string | null>(null);
   const returnFocus = useRef(false);
   const saveRef = useRef<HTMLButtonElement>(null);
+  // False once the card is gone, so a request that settles late sets no state (the initial load
+  // uses its own flag). Set true in the effect so a StrictMode remount starts live again.
+  const mounted = useRef(true);
+  useEffect(() => {
+    mounted.current = true;
+    return () => {
+      mounted.current = false;
+    };
+  }, []);
 
   const show = useCallback((stored: PublishSettings) => {
     setLoad({ kind: "ready", stored });
@@ -97,10 +106,13 @@ export function PublishingCard() {
       setError(null);
       if (!keepForm) setLoad({ kind: "loading" });
       try {
-        show(await getPublishSettings());
+        const stored = await getPublishSettings();
+        if (!mounted.current) return false;
+        show(stored);
         if (afterConflict) setError(CONFLICT_NOTICE);
         return true;
       } catch (e) {
+        if (!mounted.current) return false;
         setLoad({ kind: "error", message: afterConflict ? CONFLICT_RELOAD_FAILED : messageOf(e), afterConflict });
         return false;
       }
@@ -135,16 +147,18 @@ export function PublishingCard() {
     setNotice(null);
     try {
       const stored = await savePublishSettings({ enabled, privacy, expected_updated_at: load.stored.updated_at });
+      if (!mounted.current) return;
       show(stored);
       setNotice("Publishing settings saved.");
     } catch (e) {
+      if (!mounted.current) return;
       if (isSettingsConflict(e)) {
         if (await reload(true, true)) returnFocus.current = true;
       } else {
         setError(messageOf(e));
       }
     } finally {
-      setBusy(false);
+      if (mounted.current) setBusy(false);
     }
   }
 
