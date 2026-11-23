@@ -5,6 +5,7 @@ import { Card } from "@/components/ui/card";
 import { getConnectStatus, type ConnectStatus } from "@/lib/api";
 import { YOUTUBE_CONNECT_PATH, type ConnectResult } from "@/lib/connect";
 import { cn } from "@/lib/utils";
+import { PublishingCard } from "@/screens/PublishingCard";
 
 type Load = { kind: "loading" } | { kind: "error"; message: string } | { kind: "ready"; status: ConnectStatus };
 
@@ -73,6 +74,7 @@ export function Connections({ result }: { result: ConnectResult }) {
           {connected ? "Reconnect YouTube" : "Connect YouTube"}
         </a>
       </Card>
+      <PublishingCard />
     </div>
   );
 }
