@@ -40,3 +40,13 @@ R2_ACCOUNT_ID = "REPLACE_WITH_ACCOUNT_ID"
 # /api/connect/youtube/callback, and it must match the one registered with Google.
 # Secrets for the connect flow (not here): YOUTUBE_CLIENT_ID, YOUTUBE_CLIENT_SECRET, TOKEN_ENC_KEY.
 PUBLIC_BASE_URL = "https://gramcast.gramcast.workers.dev"
+# Publishing (slice 5b-2). Off until this is exactly "true". Set it to "true" only after the
+# first real publish test steps in the README.
+PUBLISH_ENABLED = "false"
+# Who can see a published video: private, unlisted or public. Unset or anything else is
+# private, so a first real test never goes public.
+PUBLISH_PRIVACY = "private"
+
+# The scheduled run that publishes due posts (the only place anything is published).
+[triggers]
+crons = ["*/5 * * * *"]

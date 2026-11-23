@@ -4,6 +4,19 @@ use crate::media::is_safe_id;
 
 /// YouTube title limit. Confirm against YouTube's current docs before release.
 pub const MAX_TITLE_CHARS: usize = 100;
+/// A post cannot be edited or deleted this close to its slot (or once the slot has
+/// passed): the publisher claims on its own clock and an edit must not race with it.
+pub const EDIT_LOCK_SECS: i64 = 120;
+
+/// The first slot time an edit or delete may still touch: only posts whose slot is
+/// strictly after this are changeable.
+pub fn edit_cutoff(now: i64) -> i64 {
+    now.saturating_add(EDIT_LOCK_SECS)
+}
+
+/// YouTube description limit, in BYTES (not characters). Neither the title nor the
+/// description may contain `<` or `>`.
+pub const MAX_YOUTUBE_DESCRIPTION_BYTES: usize = 5_000;
 /// Instagram caption limit. Confirm against Meta's current docs before release.
 pub const MAX_CAPTION_CHARS: usize = 2_200;
 
@@ -38,10 +51,16 @@ pub struct QueuedPost {
 pub enum QueueError {
     NoPlatforms,
     EmptyTitle,
-    SlotTaken { slot_at: i64 },
+    SlotTaken {
+        slot_at: i64,
+    },
     VideoAlreadyQueued,
     BadVideoKey,
     TooLong,
+    /// A YouTube description is limited in bytes, not characters.
+    DescriptionTooManyBytes,
+    /// YouTube refuses `<` and `>` in a title or description.
+    AngleBrackets,
     DuplicatePlatform,
     SlotInPast,
     SlotOutOfRange,
@@ -81,6 +100,14 @@ pub fn validate_fields(
     if title.chars().count() > MAX_TITLE_CHARS || caption.chars().count() > MAX_CAPTION_CHARS {
         return Err(QueueError::TooLong);
     }
+    if platforms.contains(&Platform::YouTube) {
+        if caption.len() > MAX_YOUTUBE_DESCRIPTION_BYTES {
+            return Err(QueueError::DescriptionTooManyBytes);
+        }
+        if title.contains(['<', '>']) || caption.contains(['<', '>']) {
+            return Err(QueueError::AngleBrackets);
+        }
+    }
     Ok(())
 }
 
@@ -104,6 +131,11 @@ impl QueuedPost {
     /// The one rule for "still queued": the slot is strictly after `now`.
     pub fn is_queued(&self, now: i64) -> bool {
         self.slot_at > now
+    }
+
+    /// Whether it can still be edited or deleted: the slot is after `now + EDIT_LOCK_SECS`.
+    pub fn is_editable(&self, now: i64) -> bool {
+        self.slot_at > edit_cutoff(now)
     }
 
     pub fn status(&self) -> PostStatus {
@@ -184,6 +216,50 @@ mod tests {
             "g".repeat(32).as_str(),
         ] {
             assert!(!is_post_id(bad), "{bad}");
+        }
+    }
+
+    #[test]
+    fn a_post_is_editable_only_outside_the_lock_window() {
+        let p = post("a", 10_000);
+        assert_eq!(EDIT_LOCK_SECS, 120);
+        assert!(p.is_editable(10_000 - EDIT_LOCK_SECS - 1));
+        assert!(!p.is_editable(10_000 - EDIT_LOCK_SECS));
+        assert!(!p.is_editable(10_000 - 1));
+        assert!(!p.is_editable(10_000));
+        assert!(!p.is_editable(i64::MAX));
+        assert_eq!(edit_cutoff(5), 5 + EDIT_LOCK_SECS);
+        assert_eq!(edit_cutoff(i64::MAX), i64::MAX);
+    }
+
+    #[test]
+    fn youtube_posts_obey_youtube_title_and_description_limits() {
+        use Platform::*;
+        // 2,000 characters of 3 bytes each: fine for characters, over 5,000 bytes.
+        let wide = "\u{20ac}".repeat(2_000);
+        assert_eq!(
+            validate_fields("T", &wide, &[YouTube]),
+            Err(QueueError::DescriptionTooManyBytes)
+        );
+        assert_eq!(validate_fields("T", &wide, &[Instagram]), Ok(()));
+        let exact = format!("{}ab", "\u{20ac}".repeat(1_666));
+        assert_eq!(exact.len(), MAX_YOUTUBE_DESCRIPTION_BYTES);
+        assert_eq!(validate_fields("T", &exact, &[YouTube]), Ok(()));
+        assert_eq!(
+            validate_fields("T", &format!("{exact}a"), &[YouTube]),
+            Err(QueueError::DescriptionTooManyBytes)
+        );
+        assert_eq!(
+            validate_fields(&"t".repeat(101), "", &[YouTube]),
+            Err(QueueError::TooLong)
+        );
+        for (title, caption) in [("a<b", ""), ("a>b", ""), ("T", "x <b>y</b>"), ("T", ">")] {
+            assert_eq!(
+                validate_fields(title, caption, &[YouTube]),
+                Err(QueueError::AngleBrackets),
+                "{title} {caption}"
+            );
+            assert_eq!(validate_fields(title, caption, &[Instagram]), Ok(()));
         }
     }
 

@@ -111,6 +111,25 @@ describe("App", () => {
     expect(screen.queryByRole("alert")).not.toBeInTheDocument();
   });
 
+  it("shows the reconnect banner on the queue and not on Connections, and leads there", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockImplementation((url: string) =>
+        Promise.resolve(
+          new Response(url === "/api/connect/status" ? '{"youtube":{"connected":true,"needs_reconnect":true}}' : "[]"),
+        ),
+      ),
+    );
+    const user = userEvent.setup();
+    render(<App />);
+    expect(await screen.findByRole("alert")).toHaveTextContent("YouTube needs to be reconnected");
+    expect(screen.getByRole("banner")).toBeInTheDocument(); // the BC Guides header stays
+    await user.click(screen.getByRole("button", { name: "Go to Connections" }));
+    expect(await screen.findByText("Needs reconnecting")).toBeInTheDocument();
+    expect(screen.queryByText("YouTube needs to be reconnected")).not.toBeInTheDocument();
+    expect(window.location.pathname).toBe("/settings");
+  });
+
   it("keeps the address in step with the screen", async () => {
     stubEmptyApi();
     const user = userEvent.setup();

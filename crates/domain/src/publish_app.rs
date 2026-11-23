@@ -6,32 +6,58 @@ use crate::publish::{
     claim, flag_if_stuck, is_valid_external_id, record_failure, record_success, select_due,
     FailReason, PublishState, ScheduledPost,
 };
-use crate::queue::QueuedPost;
-use crate::token::{StoredToken, TokenStore};
+use crate::queue::{is_valid_video_key, QueuedPost};
+use crate::token::{StoredToken, TokenLoad, TokenStore};
+use crate::youtube::{upload_deadline, MAX_PUBLISH_BYTES};
 use std::fmt;
 
-/// Short-lived access to the video bytes (a presigned link). A secret: never logged.
-// Do NOT derive or implement Serialize (or Display) for this type: it would let the
-// link reach logs or storage. Debug is hand-written to redact it.
+/// Where a stored video is and how big it is, which is all a publisher needs to read it
+/// from storage itself. No link is ever handed out. The key is hidden from `Debug`
+/// anyway, so a stray `{:?}` shows nothing about storage.
+// Do NOT derive or implement Serialize (or Display) for this type.
 #[derive(Clone, PartialEq, Eq)]
 pub struct VideoAccess {
-    url: String,
+    key: String,
+    size: u64,
+    /// The storage version tag read with the size, so every range read can insist on
+    /// the same object. Not a secret, but not shown either.
+    etag: Option<String>,
 }
 
 impl VideoAccess {
-    pub fn new(url: impl Into<String>) -> Self {
-        Self { url: url.into() }
+    pub fn new(key: impl Into<String>, size: u64) -> Self {
+        Self {
+            key: key.into(),
+            size,
+            etag: None,
+        }
     }
 
-    pub fn url(&self) -> &str {
-        &self.url
+    /// The same video with the storage version tag its size was read at.
+    pub fn with_etag(mut self, etag: impl Into<String>) -> Self {
+        self.etag = Some(etag.into());
+        self
+    }
+
+    pub fn etag(&self) -> Option<&str> {
+        self.etag.as_deref()
+    }
+
+    pub fn key(&self) -> &str {
+        &self.key
+    }
+
+    /// Size in bytes, as storage reports it.
+    pub fn size(&self) -> u64 {
+        self.size
     }
 }
 
 impl fmt::Debug for VideoAccess {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("VideoAccess")
-            .field("url", &"[redacted]")
+            .field("key", &"[redacted]")
+            .field("size", &self.size)
             .finish()
     }
 }
@@ -46,7 +72,9 @@ pub struct PublishedRef {
 /// is carried, so nothing sensitive can travel with the error.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PublishError {
-    /// The token was refused or could not be refreshed.
+    /// The token was refused or could not be refreshed. A publisher returns this only
+    /// for a refusal that cannot have created the video (not of the final chunk, and not
+    /// after the final chunk was sent); otherwise `Unknown`.
     Auth,
     /// `retry_at` (Unix seconds) is the provider's hint, if it gave one.
     RateLimited { retry_at: Option<i64> },
@@ -77,6 +105,9 @@ impl From<PublishError> for FailReason {
 /// Error contract: `Transient` means the provider definitely did NOT create the
 /// video. Any failure where it might have (timeout after the body was sent, a
 /// lost response, an unparsable success) must be `Unknown`.
+///
+/// `deadline` (Unix seconds) is the moment no further request may start: the claim time
+/// plus `UPLOAD_DEADLINE_SECS`. Past it the publisher gives up as the error contract says.
 #[allow(async_fn_in_trait)]
 pub trait Publisher {
     async fn publish(
@@ -84,6 +115,7 @@ pub trait Publisher {
         post: &QueuedPost,
         video: &VideoAccess,
         token: &StoredToken,
+        deadline: i64,
     ) -> Result<PublishedRef, PublishError>;
 }
 
@@ -95,7 +127,7 @@ pub trait TokenRefresher {
     async fn refresh(&self, token: &StoredToken) -> Result<StoredToken, PublishError>;
 }
 
-/// Storage port: a short-lived read link for a stored video.
+/// Storage port: finds a stored video (its key and size, read from storage).
 #[allow(async_fn_in_trait)]
 pub trait VideoLinks {
     async fn access(&self, video_key: &str) -> Result<VideoAccess, PortError>;
@@ -112,7 +144,11 @@ pub enum Cas {
 /// Persistence port for publishing state.
 #[allow(async_fn_in_trait)]
 pub trait PublishRepository {
-    async fn list(&self) -> Result<Vec<ScheduledPost>, PortError>;
+    /// What a run needs, as of `now` (Unix seconds from the run's clock): the Queued
+    /// posts that are due (slot reached and any retry delay over) and every Publishing
+    /// post (to flag the stuck ones). Not Published or Failed posts: history stays out.
+    /// The use case still checks `is_due`, so an adapter may return a little extra.
+    async fn list(&self, now: i64) -> Result<Vec<ScheduledPost>, PortError>;
     /// Writes `next` only if the post's stored state still equals `expected`,
     /// in one atomic step (an `UPDATE ... WHERE state = expected`). This is what
     /// stops two overlapping runs from publishing the same post twice.
@@ -127,6 +163,13 @@ pub trait PublishRepository {
         next: &PublishState,
     ) -> Result<Cas, PortError>;
 }
+
+/// Posts a scheduled run handles. One: an upload can take most of the invocation and its
+/// subrequest allowance, so the next post waits for the next run (5 minutes later).
+pub const POSTS_PER_RUN: usize = 1;
+
+/// Stuck posts flagged in one run. Each flag is a write, so the rest wait for the next run.
+pub const MAX_FLAGS_PER_RUN: usize = 3;
 
 /// What happened to one post in a run.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -154,6 +197,29 @@ pub enum Outcome {
     },
 }
 
+impl Outcome {
+    /// A fixed log code, never provider text.
+    pub fn code(&self) -> &'static str {
+        match self {
+            Outcome::Published { .. } => "published",
+            Outcome::Retrying(_) => "retrying",
+            Outcome::Failed(_) => "failed",
+            Outcome::AlreadyClaimed => "already_claimed",
+            Outcome::Released => "released",
+            Outcome::FlaggedStuck => "flagged_stuck",
+            Outcome::StateLost { .. } => "state_lost",
+        }
+    }
+
+    /// The reason behind a retry or a failure.
+    pub fn reason(&self) -> Option<FailReason> {
+        match self {
+            Outcome::Retrying(r) | Outcome::Failed(r) => Some(*r),
+            _ => None,
+        }
+    }
+}
+
 /// Why a run stopped before working through every due post.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Halt {
@@ -168,6 +234,18 @@ pub enum Halt {
     Storage,
 }
 
+impl Halt {
+    /// A fixed log code.
+    pub fn code(self) -> &'static str {
+        match self {
+            Halt::NeedsReconnect => "needs_reconnect",
+            Halt::TokenUnavailable => "token_unavailable",
+            Halt::RateLimited => "rate_limited",
+            Halt::Storage => "storage",
+        }
+    }
+}
+
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct PublishReport {
     /// (post id, outcome), in the order handled.
@@ -179,6 +257,8 @@ pub struct PublishReport {
 /// time-dependent step. Posts that were not reached stay Queued and unclaimed. A failure
 /// on one post does not stop the next, except `Auth` and rate limits, which would hit
 /// every post and so end the run (`PublishReport::halted`).
+/// At most `max_posts` due posts are handled per call (earliest slots first), which bounds
+/// a run (W7); the rest stay Queued and unclaimed for the next run.
 /// Only a failure to list posts is an `Err`; later storage errors end the run as `Halt::Storage`.
 pub async fn publish_due(
     clock: &impl Fn() -> i64,
@@ -187,6 +267,7 @@ pub async fn publish_due(
     tokens: &impl TokenStore,
     refresher: &impl TokenRefresher,
     links: &impl VideoLinks,
+    max_posts: usize,
 ) -> Result<PublishReport, PortError> {
     let run = Run {
         clock,
@@ -196,14 +277,14 @@ pub async fn publish_due(
         refresher,
         links,
     };
-    let posts = repo.list().await?;
+    let posts = repo.list(clock()).await?;
     let mut report = PublishReport::default();
     if run.flag_stuck(&posts, &mut report).await.is_err() {
         report.halted = Some(Halt::Storage);
         return Ok(report);
     }
     let due = select_due(&posts, clock());
-    if due.is_empty() {
+    if due.is_empty() || max_posts == 0 {
         return Ok(report);
     }
     // One token check for the run: if it fails, nothing is claimed.
@@ -214,7 +295,7 @@ pub async fn publish_due(
             return Ok(report);
         }
     };
-    for p in due {
+    for p in due.into_iter().take(max_posts) {
         // Before the claim: a token problem is not an upload outcome, so it must
         // never fail a post that was not uploaded. Nothing is claimed.
         if let Err(e) = run.refresh_if_needed(&mut token).await {
@@ -238,11 +319,27 @@ pub async fn publish_due(
     Ok(report)
 }
 
+/// Why a token could not be had for the run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TokenFail {
+    Provider(PublishError),
+    /// The needs-reconnect mark could not be written. Carrying on would requeue an Auth
+    /// failure uncounted every run, so the run halts on storage instead.
+    Storage,
+}
+
+impl From<PublishError> for TokenFail {
+    fn from(e: PublishError) -> Self {
+        TokenFail::Provider(e)
+    }
+}
+
 /// A token problem halts the run: `Auth` needs the owner, anything else may pass.
-fn token_halt(e: PublishError) -> Halt {
+fn token_halt(e: TokenFail) -> Halt {
     match e {
-        PublishError::Auth => Halt::NeedsReconnect,
-        _ => Halt::TokenUnavailable,
+        TokenFail::Storage => Halt::Storage,
+        TokenFail::Provider(PublishError::Auth) => Halt::NeedsReconnect,
+        TokenFail::Provider(_) => Halt::TokenUnavailable,
     }
 }
 
@@ -261,6 +358,8 @@ enum Retried {
     Done(Result<PublishedRef, PublishError>),
     /// The forced refresh failed for a reason other than `Auth`.
     TokenTrouble,
+    /// The provider refused the token again but the reconnect mark could not be written.
+    MarkFailed,
 }
 
 struct Step {
@@ -302,11 +401,16 @@ where
         posts: &[ScheduledPost],
         report: &mut PublishReport,
     ) -> Result<(), PortError> {
+        let mut flagged = 0;
         for p in posts {
+            if flagged >= MAX_FLAGS_PER_RUN {
+                break;
+            }
             let Some(next) = flag_if_stuck(&p.state, (self.clock)()) else {
                 continue;
             };
             if self.repo.transition(&p.post.id, &p.state, &next).await? == Cas::Applied {
+                flagged += 1;
                 report
                     .outcomes
                     .push((p.post.id.clone(), Outcome::FlaggedStuck));
@@ -315,7 +419,7 @@ where
         Ok(())
     }
 
-    async fn load_fresh_token(&self) -> Result<StoredToken, PublishError> {
+    async fn load_fresh_token(&self) -> Result<StoredToken, TokenFail> {
         // The provider kept refusing the stored token: nothing runs until the owner
         // reconnects (which saves a new token and clears the mark).
         if self
@@ -324,19 +428,40 @@ where
             .await
             .map_err(|_| PublishError::Transient)?
         {
-            return Err(PublishError::Auth);
+            return Err(PublishError::Auth.into());
         }
-        let mut token = self
+        let mut token = match self
             .tokens
             .load()
             .await
             .map_err(|_| PublishError::Transient)?
-            .ok_or(PublishError::Auth)?;
+        {
+            TokenLoad::Token(t) => t,
+            TokenLoad::Missing => return Err(PublishError::Auth.into()),
+            TokenLoad::Unreadable => {
+                // The row exists but cannot be decrypted (a lost or changed key): only
+                // the owner reconnecting fixes it. The mark applies only if the row is
+                // still the version just read; if it cannot be written the run halts on storage.
+                return Err(self
+                    .mark_reconnect()
+                    .await
+                    .err()
+                    .unwrap_or(PublishError::Auth.into()));
+            }
+        };
         self.refresh_if_needed(&mut token).await?;
         Ok(token)
     }
 
-    async fn refresh_if_needed(&self, token: &mut StoredToken) -> Result<(), PublishError> {
+    /// Writes the needs-reconnect mark. `Err(Storage)` if it cannot be written.
+    async fn mark_reconnect(&self) -> Result<(), TokenFail> {
+        self.tokens
+            .mark_needs_reconnect()
+            .await
+            .map_err(|_| TokenFail::Storage)
+    }
+
+    async fn refresh_if_needed(&self, token: &mut StoredToken) -> Result<(), TokenFail> {
         if !token.needs_refresh((self.clock)()) {
             return Ok(());
         }
@@ -344,27 +469,34 @@ where
     }
 
     /// Refreshes whether or not the token looks expired.
-    async fn refresh(&self, token: &mut StoredToken) -> Result<(), PublishError> {
+    async fn refresh(&self, token: &mut StoredToken) -> Result<(), TokenFail> {
         let mut fresh = match self.refresher.refresh(token).await {
             Ok(t) => t,
             Err(PublishError::Auth) => {
                 // The refresh token itself is refused (revoked or expired): only the
-                // owner reconnecting fixes it. A failed mark is ignored; the run halts anyway.
-                let _ = self.tokens.mark_needs_reconnect().await;
-                return Err(PublishError::Auth);
+                // owner reconnecting fixes it. If the mark cannot be written the run halts
+                // on storage.
+                self.mark_reconnect().await?;
+                return Err(PublishError::Auth.into());
             }
-            Err(e) => return Err(e),
+            Err(e) => return Err(e.into()),
         };
         // Providers often leave the refresh token out of a refresh response.
         if fresh.refresh_token.is_empty() {
             fresh.refresh_token = token.refresh_token.clone();
         }
         // A refresh that cannot be saved is not safe to carry on with: the
-        // provider may have rotated the refresh token.
-        self.tokens
+        // provider may have rotated the refresh token. A save that did not apply
+        // means the owner reconnected since this run loaded: the token held here is
+        // stale, so the run stops rather than carry on with it.
+        let applied = self
+            .tokens
             .save(&fresh)
             .await
             .map_err(|_| PublishError::Transient)?;
+        if !applied {
+            return Err(PublishError::Transient.into());
+        }
         *token = fresh;
         Ok(())
     }
@@ -385,11 +517,32 @@ where
             return Ok(Step::of(Outcome::AlreadyClaimed));
         }
 
-        let mut result = self.upload(&p.post, token).await;
+        let deadline = match &claimed {
+            PublishState::Publishing { started_at, .. } => upload_deadline(*started_at),
+            _ => return Ok(Step::of(Outcome::AlreadyClaimed)),
+        };
+        let mut result = self.upload(&p.post, token, deadline).await;
+        // A forced refresh and a second upload must not stretch the post past its
+        // deadline. Auth means nothing was sent, so with no time left the claim is undone
+        // (no attempt spent) and the next run starts over.
+        if result == Err(PublishError::Auth) && (self.clock)() >= deadline {
+            return self
+                .release(id, &claimed, &p.state, Halt::TokenUnavailable)
+                .await;
+        }
         if result == Err(PublishError::Auth) {
-            match self.retry_after_refresh(&p.post, token).await {
+            match self.retry_after_refresh(&p.post, token, deadline).await {
                 Retried::Done(r) => result = r,
-                Retried::TokenTrouble => return self.release(id, &claimed, &p.state).await,
+                Retried::TokenTrouble => {
+                    return self
+                        .release(id, &claimed, &p.state, Halt::TokenUnavailable)
+                        .await
+                }
+                // Nothing was sent (Auth means a refusal before any chunk), so the claim
+                // is undone rather than requeued uncounted with no mark to stop the next run.
+                Retried::MarkFailed => {
+                    return self.release(id, &claimed, &p.state, Halt::Storage).await
+                }
             }
         }
         let now = (self.clock)();
@@ -441,28 +594,35 @@ where
     /// token so later runs stop at once; a failed mark is ignored because the post is
     /// requeued and the run halts either way. A refresh that fails for any reason but
     /// `Auth` is a token problem, not a verdict on this post (see `release`).
-    async fn retry_after_refresh(&self, post: &QueuedPost, token: &mut StoredToken) -> Retried {
+    async fn retry_after_refresh(
+        &self,
+        post: &QueuedPost,
+        token: &mut StoredToken,
+        deadline: i64,
+    ) -> Retried {
         let result = match self.refresh(token).await {
-            Ok(()) => self.upload(post, token).await,
-            Err(PublishError::Auth) => Err(PublishError::Auth),
-            Err(_) => return Retried::TokenTrouble,
+            Ok(()) => self.upload(post, token, deadline).await,
+            Err(TokenFail::Provider(PublishError::Auth)) => Err(PublishError::Auth),
+            Err(TokenFail::Storage) => return Retried::MarkFailed,
+            Err(TokenFail::Provider(_)) => return Retried::TokenTrouble,
         };
-        if result == Err(PublishError::Auth) {
-            let _ = self.tokens.mark_needs_reconnect().await;
+        if result == Err(PublishError::Auth) && self.mark_reconnect().await.is_err() {
+            return Retried::MarkFailed;
         }
         Retried::Done(result)
     }
 
     /// Undoes a claim: writes the pre-claim state back, so no attempt is used and the
-    /// post is exactly as it was. The run halts with `TokenUnavailable`, with no
-    /// reconnect mark, because the owner has nothing to do.
+    /// post is exactly as it was. The run halts with `halt`: `TokenUnavailable` (no
+    /// reconnect mark, the owner has nothing to do) or `Storage`.
     async fn release(
         &self,
         id: &str,
         claimed: &PublishState,
         before: &PublishState,
+        halt: Halt,
     ) -> Result<Step, PortError> {
-        let halt = Some(Halt::TokenUnavailable);
+        let halt = Some(halt);
         let lost = |halt| Step {
             outcome: Outcome::StateLost { external_id: None },
             halt,
@@ -482,13 +642,27 @@ where
         &self,
         post: &QueuedPost,
         token: &StoredToken,
+        deadline: i64,
     ) -> Result<PublishedRef, PublishError> {
+        // Storage is only asked about well-formed keys, as the delete path does.
+        if !is_valid_video_key(&post.video_key) {
+            return Err(PublishError::Rejected);
+        }
         let video = self
             .links
             .access(&post.video_key)
             .await
             .map_err(|_| PublishError::Transient)?;
-        let published = self.publisher.publish(post, &video, token).await?;
+        // Too big for one run's subrequest allowance (or empty): refuse it here, before
+        // anything is sent. Uploads are capped at the same size, so this is a backstop
+        // for an object that was replaced after it was queued.
+        if video.size() == 0 || video.size() > MAX_PUBLISH_BYTES {
+            return Err(PublishError::Rejected);
+        }
+        let published = self
+            .publisher
+            .publish(post, &video, token, deadline)
+            .await?;
         // The upload succeeded but the id is not one we will store or trust: the video
         // may exist, so this is an unknown outcome, never a retry.
         if !is_valid_external_id(&published.external_id) {
@@ -503,15 +677,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn video_access_debug_hides_the_link() {
-        let v = VideoAccess::new("https://r2.example/videos/a.mp4?X-Sig=SECRET");
-        let out = format!("{v:?}");
-        assert!(
-            !out.contains("SECRET") && !out.contains("r2.example"),
-            "{out}"
-        );
-        assert!(out.contains("[redacted]"));
-        assert_eq!(v.url(), "https://r2.example/videos/a.mp4?X-Sig=SECRET");
+    fn video_access_debug_hides_the_key() {
+        let v = VideoAccess::new("videos/SECRET-KEY.mp4", 1234);
+        let v = v.with_etag("ETAG-VALUE");
+        assert_eq!(v.etag(), Some("ETAG-VALUE"));
+        let out = format!("{v:?} {v:#?}");
+        assert!(!out.contains("ETAG"), "{out}");
+        assert!(!out.contains("SECRET") && !out.contains("videos/"), "{out}");
+        assert!(out.contains("[redacted]") && out.contains("1234"));
+        assert_eq!((v.key(), v.size()), ("videos/SECRET-KEY.mp4", 1234));
     }
 
     #[test]
@@ -534,6 +708,7 @@ mod tests {
     use crate::publish::{MAX_ATTEMPTS, PUBLISH_TIMEOUT_SECS};
     use crate::queue::Platform;
     use crate::token::fakes::FakeTokenStore;
+    use crate::youtube::MAX_PUBLISH_BYTES;
     use std::cell::{Cell, RefCell};
     use std::collections::VecDeque;
     use std::rc::Rc;
@@ -564,6 +739,8 @@ mod tests {
         /// Storage fails on a write from Publishing (a final write or a stuck flag), once
         /// this many of them have gone through. `None`: never fails.
         fail_final: Cell<Option<u32>>,
+        /// The `now` each `list` call was given.
+        listed_at: RefCell<Vec<i64>>,
     }
     impl FakeRepo {
         fn with(posts: Vec<ScheduledPost>) -> Self {
@@ -583,7 +760,8 @@ mod tests {
         }
     }
     impl PublishRepository for FakeRepo {
-        async fn list(&self) -> Result<Vec<ScheduledPost>, PortError> {
+        async fn list(&self, now: i64) -> Result<Vec<ScheduledPost>, PortError> {
+            self.listed_at.borrow_mut().push(now);
             Ok(self.posts.borrow().clone())
         }
         async fn transition(
@@ -626,6 +804,8 @@ mod tests {
         seen: RefCell<Vec<(String, String, String)>>,
         /// Moves the shared clock forward by `.1` seconds on every call.
         advance: Option<(Rc<Cell<i64>>, i64)>,
+        /// The deadline each provider call was given.
+        deadlines: RefCell<Vec<i64>>,
     }
     impl FakePublisher {
         fn returning(r: Vec<Result<PublishedRef, PublishError>>) -> Self {
@@ -641,11 +821,13 @@ mod tests {
             post: &QueuedPost,
             video: &VideoAccess,
             token: &StoredToken,
+            deadline: i64,
         ) -> Result<PublishedRef, PublishError> {
+            self.deadlines.borrow_mut().push(deadline);
             self.calls.borrow_mut().push(post.id.clone());
             self.seen.borrow_mut().push((
                 token.access_token.clone(),
-                video.url().to_string(),
+                video.key().to_string(),
                 format!("{token:?} {video:?}"),
             ));
             if let Some((clock, secs)) = &self.advance {
@@ -672,7 +854,7 @@ mod tests {
     struct FakeLinks;
     impl VideoLinks for FakeLinks {
         async fn access(&self, key: &str) -> Result<VideoAccess, PortError> {
-            Ok(VideoAccess::new(format!("https://signed/{key}?sig=SECRET")))
+            Ok(VideoAccess::new(format!("{key}?SECRET"), 1_000_000))
         }
     }
 
@@ -716,6 +898,7 @@ mod tests {
             tokens,
             refresher,
             &FakeLinks,
+            usize::MAX,
         ))
         .unwrap()
     }
@@ -741,6 +924,109 @@ mod tests {
             }
         );
         assert_eq!(repo.state("later"), PublishState::new_queued());
+    }
+
+    #[test]
+    fn the_run_lists_posts_as_of_its_own_clock() {
+        let repo = FakeRepo::with(vec![scheduled("a", NOW - 1)]);
+        let publisher = FakePublisher::returning(vec![ok_ref("yt1")]);
+        run(&repo, &publisher, &fresh_store(), &refresher_ok());
+        assert_eq!(*repo.listed_at.borrow(), [NOW]);
+    }
+
+    fn three_due() -> FakeRepo {
+        FakeRepo::with(vec![
+            scheduled("a", NOW - 3),
+            scheduled("b", NOW - 2),
+            scheduled("c", NOW - 1),
+        ])
+    }
+
+    #[test]
+    fn a_run_handles_no_more_posts_than_its_cap_earliest_first() {
+        for (cap, handled) in [(0, 0), (1, 1), (2, 2), (3, 3), (10, 3)] {
+            let repo = three_due();
+            let publisher =
+                FakePublisher::returning(vec![ok_ref("y1"), ok_ref("y2"), ok_ref("y3")]);
+            let tokens = fresh_store();
+            let refresher = refresher_ok();
+            let report = pollster::block_on(publish_due(
+                &|| NOW,
+                &repo,
+                &publisher,
+                &tokens,
+                &refresher,
+                &FakeLinks,
+                cap,
+            ))
+            .unwrap();
+            assert_eq!(report.outcomes.len(), handled, "cap {cap}");
+            assert_eq!(report.halted, None);
+            let ids = ["a", "b", "c"];
+            for (n, id) in ids.iter().enumerate() {
+                let untouched = n >= handled;
+                assert_eq!(
+                    repo.state(id) == PublishState::new_queued(),
+                    untouched,
+                    "{id} cap {cap}"
+                );
+            }
+            // Posts past the cap are not claimed, so nothing is half-done for them.
+            assert_eq!(publisher.calls.borrow().len(), handled);
+        }
+    }
+
+    #[test]
+    fn a_run_with_a_cap_of_zero_does_not_even_check_the_token() {
+        let repo = three_due();
+        let tokens = FakeTokenStore::default(); // no token: a check would halt
+        let report = pollster::block_on(publish_due(
+            &|| NOW,
+            &repo,
+            &FakePublisher::default(),
+            &tokens,
+            &refresher_ok(),
+            &FakeLinks,
+            0,
+        ))
+        .unwrap();
+        assert_eq!(report, PublishReport::default());
+    }
+
+    #[test]
+    fn a_scheduled_run_handles_one_post() {
+        assert_eq!(POSTS_PER_RUN, 1);
+    }
+
+    #[test]
+    fn halts_and_outcomes_have_fixed_log_codes() {
+        assert_eq!(Halt::NeedsReconnect.code(), "needs_reconnect");
+        assert_eq!(Halt::TokenUnavailable.code(), "token_unavailable");
+        assert_eq!(Halt::RateLimited.code(), "rate_limited");
+        assert_eq!(Halt::Storage.code(), "storage");
+        let o = |o: Outcome| o.code();
+        assert_eq!(
+            o(Outcome::Published {
+                external_id: "x".into()
+            }),
+            "published"
+        );
+        assert_eq!(o(Outcome::Retrying(FailReason::Transient)), "retrying");
+        assert_eq!(o(Outcome::Failed(FailReason::Rejected)), "failed");
+        assert_eq!(o(Outcome::AlreadyClaimed), "already_claimed");
+        assert_eq!(o(Outcome::Released), "released");
+        assert_eq!(o(Outcome::FlaggedStuck), "flagged_stuck");
+        assert_eq!(o(Outcome::StateLost { external_id: None }), "state_lost");
+        // The reason behind a retry or a failure is reported separately, by its own code.
+        assert_eq!(
+            Outcome::Retrying(FailReason::Auth).reason(),
+            Some(FailReason::Auth)
+        );
+        assert_eq!(
+            Outcome::Failed(FailReason::Unknown).reason(),
+            Some(FailReason::Unknown)
+        );
+        assert_eq!(Outcome::Released.reason(), None);
     }
 
     #[test]
@@ -807,6 +1093,48 @@ mod tests {
     }
 
     #[test]
+    fn the_publisher_gets_a_deadline_counted_from_the_claim() {
+        let repo = FakeRepo::with(vec![scheduled("a", NOW - 1)]);
+        let publisher = FakePublisher::returning(vec![Err(PublishError::Auth), ok_ref("yt1")]);
+        run(&repo, &publisher, &fresh_store(), &refresher_ok());
+        // Both calls share the first claim's deadline: a retry cannot stretch the post.
+        let want = NOW + crate::youtube::UPLOAD_DEADLINE_SECS;
+        assert_eq!(*publisher.deadlines.borrow(), [want, want]);
+    }
+
+    #[test]
+    fn an_auth_refusal_with_no_time_left_is_not_retried() {
+        let clock = Rc::new(Cell::new(NOW));
+        let repo = FakeRepo::with(vec![scheduled("a", NOW - 1)]);
+        let tokens = fresh_store();
+        let refresher = refresher_ok();
+        let publisher = FakePublisher {
+            results: RefCell::new(vec![Err(PublishError::Auth)].into()),
+            advance: Some((clock.clone(), crate::youtube::UPLOAD_DEADLINE_SECS)),
+            ..FakePublisher::default()
+        };
+        let c = clock.clone();
+        let report = pollster::block_on(publish_due(
+            &move || c.get(),
+            &repo,
+            &publisher,
+            &tokens,
+            &refresher,
+            &FakeLinks,
+            usize::MAX,
+        ))
+        .unwrap();
+        // No forced refresh and no second upload. Nothing was sent, so the claim is
+        // undone: no attempt is spent and the post is exactly as before.
+        assert_eq!(refresher.calls.get(), 0);
+        assert_eq!(publisher.calls.borrow().len(), 1);
+        assert_eq!(report.outcomes, [("a".to_string(), Outcome::Released)]);
+        assert_eq!(repo.state("a"), PublishState::new_queued());
+        assert_eq!(report.halted, Some(Halt::TokenUnavailable));
+        assert!(!tokens.reconnect.get());
+    }
+
+    #[test]
     fn auth_then_a_refresh_the_provider_refuses_marks_the_token() {
         let repo = FakeRepo::with(vec![scheduled("a", NOW - 1)]);
         let tokens = fresh_store();
@@ -866,6 +1194,7 @@ mod tests {
                 &tokens,
                 &refresher,
                 &FakeLinks,
+                usize::MAX,
             ))
             .unwrap();
             assert_eq!(report.halted, Some(Halt::TokenUnavailable));
@@ -921,6 +1250,25 @@ mod tests {
         assert_eq!(saved.access_token, "ya29.NEW-SECRET");
         // The provider call used the NEW token, not the stored one.
         assert_eq!(publisher.seen.borrow()[0].0, "ya29.NEW-SECRET");
+    }
+
+    #[test]
+    fn a_token_that_would_expire_during_the_longest_publish_is_refreshed_first() {
+        use crate::youtube::WORST_CASE_PUBLISH_SECS;
+        let refreshed = |expires_in: i64| {
+            let repo = FakeRepo::with(vec![scheduled("a", NOW - 1)]);
+            let tokens = FakeTokenStore::default();
+            *tokens.token.borrow_mut() = Some(token(NOW + expires_in, "ya29.OLD"));
+            let refresher = refresher_ok();
+            let publisher = FakePublisher::returning(vec![ok_ref("y")]);
+            run(&repo, &publisher, &tokens, &refresher);
+            // Whichever token it was, the provider call got one good for the whole run.
+            assert!(publisher.seen.borrow().len() == 1);
+            refresher.calls.get()
+        };
+        assert_eq!(refreshed(WORST_CASE_PUBLISH_SECS + 30), 1);
+        assert_eq!(refreshed(WORST_CASE_PUBLISH_SECS), 1);
+        assert_eq!(refreshed(crate::token::REFRESH_MARGIN_SECS + 1), 0);
     }
 
     #[test]
@@ -997,6 +1345,7 @@ mod tests {
                 &tokens,
                 &refresher_ok(),
                 &FakeLinks,
+                usize::MAX,
             ))
             .unwrap();
             outcomes.push(r.outcomes[0].1.clone());
@@ -1060,6 +1409,42 @@ mod tests {
             PublishState::Publishing { .. }
         ));
         assert!(publisher.calls.borrow().is_empty());
+    }
+
+    #[test]
+    fn a_run_flags_at_most_three_stuck_posts_and_the_rest_wait() {
+        let stuck = |id: &str| {
+            let mut p = scheduled(id, 0);
+            p.state = PublishState::Publishing {
+                attempt: 1,
+                started_at: NOW - PUBLISH_TIMEOUT_SECS,
+            };
+            p
+        };
+        let repo = FakeRepo::with(
+            ["s1", "s2", "s3", "s4", "s5"]
+                .into_iter()
+                .map(stuck)
+                .collect(),
+        );
+        let publisher = FakePublisher::default();
+        let report = run(&repo, &publisher, &fresh_store(), &refresher_ok());
+        assert_eq!(report.outcomes.len(), MAX_FLAGS_PER_RUN);
+        assert!(report
+            .outcomes
+            .iter()
+            .all(|(_, o)| *o == Outcome::FlaggedStuck));
+        let flagged = |id| matches!(repo.state(id), PublishState::Failed { .. });
+        assert_eq!(
+            ["s1", "s2", "s3", "s4", "s5"]
+                .into_iter()
+                .filter(|i| flagged(i))
+                .count(),
+            3
+        );
+        // The next run flags the remaining two.
+        let again = run(&repo, &publisher, &fresh_store(), &refresher_ok());
+        assert_eq!(again.outcomes.len(), 2);
     }
 
     #[test]
@@ -1177,7 +1562,7 @@ mod tests {
         let clock = Rc::new(Cell::new(NOW));
         let repo = two_due();
         let tokens = FakeTokenStore::default();
-        *tokens.token.borrow_mut() = Some(token(NOW + 400, "ya29.OLD"));
+        *tokens.token.borrow_mut() = Some(token(NOW + 700, "ya29.OLD"));
         let refresher = refresher_ok();
         let publisher = FakePublisher {
             results: RefCell::new(
@@ -1194,6 +1579,7 @@ mod tests {
             &tokens,
             &refresher,
             &FakeLinks,
+            usize::MAX,
         ))
         .unwrap();
         // Backoff is measured from the moment each post failed, not from the start of the run.
@@ -1234,7 +1620,7 @@ mod tests {
         let clock = Rc::new(Cell::new(NOW));
         let repo = two_due();
         let tokens = FakeTokenStore::default();
-        *tokens.token.borrow_mut() = Some(token(NOW + 400, "ya29.OLD"));
+        *tokens.token.borrow_mut() = Some(token(NOW + 700, "ya29.OLD"));
         // Fine at run start; expired by the time post b is reached.
         let refresher = FakeRefresher {
             result: Err(PublishError::Unknown),
@@ -1253,6 +1639,7 @@ mod tests {
             &tokens,
             &refresher,
             &FakeLinks,
+            usize::MAX,
         ))
         .unwrap();
         assert_eq!(report.halted, Some(Halt::TokenUnavailable));
@@ -1295,6 +1682,7 @@ mod tests {
             &fresh_store(),
             &refresher_ok(),
             &FakeLinks,
+            usize::MAX,
         ))
         .unwrap();
         assert_eq!(report.halted, Some(Halt::Storage));
@@ -1398,6 +1786,7 @@ mod tests {
             &fresh_store(),
             &refresher_ok(),
             &FakeLinks,
+            usize::MAX,
         ))
         .unwrap();
         assert_eq!(later.outcomes, [("a".to_string(), Outcome::FlaggedStuck)]);
@@ -1458,15 +1847,212 @@ mod tests {
         assert!(!dump.contains("SECRET") && !dump.contains("ya29"), "{dump}");
     }
 
+    /// A token store whose `save` answers as told: `Some(applied)` or an error (`None`).
+    struct SaveAnswers(FakeTokenStore, Option<bool>);
+    impl TokenStore for SaveAnswers {
+        async fn load(&self) -> Result<TokenLoad, PortError> {
+            self.0.load().await
+        }
+        async fn save(&self, _t: &StoredToken) -> Result<bool, PortError> {
+            self.1.ok_or_else(|| PortError("kv down".into()))
+        }
+        async fn connect(&self, t: &StoredToken) -> Result<(), PortError> {
+            self.0.connect(t).await
+        }
+        async fn mark_needs_reconnect(&self) -> Result<(), PortError> {
+            self.0.mark_needs_reconnect().await
+        }
+        async fn needs_reconnect(&self) -> Result<bool, PortError> {
+            self.0.needs_reconnect().await
+        }
+        async fn connection_mark(&self) -> Result<Option<bool>, PortError> {
+            self.0.connection_mark().await
+        }
+    }
+
+    /// A token store that cannot write the needs-reconnect mark.
+    struct MarkFails(FakeTokenStore);
+    impl TokenStore for MarkFails {
+        async fn load(&self) -> Result<TokenLoad, PortError> {
+            self.0.load().await
+        }
+        async fn save(&self, t: &StoredToken) -> Result<bool, PortError> {
+            self.0.save(t).await
+        }
+        async fn connect(&self, t: &StoredToken) -> Result<(), PortError> {
+            self.0.connect(t).await
+        }
+        async fn mark_needs_reconnect(&self) -> Result<(), PortError> {
+            Err(PortError("kv down".into()))
+        }
+        async fn needs_reconnect(&self) -> Result<bool, PortError> {
+            self.0.needs_reconnect().await
+        }
+        async fn connection_mark(&self) -> Result<Option<bool>, PortError> {
+            self.0.connection_mark().await
+        }
+    }
+
+    fn run_marks_failing(
+        tokens: FakeTokenStore,
+        refresher: &FakeRefresher,
+        publisher: &FakePublisher,
+    ) -> (PublishReport, FakeRepo) {
+        let repo = two_due();
+        let report = run_on(&repo, publisher, &MarkFails(tokens), refresher);
+        (report, repo)
+    }
+
+    fn run_on(
+        repo: &FakeRepo,
+        publisher: &FakePublisher,
+        tokens: &impl TokenStore,
+        refresher: &FakeRefresher,
+    ) -> PublishReport {
+        pollster::block_on(publish_due(
+            &|| NOW,
+            repo,
+            publisher,
+            tokens,
+            refresher,
+            &FakeLinks,
+            usize::MAX,
+        ))
+        .unwrap()
+    }
+
+    #[test]
+    fn a_failed_reconnect_mark_after_a_second_auth_halts_on_storage_and_releases_the_post() {
+        let publisher =
+            FakePublisher::returning(vec![Err(PublishError::Auth), Err(PublishError::Auth)]);
+        let (report, repo) = run_marks_failing(fresh_store(), &refresher_ok(), &publisher);
+        assert_eq!(report.halted, Some(Halt::Storage));
+        assert_eq!(report.outcomes, [("a".to_string(), Outcome::Released)]);
+        // Not requeued as an uncounted Auth failure: exactly as before the claim.
+        assert_eq!(repo.state("a"), PublishState::new_queued());
+        assert_eq!(repo.state("b"), PublishState::new_queued());
+    }
+
+    #[test]
+    fn a_failed_reconnect_mark_after_a_refused_refresh_halts_on_storage() {
+        let refresher = FakeRefresher {
+            result: Err(PublishError::Auth),
+            calls: Cell::new(0),
+        };
+        let tokens = FakeTokenStore::default();
+        *tokens.token.borrow_mut() = Some(token(NOW, "ya29.OLD"));
+        let publisher = FakePublisher::default();
+        let (report, repo) = run_marks_failing(tokens, &refresher, &publisher);
+        assert_eq!(report.halted, Some(Halt::Storage));
+        assert!(report.outcomes.is_empty());
+        assert!(publisher.calls.borrow().is_empty());
+        assert_eq!(repo.state("a"), PublishState::new_queued());
+    }
+
+    #[test]
+    fn a_failed_reconnect_mark_for_an_unreadable_token_halts_on_storage() {
+        let tokens = fresh_store();
+        tokens.unreadable.set(true);
+        let (report, _) = run_marks_failing(tokens, &refresher_ok(), &FakePublisher::default());
+        assert_eq!(report.halted, Some(Halt::Storage));
+    }
+
+    fn run_with_save(answer: Option<bool>) -> (PublishReport, FakeRepo, FakePublisher) {
+        let inner = FakeTokenStore::default();
+        *inner.token.borrow_mut() = Some(token(NOW, "ya29.OLD"));
+        let repo = two_due();
+        let publisher = FakePublisher::default();
+        let report = pollster::block_on(publish_due(
+            &|| NOW,
+            &repo,
+            &publisher,
+            &SaveAnswers(inner, answer),
+            &refresher_ok(),
+            &FakeLinks,
+            usize::MAX,
+        ))
+        .unwrap();
+        (report, repo, publisher)
+    }
+
     #[test]
     fn a_failing_token_save_stops_the_run_before_the_provider_is_called() {
-        struct NoSave(FakeTokenStore);
-        impl TokenStore for NoSave {
-            async fn load(&self) -> Result<Option<StoredToken>, PortError> {
-                self.0.load().await
+        let (report, repo, publisher) = run_with_save(None);
+        assert_eq!(report.halted, Some(Halt::TokenUnavailable));
+        assert_eq!(repo.state("a"), PublishState::new_queued());
+        assert!(publisher.calls.borrow().is_empty());
+    }
+
+    #[test]
+    fn a_refresh_save_that_did_not_apply_stops_the_run_without_using_the_new_token() {
+        // The owner reconnected between load and save: the refreshed token is stale.
+        let (report, repo, publisher) = run_with_save(Some(false));
+        assert_eq!(report.halted, Some(Halt::TokenUnavailable));
+        assert!(report.outcomes.is_empty());
+        assert_eq!(repo.state("a"), PublishState::new_queued());
+        assert!(
+            publisher.calls.borrow().is_empty(),
+            "no upload with the stale token"
+        );
+    }
+
+    #[test]
+    fn a_refresh_save_that_did_not_apply_mid_run_releases_the_claimed_post() {
+        let inner = FakeTokenStore::default();
+        *inner.token.borrow_mut() = Some(token(NOW + 3600, "ya29.OLD"));
+        let repo = two_due();
+        let publisher = FakePublisher::returning(vec![Err(PublishError::Auth)]);
+        let report = pollster::block_on(publish_due(
+            &|| NOW,
+            &repo,
+            &publisher,
+            &SaveAnswers(inner, Some(false)),
+            &refresher_ok(),
+            &FakeLinks,
+            usize::MAX,
+        ))
+        .unwrap();
+        assert_eq!(report.halted, Some(Halt::TokenUnavailable));
+        assert_eq!(report.outcomes[0].1, Outcome::Released);
+        assert_eq!(repo.state("a"), PublishState::new_queued());
+        assert_eq!(
+            publisher.calls.borrow().len(),
+            1,
+            "no retry with the stale token"
+        );
+    }
+
+    #[test]
+    fn an_unreadable_token_marks_the_row_and_halts_for_a_reconnect() {
+        let tokens = fresh_store();
+        tokens.unreadable.set(true);
+        let repo = two_due();
+        let publisher = FakePublisher::default();
+        let refresher = refresher_ok();
+        let report = run(&repo, &publisher, &tokens, &refresher);
+        assert_eq!(report.halted, Some(Halt::NeedsReconnect));
+        assert!(report.outcomes.is_empty());
+        assert!(
+            tokens.reconnect.get(),
+            "the row is marked, so later runs stop early"
+        );
+        assert_eq!(repo.state("a"), PublishState::new_queued());
+        assert!(publisher.calls.borrow().is_empty());
+        assert_eq!(refresher.calls.get(), 0);
+    }
+
+    #[test]
+    fn an_unreadable_token_is_not_marked_if_the_owner_reconnected_since_the_load() {
+        /// Reconnects right after the load, as the owner could between two steps of a run.
+        struct ReconnectsAfterLoad(FakeTokenStore);
+        impl TokenStore for ReconnectsAfterLoad {
+            async fn load(&self) -> Result<TokenLoad, PortError> {
+                let loaded = self.0.load().await;
+                self.0.connect(&token(NOW + 3600, "ya29.NEW")).await?;
+                loaded
             }
-            async fn save(&self, _t: &StoredToken) -> Result<(), PortError> {
-                Err(PortError("kv down".into()))
+            async fn save(&self, t: &StoredToken) -> Result<bool, PortError> {
+                self.0.save(t).await
             }
             async fn connect(&self, t: &StoredToken) -> Result<(), PortError> {
                 self.0.connect(t).await
@@ -1481,22 +2067,25 @@ mod tests {
                 self.0.connection_mark().await
             }
         }
-        let inner = FakeTokenStore::default();
-        *inner.token.borrow_mut() = Some(token(NOW, "ya29.OLD"));
+        let inner = fresh_store();
+        inner.unreadable.set(true);
+        let store = ReconnectsAfterLoad(inner);
         let repo = two_due();
-        let publisher = FakePublisher::default();
         let report = pollster::block_on(publish_due(
             &|| NOW,
             &repo,
-            &publisher,
-            &NoSave(inner),
+            &FakePublisher::default(),
+            &store,
             &refresher_ok(),
             &FakeLinks,
+            usize::MAX,
         ))
         .unwrap();
-        assert_eq!(report.halted, Some(Halt::TokenUnavailable));
-        assert_eq!(repo.state("a"), PublishState::new_queued());
-        assert!(publisher.calls.borrow().is_empty());
+        assert_eq!(report.halted, Some(Halt::NeedsReconnect));
+        assert!(
+            !store.0.reconnect.get(),
+            "the new connection must stay unmarked"
+        );
     }
 
     #[test]
@@ -1516,6 +2105,7 @@ mod tests {
             &fresh_store(),
             &refresher_ok(),
             &NoLinks,
+            usize::MAX,
         ))
         .unwrap();
         assert_eq!(
@@ -1530,6 +2120,81 @@ mod tests {
             }
         );
         assert!(publisher.calls.borrow().is_empty());
+    }
+
+    #[test]
+    fn a_post_with_a_malformed_video_key_is_rejected_before_storage_is_asked() {
+        struct NeverAsked;
+        impl VideoLinks for NeverAsked {
+            async fn access(&self, _k: &str) -> Result<VideoAccess, PortError> {
+                panic!("storage must not be asked about a malformed key");
+            }
+        }
+        for key in [
+            "",
+            "../x.mp4",
+            "videos/a b.mp4",
+            "videos/x.MP4",
+            "other/x.mp4",
+        ] {
+            let mut post = scheduled("a", 1);
+            post.post.video_key = key.into();
+            let repo = FakeRepo::with(vec![post]);
+            let publisher = FakePublisher::default();
+            let report = pollster::block_on(publish_due(
+                &|| NOW,
+                &repo,
+                &publisher,
+                &fresh_store(),
+                &refresher_ok(),
+                &NeverAsked,
+                usize::MAX,
+            ))
+            .unwrap();
+            assert_eq!(
+                report.outcomes[0].1,
+                Outcome::Failed(FailReason::Rejected),
+                "{key}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_video_too_big_or_empty_to_publish_is_rejected_without_calling_the_provider() {
+        struct Sized(u64);
+        impl VideoLinks for Sized {
+            async fn access(&self, k: &str) -> Result<VideoAccess, PortError> {
+                Ok(VideoAccess::new(k, self.0))
+            }
+        }
+        for (size, rejected) in [
+            (0, true),
+            (1, false),
+            (MAX_PUBLISH_BYTES, false),
+            (MAX_PUBLISH_BYTES + 1, true),
+            (u64::MAX, true),
+        ] {
+            let repo = FakeRepo::with(vec![scheduled("a", 1)]);
+            let publisher = FakePublisher::returning(vec![ok_ref("yt1")]);
+            let report = pollster::block_on(publish_due(
+                &|| NOW,
+                &repo,
+                &publisher,
+                &fresh_store(),
+                &refresher_ok(),
+                &Sized(size),
+                usize::MAX,
+            ))
+            .unwrap();
+            assert_eq!(
+                publisher.calls.borrow().len(),
+                usize::from(!rejected),
+                "{size}"
+            );
+            if rejected {
+                assert_eq!(report.outcomes[0].1, Outcome::Failed(FailReason::Rejected));
+            }
+        }
     }
 
     #[test]

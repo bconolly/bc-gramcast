@@ -3,7 +3,8 @@
 use domain::app::{AppError, DeleteError, InsertError, PortError, PostChanges, UpdateError};
 use domain::auth::{self, AuthError, Claims, JwtHeader};
 use domain::media::UploadError;
-use domain::queue::{Platform, QueueError, QueuedPost};
+use domain::publish::{is_valid_external_id, PublishState, ScheduledPost};
+use domain::queue::{edit_cutoff, Platform, QueueError, QueuedPost};
 use domain::slots::{SlotError, SlotPattern, SlotRule, Weekday};
 use serde::{Deserialize, Serialize};
 
@@ -66,6 +67,7 @@ pub struct PostJson {
     pub platforms: Vec<String>,
     pub slot_at: i64,
     pub status: String,
+    pub publish: PublishJson,
 }
 
 pub fn platform_from_str(s: &str) -> Option<Platform> {
@@ -100,8 +102,49 @@ pub fn to_domain(id: String, body: QueuePostBody) -> Option<QueuedPost> {
     })
 }
 
+/// The publishing part of a post, as the Queue screen shows it: a fixed state tag, the
+/// provider's id once published (only if it passes the domain's shape check) and the
+/// fixed failure code once failed. No other detail leaves the Worker.
+#[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PublishJson {
+    pub state: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub external_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+pub fn publish_json(state: &PublishState) -> PublishJson {
+    let tag = |state: &str| PublishJson {
+        state: state.to_string(),
+        external_id: None,
+        reason: None,
+    };
+    match state {
+        PublishState::Queued { .. } => tag("queued"),
+        PublishState::Publishing { .. } => tag("publishing"),
+        PublishState::Published { external_id } => PublishJson {
+            external_id: Some(external_id.clone()).filter(|id| is_valid_external_id(id)),
+            ..tag("published")
+        },
+        PublishState::Failed { reason, .. } => PublishJson {
+            reason: Some(reason.code().to_string()),
+            ..tag("failed")
+        },
+    }
+}
+
+/// A post with its publishing state, for the Queue.
+pub fn scheduled_to_json(p: &ScheduledPost) -> PostJson {
+    PostJson {
+        publish: publish_json(&p.state),
+        ..to_json(&p.post)
+    }
+}
+
 pub fn to_json(p: &QueuedPost) -> PostJson {
     PostJson {
+        publish: publish_json(&PublishState::new_queued()),
         id: p.id.clone(),
         video_key: p.video_key.clone(),
         title: p.title.clone(),
@@ -224,41 +267,72 @@ pub fn classify_update_error(text: &str) -> UpdateError {
 /// itself fails, so a possibly orphaned video is visible. No id: it may be unknown.
 pub const DELETE_UNCONFIRMED_LINE: &str = "delete could not be confirmed; a video may be orphaned";
 
+/// The fixed 409 text for an edit or delete inside the lock window. The web UI shows the
+/// same words where it hides the buttons.
+pub const TOO_CLOSE_MESSAGE: &str = "too close to its slot to change";
+
 /// True when D1 reports at least one row changed by a write.
 pub fn write_applied(changes: Option<usize>) -> bool {
     changes.is_some_and(|n| n > 0)
 }
 
-/// Settles an update that did not report a change. `row_slot` is the stored
-/// `slot_at` read back afterwards (`None`: no such row). The SQL only touches rows
-/// whose slot is after `now`, so a row at or before it was refused, not updated.
+/// What the edit and delete paths read back after a write that changed nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RowGuard {
+    pub slot_at: i64,
+    /// The publisher has taken the post (or it is finished): see `row_claimed`.
+    pub claimed: bool,
+}
+
+/// Unclaimed means Queued with 0 attempts. Anything else, including a state or a
+/// count this code does not recognise, counts as claimed, so it fails closed.
+pub fn row_claimed(state: &str, attempts: f64) -> bool {
+    !(state == "queued" && attempts == 0.0)
+}
+
+/// Edit and delete touch a row only while its slot is after the lock cutoff (`now` plus
+/// `EDIT_LOCK_SECS`, bound as the slot parameter) AND the publisher has
+/// not claimed it (the state columns of migration 0004). The slot test alone left a gap:
+/// the publisher claims on the Worker clock, which can pass the slot after this request
+/// began.
+pub const UPDATE_POST_SQL: &str = "UPDATE posts SET title = ?1, caption = ?2, platforms = ?3, \
+     slot_at = ?4 WHERE id = ?5 AND slot_at > ?6 AND state = 'queued' AND attempts = 0";
+pub const DELETE_POST_SQL: &str =
+    "DELETE FROM posts WHERE id = ?1 AND slot_at > ?2 AND state = 'queued' AND attempts = 0";
+
+/// Settles an update that did not report a change. `row` is what was read back
+/// afterwards (`None`: no such row). The SQL only touches unclaimed rows whose slot
+/// is after `now`, so a claimed row or one at or before it was refused, not updated.
 pub fn update_after_miss(
     changes: Option<usize>,
-    row_slot: Option<i64>,
+    row: Option<RowGuard>,
     now: i64,
 ) -> Result<(), UpdateError> {
-    match (changes, row_slot) {
+    match (changes, row) {
         (_, None) => Err(UpdateError::NotFound),
-        (_, Some(slot)) if slot <= now => Err(UpdateError::NotQueued),
-        // No count, and the row now holds a future slot: our update landed.
+        (_, Some(r)) if r.claimed || r.slot_at <= now => Err(UpdateError::NotQueued),
+        (_, Some(r)) if r.slot_at <= edit_cutoff(now) => Err(UpdateError::TooCloseToSlot),
+        // No count, and the row is open with a future slot: our update landed.
         (None, Some(_)) => Ok(()),
-        // A count of 0 with a queued row should be impossible: do not claim success.
+        // A count of 0 with an open row should be impossible: do not claim success.
         (Some(_), Some(_)) => Err(UpdateError::Port(PortError(
             "update changed no rows".into(),
         ))),
     }
 }
 
-/// Settles a delete that did not report a change, like `update_after_miss`.
+/// Settles a delete that did not report a change, like `update_after_miss`. A claimed
+/// row still exists, so it is `NotQueued` and its video must stay.
 pub fn delete_after_miss(
     changes: Option<usize>,
-    row_slot: Option<i64>,
+    row: Option<RowGuard>,
     now: i64,
 ) -> Result<(), DeleteError> {
-    match (changes, row_slot) {
+    match (changes, row) {
         (None, None) => Ok(()),
         (Some(_), None) => Err(DeleteError::NotFound),
-        (_, Some(slot)) if slot <= now => Err(DeleteError::NotQueued),
+        (_, Some(r)) if r.claimed || r.slot_at <= now => Err(DeleteError::NotQueued),
+        (_, Some(r)) if r.slot_at <= edit_cutoff(now) => Err(DeleteError::TooCloseToSlot),
         (_, Some(_)) => Err(DeleteError::Port(PortError(
             "delete removed no rows".into(),
         ))),
@@ -280,6 +354,7 @@ pub fn error_status(e: &AppError) -> (u16, &'static str) {
     match e {
         AppError::NotFound => (404, "post not found"),
         AppError::NotQueued => (409, "post is no longer queued"),
+        AppError::TooCloseToSlot => (409, TOO_CLOSE_MESSAGE),
         AppError::VideoNotUploaded => (422, "video has not been uploaded"),
         AppError::Upload(u) => (
             422,
@@ -298,6 +373,12 @@ pub fn error_status(e: &AppError) -> (u16, &'static str) {
             QueueError::EmptyTitle => (422, "title is required"),
             QueueError::BadVideoKey => (422, "video key is not valid"),
             QueueError::TooLong => (422, "title or caption is too long"),
+            QueueError::DescriptionTooManyBytes => {
+                (422, "caption is too long for YouTube (5000 bytes at most)")
+            }
+            QueueError::AngleBrackets => {
+                (422, "YouTube does not allow < or > in a title or caption")
+            }
             QueueError::DuplicatePlatform => (422, "each platform can be chosen once"),
             QueueError::SlotInPast => (422, "slot must be in the future"),
             QueueError::SlotOutOfRange => (422, "slot is out of range"),
@@ -542,6 +623,8 @@ mod tests {
     use super::*;
     use domain::app::{InsertError, PortError};
     use domain::media::UploadError;
+    use domain::publish::FailReason;
+    use domain::queue::EDIT_LOCK_SECS;
 
     fn body() -> QueuePostBody {
         QueuePostBody {
@@ -559,6 +642,60 @@ mod tests {
         let json = to_json(&post);
         assert_eq!(json.platforms, ["instagram", "youtube"]);
         assert_eq!(json.status, "ready");
+    }
+
+    #[test]
+    fn a_post_without_publish_state_is_queued_in_json() {
+        let post = to_domain("id1".into(), body()).unwrap();
+        let json = serde_json::to_value(to_json(&post)).unwrap();
+        assert_eq!(json["publish"], serde_json::json!({"state": "queued"}));
+    }
+
+    fn scheduled_json(state: PublishState) -> serde_json::Value {
+        let post = to_domain("id1".into(), body()).unwrap();
+        serde_json::to_value(scheduled_to_json(&ScheduledPost { post, state })).unwrap()
+    }
+
+    #[test]
+    fn each_publish_state_maps_to_a_fixed_tag_with_only_its_own_detail() {
+        use serde_json::json;
+        assert_eq!(
+            scheduled_json(PublishState::Queued {
+                attempts: 2,
+                not_before: 9
+            })["publish"],
+            json!({"state": "queued"})
+        );
+        assert_eq!(
+            scheduled_json(PublishState::Publishing {
+                attempt: 1,
+                started_at: 5
+            })["publish"],
+            json!({"state": "publishing"})
+        );
+        assert_eq!(
+            scheduled_json(PublishState::Published {
+                external_id: "dQw4w9WgXcQ".into()
+            })["publish"],
+            json!({"state": "published", "external_id": "dQw4w9WgXcQ"})
+        );
+        assert_eq!(
+            scheduled_json(PublishState::Failed {
+                attempts: 3,
+                reason: FailReason::StuckPublishing
+            })["publish"],
+            json!({"state": "failed", "reason": "stuck_publishing"})
+        );
+        // The post's own fields are still there.
+        assert_eq!(scheduled_json(PublishState::new_queued())["title"], "T");
+    }
+
+    #[test]
+    fn an_external_id_of_the_wrong_shape_is_never_sent() {
+        let json = scheduled_json(PublishState::Published {
+            external_id: "a b\"<".into(),
+        });
+        assert_eq!(json["publish"], serde_json::json!({"state": "published"}));
     }
 
     #[test]
@@ -649,33 +786,71 @@ mod tests {
         assert!(!write_applied(None));
     }
 
+    const OPEN: RowGuard = RowGuard {
+        slot_at: NOW + EDIT_LOCK_SECS + 1,
+        claimed: false,
+    };
+    const CLAIMED: RowGuard = RowGuard {
+        slot_at: NOW + 1,
+        claimed: true,
+    };
+    const INSIDE_WINDOW: RowGuard = RowGuard {
+        slot_at: NOW + EDIT_LOCK_SECS,
+        claimed: false,
+    };
+    const PASSED: RowGuard = RowGuard {
+        slot_at: NOW,
+        claimed: false,
+    };
+
+    #[test]
+    fn a_post_is_unclaimed_only_while_queued_with_no_attempts() {
+        assert!(!row_claimed("queued", 0.0));
+        for (state, attempts) in [
+            ("queued", 1.0),
+            ("publishing", 0.0),
+            ("published", 0.0),
+            ("failed", 3.0),
+            ("something-new", 0.0),
+            ("queued", f64::NAN),
+            ("queued", -1.0),
+        ] {
+            assert!(row_claimed(state, attempts), "{state} {attempts}");
+        }
+    }
+
     #[test]
     fn update_after_no_change_reads_the_row_to_decide() {
-        // Row gone: NotFound. Row there with a passed slot: NotQueued.
+        // Row gone: NotFound. Row there with a passed slot or a claim: NotQueued.
         assert_eq!(
             update_after_miss(Some(0), None, NOW),
             Err(UpdateError::NotFound)
         );
         assert_eq!(
-            update_after_miss(Some(0), Some(NOW), NOW),
+            update_after_miss(Some(0), Some(PASSED), NOW),
             Err(UpdateError::NotQueued)
         );
         assert_eq!(
-            update_after_miss(Some(0), Some(NOW - 1), NOW),
-            Err(UpdateError::NotQueued)
+            update_after_miss(Some(0), Some(CLAIMED), NOW),
+            Err(UpdateError::NotQueued),
+            "a claimed post is refused even with its slot still ahead"
         );
-        // 0 changes yet a queued row cannot happen: do not claim success.
+        // 0 changes yet an open row cannot happen: do not claim success.
         assert!(matches!(
-            update_after_miss(Some(0), Some(NOW + 1), NOW),
+            update_after_miss(Some(0), Some(OPEN), NOW),
             Err(UpdateError::Port(_))
         ));
     }
 
     #[test]
     fn update_without_a_change_count_trusts_the_reread_row() {
-        assert_eq!(update_after_miss(None, Some(NOW + 1), NOW), Ok(()));
+        assert_eq!(update_after_miss(None, Some(OPEN), NOW), Ok(()));
         assert_eq!(
-            update_after_miss(None, Some(NOW), NOW),
+            update_after_miss(None, Some(PASSED), NOW),
+            Err(UpdateError::NotQueued)
+        );
+        assert_eq!(
+            update_after_miss(None, Some(CLAIMED), NOW),
             Err(UpdateError::NotQueued)
         );
         assert_eq!(
@@ -691,11 +866,15 @@ mod tests {
             Err(DeleteError::NotFound)
         );
         assert_eq!(
-            delete_after_miss(Some(0), Some(NOW), NOW),
+            delete_after_miss(Some(0), Some(PASSED), NOW),
+            Err(DeleteError::NotQueued)
+        );
+        assert_eq!(
+            delete_after_miss(Some(0), Some(CLAIMED), NOW),
             Err(DeleteError::NotQueued)
         );
         assert!(matches!(
-            delete_after_miss(Some(0), Some(NOW + 1), NOW),
+            delete_after_miss(Some(0), Some(OPEN), NOW),
             Err(DeleteError::Port(_))
         ));
     }
@@ -704,13 +883,61 @@ mod tests {
     fn delete_without_a_change_count_trusts_the_reread_row() {
         assert_eq!(delete_after_miss(None, None, NOW), Ok(()));
         assert_eq!(
-            delete_after_miss(None, Some(NOW), NOW),
+            delete_after_miss(None, Some(PASSED), NOW),
             Err(DeleteError::NotQueued)
         );
+        assert_eq!(
+            delete_after_miss(None, Some(CLAIMED), NOW),
+            Err(DeleteError::NotQueued),
+            "a claimed row was not deleted, so its video must stay"
+        );
         assert!(matches!(
-            delete_after_miss(None, Some(NOW + 1), NOW),
+            delete_after_miss(None, Some(OPEN), NOW),
             Err(DeleteError::Port(_))
         ));
+    }
+
+    #[test]
+    fn a_row_inside_the_lock_window_is_refused_as_too_close() {
+        for changes in [Some(0), None] {
+            assert_eq!(
+                update_after_miss(changes, Some(INSIDE_WINDOW), NOW),
+                Err(UpdateError::TooCloseToSlot)
+            );
+            assert_eq!(
+                delete_after_miss(changes, Some(INSIDE_WINDOW), NOW),
+                Err(DeleteError::TooCloseToSlot),
+                "its video must stay"
+            );
+        }
+        // A claimed row is NotQueued even inside the window, and a passed slot stays NotQueued.
+        let claimed_inside = RowGuard {
+            claimed: true,
+            ..INSIDE_WINDOW
+        };
+        assert_eq!(
+            update_after_miss(None, Some(claimed_inside), NOW),
+            Err(UpdateError::NotQueued)
+        );
+        assert_eq!(
+            delete_after_miss(Some(0), Some(PASSED), NOW),
+            Err(DeleteError::NotQueued)
+        );
+        assert_eq!(
+            error_status(&AppError::TooCloseToSlot),
+            (409, "too close to its slot to change")
+        );
+    }
+
+    #[test]
+    fn the_edit_and_delete_sql_both_require_an_unclaimed_row() {
+        for sql in [UPDATE_POST_SQL, DELETE_POST_SQL] {
+            assert!(sql.contains("slot_at > ?"), "{sql}");
+            assert!(sql.contains("state = 'queued'"), "{sql}");
+            assert!(sql.contains("attempts = 0"), "{sql}");
+        }
+        assert!(UPDATE_POST_SQL.starts_with("UPDATE posts SET title = ?1"));
+        assert!(DELETE_POST_SQL.starts_with("DELETE FROM posts WHERE id = ?1"));
     }
 
     #[test]
@@ -787,6 +1014,16 @@ mod tests {
                 AppError::Queue(QueueError::BadVideoKey),
                 422,
                 "video key is not valid",
+            ),
+            (
+                AppError::Queue(QueueError::DescriptionTooManyBytes),
+                422,
+                "caption is too long for YouTube (5000 bytes at most)",
+            ),
+            (
+                AppError::Queue(QueueError::AngleBrackets),
+                422,
+                "YouTube does not allow < or > in a title or caption",
             ),
             (
                 AppError::Queue(QueueError::TooLong),

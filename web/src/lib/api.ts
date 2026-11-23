@@ -2,6 +2,8 @@
 // shown as they come. The upload link (put_url) is a secret: it is never logged,
 // never kept in state, and never put in an error message.
 
+import type { PublishInfo } from "@/lib/publish";
+
 export type Platform = "instagram" | "youtube";
 
 export interface PostJson {
@@ -12,6 +14,8 @@ export interface PostJson {
   platforms: Platform[];
   slot_at: number;
   status: "ready" | "needs_caption";
+  /** Where the post is in publishing. The Worker always sends it; older answers lack it, and that means queued. */
+  publish?: PublishInfo;
 }
 
 export interface StartUploadBody {

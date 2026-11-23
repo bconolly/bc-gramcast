@@ -6,7 +6,7 @@ use domain::app::{
     DeleteError, InsertError, PortError, PostRepository, SlotPatternRepository, UpdateError,
     UploadSigner, UploadStore,
 };
-use domain::queue::QueuedPost;
+use domain::queue::{edit_cutoff, QueuedPost};
 use domain::slots::SlotPattern;
 use serde::Deserialize;
 use worker::{Bucket, D1Database, Env};
@@ -22,13 +22,13 @@ impl D1PostRepository {
 }
 
 #[derive(Deserialize)]
-struct PostRow {
-    id: String,
-    video_key: String,
-    title: String,
-    caption: String,
-    platforms: String,
-    slot_at: f64,
+pub(crate) struct PostRow {
+    pub(crate) id: String,
+    pub(crate) video_key: String,
+    pub(crate) title: String,
+    pub(crate) caption: String,
+    pub(crate) platforms: String,
+    pub(crate) slot_at: f64,
 }
 
 /// Rows changed by a write, from D1's result metadata, if it reports them.
@@ -37,7 +37,7 @@ pub(crate) fn changes(result: &worker::D1Result) -> Result<Option<usize>, PortEr
     Ok(meta.and_then(|m| m.changes))
 }
 
-fn row_to_post(r: PostRow) -> Result<QueuedPost, PortError> {
+pub(crate) fn row_to_post(r: PostRow) -> Result<QueuedPost, PortError> {
     let platforms = r
         .platforms
         .split(',')
@@ -79,6 +79,33 @@ fn d1_error_text(e: &worker::Error) -> String {
             format!("{} | {}", d1.cause(), String::from(js.message()))
         }
         other => other.to_string(),
+    }
+}
+
+#[derive(Deserialize)]
+struct GuardRow {
+    slot_at: f64,
+    state: String,
+    attempts: f64,
+}
+
+impl D1PostRepository {
+    /// Reads back what settles a write that changed nothing: the slot and whether the
+    /// publisher has claimed the post. Fixed error text, no row value.
+    async fn guard(&self, id: &str) -> Result<Option<dto::RowGuard>, PortError> {
+        let fail = |_| PortError("post read failed".into());
+        let row = self
+            .db
+            .prepare("SELECT slot_at, state, attempts FROM posts WHERE id = ?1")
+            .bind(&[id.into()])
+            .map_err(fail)?
+            .first::<GuardRow>(None)
+            .await
+            .map_err(fail)?;
+        Ok(row.map(|r| dto::RowGuard {
+            slot_at: r.slot_at as i64,
+            claimed: dto::row_claimed(&r.state, r.attempts),
+        }))
     }
 }
 
@@ -143,20 +170,20 @@ impl PostRepository for D1PostRepository {
             .iter()
             .map(|p| dto::platform_to_str(*p))
             .collect();
-        // video_key and id are never in the SET list, so they cannot change. The
-        // slot_at > now test is the "still queued" rule again. `now` is the time
-        // the request started, so this guards against other writers, not against
-        // the slot passing while this request runs (a gap for the publishing slice).
+        // video_key and id are never in the SET list, so they cannot change. The WHERE
+        // is the "still changeable" rule: the slot is after `now` + `EDIT_LOCK_SECS` AND the publisher has not
+        // claimed the post (see `dto::UPDATE_POST_SQL`). The state test is what closes
+        // the gap between the request's clock and the publisher's.
         let result = self
             .db
-            .prepare("UPDATE posts SET title = ?1, caption = ?2, platforms = ?3, slot_at = ?4 WHERE id = ?5 AND slot_at > ?6")
+            .prepare(dto::UPDATE_POST_SQL)
             .bind(&[
                 post.title.as_str().into(),
                 post.caption.as_str().into(),
                 platforms.join(",").into(),
                 (post.slot_at as f64).into(),
                 post.id.as_str().into(),
-                (now as f64).into(),
+                (edit_cutoff(now) as f64).into(),
             ])
             .map_err(|e| UpdateError::Port(port_err(e)))?
             .run()
@@ -166,15 +193,15 @@ impl PostRepository for D1PostRepository {
         if dto::write_applied(changes) {
             return Ok(());
         }
-        let row = self.get(&post.id).await.map_err(UpdateError::Port)?;
-        dto::update_after_miss(changes, row.map(|p| p.slot_at), now)
+        let row = self.guard(&post.id).await.map_err(UpdateError::Port)?;
+        dto::update_after_miss(changes, row, now)
     }
 
     async fn delete(&self, id: &str, now: i64) -> Result<(), DeleteError> {
         let result = self
             .db
-            .prepare("DELETE FROM posts WHERE id = ?1 AND slot_at > ?2")
-            .bind(&[id.into(), (now as f64).into()])
+            .prepare(dto::DELETE_POST_SQL)
+            .bind(&[id.into(), (edit_cutoff(now) as f64).into()])
             .map_err(|e| DeleteError::Port(port_err(e)))?
             .run()
             .await
@@ -183,11 +210,11 @@ impl PostRepository for D1PostRepository {
         if dto::write_applied(changes) {
             return Ok(());
         }
-        let row = self.get(id).await.map_err(|e| {
+        let row = self.guard(id).await.map_err(|e| {
             worker::console_error!("{}", dto::DELETE_UNCONFIRMED_LINE);
             DeleteError::Port(e)
         })?;
-        dto::delete_after_miss(changes, row.map(|p| p.slot_at), now)
+        dto::delete_after_miss(changes, row, now)
     }
 }
 

@@ -1,6 +1,7 @@
 import { render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { EDIT_LOCK_SECS } from "@/lib/publish";
 import { Queue } from "@/screens/Queue";
 
 afterEach(() => vi.unstubAllGlobals());
@@ -207,5 +208,144 @@ describe("Queue delete", () => {
     await user.click(await screen.findByRole("button", { name: "Delete Sunday reel" }));
     await user.click(screen.getByRole("button", { name: "Cancel" }));
     expect(screen.getByRole("button", { name: "Delete Sunday reel" })).toHaveFocus();
+  });
+});
+
+describe("Queue publish state", () => {
+  const base = { caption: "Hi", platforms: ["youtube"], status: "ready" };
+  const later = slot(2099, 3, 5, 7, 4);
+  const posts = [
+    { ...base, id: "q1", video_key: "videos/q1.mp4", title: "Waiting post", slot_at: later, publish: { state: "queued" } },
+    { ...base, id: "p1", video_key: "videos/p1.mp4", title: "Going up", slot_at: 1_700_000_100, publish: { state: "publishing" } },
+    { ...base, id: "d1", video_key: "videos/d1.mp4", title: "Live post", slot_at: 1_700_000_200, publish: { state: "published", external_id: "dQw4w9WgXcQ" } },
+    { ...base, id: "f1", video_key: "videos/f1.mp4", title: "Lost post", slot_at: 1_700_000_300, publish: { state: "failed", reason: "unknown" } },
+    { ...base, id: "e1", video_key: "videos/e1.mp4", title: "Odd id post", slot_at: 1_700_000_400, publish: { state: "published", external_id: "https://evil.example/x" } },
+  ];
+  const row = (title: string) => within(screen.getByText(title).closest("li") as HTMLElement);
+
+  async function load() {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response(JSON.stringify(posts))));
+    render(<Queue />);
+    await screen.findByText("Waiting post");
+  }
+
+  it("shows Queued, Publishing, Published and Failed", async () => {
+    await load();
+    expect(row("Waiting post").getByText("Queued")).toBeInTheDocument();
+    expect(row("Going up").getByText("Publishing")).toBeInTheDocument();
+    expect(row("Live post").getByText("Published")).toBeInTheDocument();
+    expect(row("Lost post").getByText("Failed")).toBeInTheDocument();
+  });
+
+  it("links a published post to the fixed Shorts address, built from the id only", async () => {
+    await load();
+    const link = row("Live post").getByRole("link", { name: /Watch on YouTube/ });
+    expect(link).toHaveAttribute("href", "https://www.youtube.com/shorts/dQw4w9WgXcQ");
+    expect(link).toHaveAttribute("target", "_blank");
+    expect(link.getAttribute("rel")).toContain("noopener");
+    expect(link.getAttribute("rel")).toContain("noreferrer");
+  });
+
+  it("makes no link from an id of the wrong shape", async () => {
+    await load();
+    expect(row("Odd id post").getByText("Published")).toBeInTheDocument();
+    expect(row("Odd id post").queryByRole("link")).not.toBeInTheDocument();
+    expect(document.body.innerHTML).not.toContain("evil.example");
+  });
+
+  it("explains a failure with the fixed message for its reason code", async () => {
+    await load();
+    expect(row("Lost post").getByText(/YouTube Studio/)).toBeInTheDocument();
+  });
+
+  it("says a queued post whose slot has passed is waiting to publish", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    try {
+      const now = 1_800_000_000;
+      vi.setSystemTime(now * 1000);
+      const passed = { ...base, id: "x1", video_key: "videos/x1.mp4", title: "Late one", slot_at: now - 3600, publish: { state: "queued" } };
+      const atNow = { ...base, id: "x2", video_key: "videos/x2.mp4", title: "On the dot", slot_at: now, publish: { state: "queued" } };
+      const ahead = { ...base, id: "x3", video_key: "videos/x3.mp4", title: "Ahead one", slot_at: now + 3600, publish: { state: "queued" } };
+      const going = { ...base, id: "x4", video_key: "videos/x4.mp4", title: "Going one", slot_at: now - 60, publish: { state: "publishing" } };
+      vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response(JSON.stringify([passed, atNow, ahead, going]))));
+      render(<Queue />);
+      await screen.findByText("Late one");
+      expect(row("Late one").getByText("Waiting to publish")).toBeInTheDocument();
+      expect(row("On the dot").getByText("Waiting to publish")).toBeInTheDocument();
+      expect(row("Late one").queryByRole("button")).not.toBeInTheDocument();
+      expect(row("Ahead one").queryByText("Waiting to publish")).not.toBeInTheDocument();
+      expect(row("Going one").queryByText("Waiting to publish")).not.toBeInTheDocument();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("hides Edit and Delete inside the lock window and says why, in the Worker's words", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    try {
+      const now = 1_800_000_000;
+      vi.setSystemTime(now * 1000);
+      const inWindow = { ...base, id: "w1", video_key: "videos/w1.mp4", title: "Close one", slot_at: now + EDIT_LOCK_SECS, publish: { state: "queued" } };
+      const outside = { ...base, id: "w2", video_key: "videos/w2.mp4", title: "Far one", slot_at: now + EDIT_LOCK_SECS + 1, publish: { state: "queued" } };
+      vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response(JSON.stringify([inWindow, outside]))));
+      render(<Queue />);
+      await screen.findByText("Close one");
+      expect(screen.queryByRole("button", { name: "Edit Close one" })).not.toBeInTheDocument();
+      expect(screen.queryByRole("button", { name: "Delete Close one" })).not.toBeInTheDocument();
+      expect(row("Close one").getByText("Too close to its slot to change.")).toBeInTheDocument();
+      expect(screen.getByRole("button", { name: "Edit Far one" })).toBeInTheDocument();
+      expect(row("Far one").queryByText(/too close/i)).not.toBeInTheDocument();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("offers Edit and Delete only for a post that is still queued with its slot ahead", async () => {
+    await load();
+    expect(row("Waiting post").getByRole("button", { name: "Edit Waiting post" })).toBeInTheDocument();
+    expect(row("Waiting post").getByRole("button", { name: "Delete Waiting post" })).toBeInTheDocument();
+    for (const t of ["Going up", "Live post", "Lost post"]) {
+      expect(row(t).queryByRole("button")).not.toBeInTheDocument();
+    }
+  });
+
+  it("treats a post with no publish field as queued", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response(JSON.stringify([POSTS[0]]))));
+    render(<Queue />);
+    const r = within((await screen.findByText("Sunday reel")).closest("li") as HTMLElement);
+    expect(r.getByText("Queued")).toBeInTheDocument();
+    expect(r.getByRole("button", { name: "Edit Sunday reel" })).toBeInTheDocument();
+  });
+
+  it("moves focus to the nearest row that still has an Edit button, skipping rows that cannot change", async () => {
+    const mixed = [posts[0], posts[2], { ...posts[0], id: "q2", video_key: "videos/q2.mp4", title: "Second waiting", slot_at: later + 60 }];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (url: string) =>
+        url === "/api/queue" ? new Response(JSON.stringify(mixed)) : new Response(null, { status: 204 }),
+      ),
+    );
+    const user = userEvent.setup();
+    render(<Queue />);
+    await user.click(await screen.findByRole("button", { name: "Delete Second waiting" }));
+    await user.click(screen.getByRole("button", { name: "Delete post" }));
+    await waitFor(() => expect(screen.queryByText("Second waiting")).not.toBeInTheDocument());
+    expect(screen.getByRole("button", { name: "Edit Waiting post" })).toHaveFocus();
+  });
+
+  it("moves focus to the list when no editable row is left", async () => {
+    const only = [posts[0], posts[2]];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (url: string) =>
+        url === "/api/queue" ? new Response(JSON.stringify(only)) : new Response(null, { status: 204 }),
+      ),
+    );
+    const user = userEvent.setup();
+    render(<Queue />);
+    await user.click(await screen.findByRole("button", { name: "Delete Waiting post" }));
+    await user.click(screen.getByRole("button", { name: "Delete post" }));
+    await waitFor(() => expect(screen.queryByText("Waiting post")).not.toBeInTheDocument());
+    expect(screen.getByRole("list")).toHaveFocus();
   });
 });

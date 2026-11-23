@@ -209,6 +209,7 @@ mod tests {
     use super::*;
     use crate::oauth::STATE_TTL_SECS;
     use crate::token::fakes::FakeTokenStore;
+    use crate::token::TokenLoad;
     use std::cell::{Cell, RefCell};
     use std::collections::HashMap;
 
@@ -481,11 +482,11 @@ mod tests {
 
     struct FailingTokens;
     impl TokenStore for FailingTokens {
-        async fn load(&self) -> Result<Option<StoredToken>, PortError> {
-            Ok(None)
+        async fn load(&self) -> Result<TokenLoad, PortError> {
+            Ok(TokenLoad::Missing)
         }
-        async fn save(&self, _: &StoredToken) -> Result<(), PortError> {
-            Ok(())
+        async fn save(&self, _: &StoredToken) -> Result<bool, PortError> {
+            Ok(true)
         }
         async fn connect(&self, _: &StoredToken) -> Result<(), PortError> {
             Err(PortError("d1 down".into()))

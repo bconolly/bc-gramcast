@@ -1,7 +1,8 @@
 //! Media domain: a video the owner has uploaded.
 
-/// Upload size cap for version 1. Our Reels are about 2 MB, so this is generous.
-pub const MAX_UPLOAD_BYTES: u64 = 100 * 1024 * 1024;
+/// Upload size cap: the largest video one publishing run can send within the platform's
+/// subrequest limit (see `youtube`). Our Reels are about 2 MB, so this is generous.
+pub const MAX_UPLOAD_BYTES: u64 = crate::youtube::MAX_PUBLISH_BYTES;
 pub const MAX_FILE_NAME_BYTES: usize = 255;
 
 #[derive(Debug, Clone, PartialEq, Eq)]

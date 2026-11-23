@@ -58,11 +58,14 @@ describe("validateForm", () => {
     expect(validateForm({ ...ok, file: null })).toContain("Choose an MP4 video.");
     expect(validateForm({ ...ok, file: mp4("reel.mov") })).toContain("The video must be an MP4 file.");
   });
+  it("caps a video at what one publishing run can upload (88 MiB, as the Worker)", () => {
+    expect(MAX_UPLOAD_BYTES).toBe(88 * 1024 * 1024);
+  });
   it("rejects an empty or oversized file", () => {
     expect(validateForm({ ...ok, file: mp4("a.mp4", 0) })).toContain("The video file is empty.");
     expect(validateForm({ ...ok, file: mp4("a.mp4", MAX_UPLOAD_BYTES) })).toEqual([]);
     expect(validateForm({ ...ok, file: mp4("a.mp4", MAX_UPLOAD_BYTES + 1) })).toContain(
-      "The video is too large (100 MB limit).",
+      "The video is too large (88 MB limit).",
     );
   });
   it("rejects file names the server rejects", () => {
@@ -86,6 +89,21 @@ describe("validateForm", () => {
     expect(validateForm({ ...ok, caption: "c".repeat(MAX_CAPTION_CHARS + 1) })).toContain(
       "Caption must be 2,200 characters or fewer.",
     );
+  });
+  it("applies YouTube's description and angle-bracket rules only to YouTube posts", () => {
+    const yt = { ...ok, platforms: ["youtube" as const] };
+    const wide = "\u20ac".repeat(2000); // 6,000 bytes
+    expect(validateForm({ ...yt, caption: wide })).toContain(
+      "Caption must be 5,000 bytes or fewer for YouTube.",
+    );
+    expect(validateForm({ ...ok, caption: wide })).toEqual([]);
+    expect(validateForm({ ...yt, caption: "\u20ac".repeat(1666) + "ab" })).toEqual([]);
+    for (const bad of [{ title: "a<b" }, { title: "a>b" }, { caption: "x <b>" }]) {
+      expect(validateForm({ ...yt, ...bad })).toContain(
+        "YouTube does not allow < or > in the title or caption.",
+      );
+      expect(validateForm({ ...ok, ...bad })).toEqual([]);
+    }
   });
   it("requires a platform", () => {
     expect(validateForm({ ...ok, platforms: [] })).toContain("Choose at least one platform.");

@@ -24,7 +24,7 @@ pub async fn connection_status<T: TokenStore>(tokens: &T) -> Result<ConnectionSt
 mod tests {
     use super::*;
     use crate::token::fakes::FakeTokenStore;
-    use crate::token::StoredToken;
+    use crate::token::{StoredToken, TokenLoad};
 
     fn token() -> StoredToken {
         StoredToken {
@@ -89,11 +89,11 @@ mod tests {
         mark: Result<Option<bool>, PortError>,
     }
     impl TokenStore for Unreadable {
-        async fn load(&self) -> Result<Option<StoredToken>, PortError> {
+        async fn load(&self) -> Result<TokenLoad, PortError> {
             panic!("the status must not read the token");
         }
-        async fn save(&self, _: &StoredToken) -> Result<(), PortError> {
-            Ok(())
+        async fn save(&self, _: &StoredToken) -> Result<bool, PortError> {
+            Ok(true)
         }
         async fn connect(&self, _: &StoredToken) -> Result<(), PortError> {
             Ok(())
