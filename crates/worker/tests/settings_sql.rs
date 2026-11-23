@@ -2,9 +2,9 @@
 //! migrations 0001 to 0005, so the compare-and-set is shown to work and not just to
 //! contain the right words. D1 is SQLite, but this is not D1 itself.
 //!
-//! Skipped, with a note on stderr, when `sqlite3` is not installed. CI does not install it
-//! (see `.github/workflows/ci.yml`); whether the runner image has it is unconfirmed, so a
-//! skip there would pass silently.
+//! Skipped, with a note on stderr, when `sqlite3` is not installed, except when the `CI`
+//! environment variable is set: then a missing `sqlite3` fails the run, so CI cannot pass
+//! silently without it (the workflow installs it).
 
 use gramcast_worker::settings_dto::{INSERT_SQL, UPDATE_SQL};
 use std::io::Write;
@@ -18,6 +18,16 @@ const MIGRATIONS: [&str; 5] = [
     include_str!("../../../migrations/0005_settings.sql"),
 ];
 
+/// What to do when `sqlite3` cannot be started: skip off CI, fail on CI.
+fn on_missing_sqlite(ci: bool) -> Option<String> {
+    assert!(
+        !ci,
+        "sqlite3 is required when CI is set, but it was not found"
+    );
+    eprintln!("sqlite3 not found: skipping the settings SQL test");
+    None
+}
+
 /// Runs the script in a fresh in-memory database and returns what it printed.
 /// `None` means sqlite3 is not available here.
 fn sqlite(script: &str) -> Option<String> {
@@ -29,10 +39,7 @@ fn sqlite(script: &str) -> Option<String> {
         .spawn();
     let mut child = match child {
         Ok(c) => c,
-        Err(_) => {
-            eprintln!("sqlite3 not found: skipping the settings SQL test");
-            return None;
-        }
+        Err(_) => return on_missing_sqlite(std::env::var_os("CI").is_some()),
     };
     child
         .stdin
@@ -125,4 +132,15 @@ fn a_stale_expected_time_changes_nothing_and_the_current_one_changes_one_row() {
         out,
         "0\n1|public|100|integer|integer\n1\n0|private|300|integer|integer\n"
     );
+}
+
+#[test]
+#[should_panic(expected = "sqlite3 is required when CI is set")]
+fn a_missing_sqlite3_fails_the_run_on_ci() {
+    on_missing_sqlite(true);
+}
+
+#[test]
+fn a_missing_sqlite3_is_skipped_off_ci() {
+    assert_eq!(on_missing_sqlite(false), None);
 }
