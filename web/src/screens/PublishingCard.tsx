@@ -13,12 +13,18 @@ import {
   type PublishSettings,
 } from "@/lib/api";
 
-type Load = { kind: "loading" } | { kind: "error"; message: string } | { kind: "ready"; stored: PublishSettings };
+type Load =
+  | { kind: "loading" }
+  | { kind: "error"; message: string; afterConflict: boolean }
+  | { kind: "ready"; stored: PublishSettings };
 
 const messageOf = (e: unknown) => (e instanceof Error ? e.message : "Something went wrong.");
 
 const CONFLICT_NOTICE =
   "These settings were changed since you opened them. They have been reloaded, so check them and save again.";
+
+const CONFLICT_RELOAD_FAILED =
+  "These settings were changed elsewhere and could not be reloaded. Your save was not applied. Retry to load them.";
 
 const PRIVACY_LABELS: Record<PublishPrivacy, string> = {
   private: "Private (only you)",
@@ -82,17 +88,20 @@ export function PublishingCard() {
   /**
    * Reads the stored settings again. `keepForm` leaves the form mounted while it waits (a
    * conflict reload), so focus and the owner's place are not lost. Any earlier message is
-   * cleared, so an old alert cannot come back. Resolves true if the reload worked.
+   * cleared, so an old alert cannot come back. `afterConflict` is a reload that follows a
+   * refused save: it keeps the conflict notice when it works and says the save was refused when
+   * it fails, through any number of Retry clicks. Resolves true if the reload worked.
    */
   const reload = useCallback(
-    async (keepForm = false): Promise<boolean> => {
+    async (keepForm = false, afterConflict = false): Promise<boolean> => {
       setError(null);
       if (!keepForm) setLoad({ kind: "loading" });
       try {
         show(await getPublishSettings());
+        if (afterConflict) setError(CONFLICT_NOTICE);
         return true;
       } catch (e) {
-        setLoad({ kind: "error", message: messageOf(e) });
+        setLoad({ kind: "error", message: afterConflict ? CONFLICT_RELOAD_FAILED : messageOf(e), afterConflict });
         return false;
       }
     },
@@ -104,7 +113,7 @@ export function PublishingCard() {
     let live = true;
     getPublishSettings().then(
       (stored) => live && show(stored),
-      (e: unknown) => live && setLoad({ kind: "error", message: messageOf(e) }),
+      (e: unknown) => live && setLoad({ kind: "error", message: messageOf(e), afterConflict: false }),
     );
     return () => {
       live = false;
@@ -130,10 +139,7 @@ export function PublishingCard() {
       setNotice("Publishing settings saved.");
     } catch (e) {
       if (isSettingsConflict(e)) {
-        if (await reload(true)) {
-          setError(CONFLICT_NOTICE);
-          returnFocus.current = true;
-        }
+        if (await reload(true, true)) returnFocus.current = true;
       } else {
         setError(messageOf(e));
       }
@@ -166,7 +172,7 @@ export function PublishingCard() {
           <p role="alert" className="text-destructive text-sm">
             {load.message}
           </p>
-          <Button type="button" variant="outline" className="min-h-11" onClick={() => void reload()}>
+          <Button type="button" variant="outline" className="min-h-11" onClick={() => void reload(false, load.afterConflict)}>
             Retry
           </Button>
         </div>

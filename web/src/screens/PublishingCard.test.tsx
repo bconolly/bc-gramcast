@@ -202,7 +202,22 @@ describe("PublishingCard", () => {
     await waitFor(() => expect(screen.getByRole("button", { name: "Save" })).toHaveFocus());
   });
 
-  it("does not bring an old conflict alert back after a failed reload is retried", async () => {
+  it("says the save was refused and could not be reloaded when a conflict is followed by a failed reload", async () => {
+    const user = userEvent.setup();
+    stubApi({
+      GET: [json(saved()), new Response("internal error", { status: 500 })],
+      PUT: [new Response("settings changed since you loaded them", { status: 409 })],
+    });
+    render(<PublishingCard />);
+    await user.selectOptions(await screen.findByLabelText("Privacy"), "unlisted");
+    await user.click(screen.getByRole("button", { name: "Save" }));
+    const alert = await screen.findByRole("alert");
+    expect(alert).toHaveTextContent("These settings were changed elsewhere and could not be reloaded");
+    expect(alert).not.toHaveTextContent("internal error");
+    expect(screen.getByRole("button", { name: "Retry" })).toBeInTheDocument();
+  });
+
+  it("keeps the conflict notice, once, after a Retry that follows a conflict", async () => {
     const user = userEvent.setup();
     stubApi({
       GET: [json(saved()), new Response("internal error", { status: 500 }), json(saved({ updated_at: 150 }))],
@@ -211,8 +226,18 @@ describe("PublishingCard", () => {
     render(<PublishingCard />);
     await user.selectOptions(await screen.findByLabelText("Privacy"), "unlisted");
     await user.click(screen.getByRole("button", { name: "Save" }));
-    expect(await screen.findByRole("alert")).toHaveTextContent("internal error");
+    await screen.findByText(/could not be reloaded/i);
     await user.click(screen.getByRole("button", { name: "Retry" }));
+    await screen.findByRole("switch", { name: "Publishing" });
+    expect(screen.getAllByRole("alert")).toHaveLength(1);
+    expect(screen.getByRole("alert")).toHaveTextContent(/changed since you opened them/i);
+  });
+
+  it("shows no conflict notice when a Retry follows an ordinary load failure", async () => {
+    const user = userEvent.setup();
+    stubApi({ GET: [new Response("internal error", { status: 500 }), json(saved())] });
+    render(<PublishingCard />);
+    await user.click(await screen.findByRole("button", { name: "Retry" }));
     await screen.findByRole("switch", { name: "Publishing" });
     expect(screen.queryByRole("alert")).not.toBeInTheDocument();
   });
