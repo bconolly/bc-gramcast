@@ -18,11 +18,12 @@ use crate::oauth_adapters::{
     oauth_config, AesGcmCipher, D1TokenStore, GoogleRefresher, WebCryptoRandom,
 };
 use crate::publish_adapters::D1PublishRepository;
-use crate::publish_log::{failure_line, run_lines, RunFailure, DISABLED_LINE};
+use crate::publish_log::{failure_line, run_lines, run_start, RunFailure, RunStart};
 use crate::settings_adapters::D1SettingsRepository;
 use crate::youtube_adapters::{R2Videos, YouTubePublisher};
+use domain::app::PortError;
 use domain::publish_app::{publish_due, PublishReport, POSTS_PER_RUN};
-use domain::settings::{load_settings, run_gate, RunGate};
+use domain::settings::{load_settings, run_gate, RunGate, SettingsError};
 use domain::youtube::Privacy;
 use worker::{console_log, Env};
 
@@ -67,22 +68,18 @@ async fn read_gate(env: &Env) -> RunGate {
             let privacy = var_text(env, "PUBLISH_PRIVACY");
             load_settings(&repo, enabled.as_deref(), privacy.as_deref()).await
         }
-        Err(_) => Err(domain::settings::SettingsError::BadRow),
+        Err(_) => Err(SettingsError::Port(PortError("no db binding".into()))),
     };
     run_gate(&read)
 }
 
 pub async fn run(env: &Env) {
-    let privacy = match read_gate(env).await {
-        RunGate::Stop => {
-            console_log!("{}", failure_line(RunFailure::Settings));
+    let privacy = match run_start(read_gate(env).await) {
+        RunStart::Stop(line) => {
+            console_log!("{}", line);
             return;
         }
-        RunGate::Disabled => {
-            console_log!("{}", DISABLED_LINE);
-            return;
-        }
-        RunGate::Publish(privacy) => privacy,
+        RunStart::Publish(privacy) => privacy,
     };
     match build_and_run(env, privacy).await {
         Ok(report) => {

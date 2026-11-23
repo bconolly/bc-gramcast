@@ -2,9 +2,7 @@
 //! `domain::settings`, and the SQL and mapping are in `settings_dto`. It cannot run natively.
 //! Its errors are fixed text: no D1 error or row value is copied in.
 
-use crate::settings_dto::{
-    cas_from_changes, row_to_settings, SettingsRow, GET_SQL, INSERT_SQL, UPDATE_SQL,
-};
+use crate::settings_dto::{cas_from_changes, decode_row, GET_SQL, INSERT_SQL, UPDATE_SQL};
 use domain::app::PortError;
 use domain::publish_app::Cas;
 use domain::settings::{PublishSettings, SettingsError, SettingsRepository};
@@ -31,11 +29,12 @@ impl SettingsRepository for D1SettingsRepository {
         let row = self
             .db
             .prepare(GET_SQL)
-            .first::<SettingsRow>(None)
+            .first::<serde_json::Value>(None)
             .await
             .map_err(fail)?;
+        // Read as loose JSON first, so a row of any wrong shape is a BadRow, not a read error.
         row.map(|r| {
-            row_to_settings(&r).inspect_err(|_| {
+            decode_row(r).inspect_err(|_| {
                 // Only that the row was bad: its values are never logged.
                 worker::console_error!("bad settings row");
             })

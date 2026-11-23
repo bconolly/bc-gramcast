@@ -6,6 +6,10 @@ use domain::publish_app::Cas;
 use domain::settings::{EffectiveSettings, PublishSettings, SettingsError, Source};
 use serde::{Deserialize, Deserializer, Serialize};
 
+/// The 409 text. The web client matches it exactly (`SETTINGS_CONFLICT_MESSAGE` in
+/// `web/src/lib/api.ts`); a test here reads that file and checks the two agree.
+pub const CONFLICT_MESSAGE: &str = "settings changed since you loaded them";
+
 pub const GET_SQL: &str =
     "SELECT publish_enabled, publish_privacy, updated_at FROM settings WHERE id = 1";
 
@@ -17,6 +21,13 @@ pub const INSERT_SQL: &str =
 /// Later saves: changes the row only if its `updated_at` is still the one the caller saw (?4).
 pub const UPDATE_SQL: &str = "UPDATE settings SET publish_enabled = ?1, publish_privacy = ?2, \
      updated_at = ?3 WHERE id = 1 AND updated_at = ?4";
+
+/// Decodes the row exactly as D1 returned it (any JSON). A row of the wrong shape or type
+/// (a NULL, a text number, a missing column) is `BadRow`, the same as a bad value.
+pub fn decode_row(value: serde_json::Value) -> Result<PublishSettings, SettingsError> {
+    let row: SettingsRow = serde_json::from_value(value).map_err(|_| SettingsError::BadRow)?;
+    row_to_settings(&row)
+}
 
 /// The row as D1 returns it: integers may arrive as doubles.
 #[derive(Debug, Deserialize)]
@@ -84,7 +95,7 @@ pub fn saved_to_json(s: &PublishSettings) -> SettingsJson {
 pub fn settings_error_status(e: &SettingsError) -> (u16, &'static str) {
     match e {
         SettingsError::Invalid => (400, "bad request"),
-        SettingsError::Conflict => (409, "settings changed since you loaded them"),
+        SettingsError::Conflict => (409, CONFLICT_MESSAGE),
         SettingsError::BadRow | SettingsError::Port(_) => (500, "internal error"),
     }
 }
@@ -119,6 +130,40 @@ mod tests {
             ..row
         };
         assert_eq!(row_to_settings(&bad), Err(SettingsError::BadRow));
+    }
+
+    #[test]
+    fn every_row_that_fails_to_decode_is_a_bad_row() {
+        let ok =
+            serde_json::json!({"publish_enabled": 1, "publish_privacy": "public", "updated_at": 5});
+        assert_eq!(decode_row(ok).unwrap().updated_at, 5);
+        let floats = serde_json::json!({"publish_enabled": 0.0, "publish_privacy": "private", "updated_at": 5.0});
+        assert!(decode_row(floats).is_ok());
+        for bad in [
+            serde_json::json!({"publish_enabled": null, "publish_privacy": "private", "updated_at": 5}),
+            serde_json::json!({"publish_enabled": "1", "publish_privacy": "private", "updated_at": 5}),
+            serde_json::json!({"publish_enabled": 1, "publish_privacy": 7, "updated_at": 5}),
+            serde_json::json!({"publish_enabled": 1, "publish_privacy": "private"}),
+            serde_json::json!({"publish_enabled": 1, "publish_privacy": "x", "updated_at": 5}),
+            serde_json::json!({"publish_enabled": 1, "publish_privacy": "private", "updated_at": "5"}),
+            serde_json::json!(null),
+            serde_json::json!([]),
+        ] {
+            assert_eq!(decode_row(bad.clone()), Err(SettingsError::BadRow), "{bad}");
+        }
+    }
+
+    /// The web client recognises a conflict by this exact text (`SETTINGS_CONFLICT_MESSAGE`
+    /// in `web/src/lib/api.ts`). If either side changes, this fails.
+    #[test]
+    fn the_conflict_text_is_the_one_the_web_client_looks_for() {
+        let api = include_str!("../../../web/src/lib/api.ts");
+        let wanted = format!("SETTINGS_CONFLICT_MESSAGE = \"{CONFLICT_MESSAGE}\"");
+        assert!(api.contains(&wanted), "{wanted}");
+        assert_eq!(
+            settings_error_status(&SettingsError::Conflict),
+            (409, CONFLICT_MESSAGE)
+        );
     }
 
     #[test]

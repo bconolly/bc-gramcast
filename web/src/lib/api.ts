@@ -279,7 +279,11 @@ export async function savePublishSettings(body: SavePublishSettingsBody): Promis
   return readChecked(await sendJson("PUT", "/api/settings/publish", body), isPublishSettings);
 }
 
-/** The Worker's fixed 409 text for a save made against settings that have since changed. */
+/**
+ * The Worker's fixed 409 text for a save made against settings that have since changed.
+ * Must equal `CONFLICT_MESSAGE` in `crates/worker/src/settings_dto.rs`; a Rust test there
+ * reads this file and fails if the two differ.
+ */
 export const SETTINGS_CONFLICT_MESSAGE = "settings changed since you loaded them";
 
 export const isSettingsConflict = (e: unknown): boolean =>
