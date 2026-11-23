@@ -18,6 +18,11 @@ const MIGRATIONS: [&str; 5] = [
     include_str!("../../../migrations/0005_settings.sql"),
 ];
 
+/// Only "not found" means sqlite3 is not installed; any other spawn error is a real fault.
+fn is_missing(e: &std::io::Error) -> bool {
+    e.kind() == std::io::ErrorKind::NotFound
+}
+
 /// What to do when `sqlite3` cannot be started: skip off CI, fail on CI.
 fn on_missing_sqlite(ci: bool) -> Option<String> {
     assert!(
@@ -39,7 +44,8 @@ fn sqlite(script: &str) -> Option<String> {
         .spawn();
     let mut child = match child {
         Ok(c) => c,
-        Err(_) => return on_missing_sqlite(std::env::var_os("CI").is_some()),
+        Err(e) if is_missing(&e) => return on_missing_sqlite(std::env::var_os("CI").is_some()),
+        Err(e) => panic!("sqlite3 could not be started: {e}"),
     };
     child
         .stdin
@@ -143,4 +149,12 @@ fn a_missing_sqlite3_fails_the_run_on_ci() {
 #[test]
 fn a_missing_sqlite3_is_skipped_off_ci() {
     assert_eq!(on_missing_sqlite(false), None);
+}
+
+#[test]
+fn only_not_found_means_sqlite3_is_missing() {
+    use std::io::{Error, ErrorKind};
+    assert!(is_missing(&Error::from(ErrorKind::NotFound)));
+    assert!(!is_missing(&Error::from(ErrorKind::PermissionDenied)));
+    assert!(!is_missing(&Error::from(ErrorKind::Other)));
 }
