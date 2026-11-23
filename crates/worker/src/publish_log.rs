@@ -14,12 +14,15 @@ pub const DISABLED_LINE: &str = "publish disabled";
 pub enum RunFailure {
     Setup,
     List,
+    /// The publish settings could not be read or decoded.
+    Settings,
 }
 
 pub fn failure_line(f: RunFailure) -> &'static str {
     match f {
         RunFailure::Setup => "publish run failed: setup",
         RunFailure::List => "publish run failed: list",
+        RunFailure::Settings => "publish run failed: settings",
     }
 }
 
@@ -206,5 +209,9 @@ mod tests {
         assert_eq!(DISABLED_LINE, "publish disabled");
         assert_eq!(failure_line(RunFailure::Setup), "publish run failed: setup");
         assert_eq!(failure_line(RunFailure::List), "publish run failed: list");
+        assert_eq!(
+            failure_line(RunFailure::Settings),
+            "publish run failed: settings"
+        );
     }
 }
