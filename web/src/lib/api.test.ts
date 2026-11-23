@@ -3,6 +3,9 @@ import {
   ApiError,
   deletePost,
   getConnectStatus,
+  getPublishSettings,
+  isSettingsConflict,
+  savePublishSettings,
   getNextSlots,
   getPattern,
   getQueue,
@@ -316,5 +319,60 @@ describe("getConnectStatus", () => {
   it("shows the Worker's fixed message on failure", async () => {
     mockFetch(reply("youtube connect is not configured", 503));
     await expect(getConnectStatus()).rejects.toThrow("youtube connect is not configured");
+  });
+});
+
+describe("publish settings", () => {
+  const stored = { enabled: true, privacy: "unlisted", updated_at: 1700000000, source: "settings" };
+
+  it("reads GET /api/settings/publish", async () => {
+    const fetchFn = mockFetch(reply(JSON.stringify(stored)));
+    expect(await getPublishSettings()).toEqual(stored);
+    expect(fetchFn.mock.calls[0]?.[0]).toBe("/api/settings/publish");
+  });
+
+  it("accepts defaults with a null updated_at", async () => {
+    const defaults = { enabled: false, privacy: "private", updated_at: null, source: "defaults" };
+    mockFetch(reply(JSON.stringify(defaults)));
+    expect(await getPublishSettings()).toEqual(defaults);
+  });
+
+  it("refuses a body of the wrong shape", async () => {
+    for (const body of [
+      "{}",
+      "null",
+      JSON.stringify({ ...stored, enabled: "yes" }),
+      JSON.stringify({ ...stored, privacy: "secret" }),
+      JSON.stringify({ ...stored, updated_at: "1" }),
+      JSON.stringify({ ...stored, source: "elsewhere" }),
+    ]) {
+      mockFetch(reply(body));
+      await expect(getPublishSettings()).rejects.toThrow("Something went wrong (error 200)");
+    }
+  });
+
+  it("PUTs the three fields as JSON and returns the saved settings", async () => {
+    const fetchFn = mockFetch(reply(JSON.stringify(stored)));
+    const body = { enabled: true, privacy: "unlisted" as const, expected_updated_at: null };
+    expect(await savePublishSettings(body)).toEqual(stored);
+    const [path, init] = fetchFn.mock.calls[0] ?? [];
+    expect(path).toBe("/api/settings/publish");
+    expect(init).toMatchObject({ method: "PUT", headers: { "Content-Type": "application/json" } });
+    expect(JSON.parse(String(init.body))).toEqual(body);
+  });
+
+  it("tells a conflict from other failures", async () => {
+    mockFetch(reply("settings changed since you loaded them", 409));
+    const e = await savePublishSettings({ enabled: true, privacy: "private", expected_updated_at: 1 }).catch((x: unknown) => x);
+    expect(isSettingsConflict(e)).toBe(true);
+    mockFetch(reply("that slot is already taken", 409));
+    const other = await savePublishSettings({ enabled: true, privacy: "private", expected_updated_at: 1 }).catch((x: unknown) => x);
+    expect(isSettingsConflict(other)).toBe(false);
+    expect(isSettingsConflict(new Error("x"))).toBe(false);
+  });
+
+  it("shows the Worker's fixed message on failure", async () => {
+    mockFetch(reply("internal error", 500));
+    await expect(getPublishSettings()).rejects.toThrow("internal error");
   });
 });
