@@ -138,4 +138,82 @@ describe("PublishingCard", () => {
     await user.click(screen.getByRole("button", { name: "Retry" }));
     expect(await screen.findByRole("switch", { name: "Publishing" })).toHaveAttribute("aria-checked", "true");
   });
+
+  it("does not ask when switching off while public", async () => {
+    const user = userEvent.setup();
+    const pub = saved({ privacy: "public" });
+    const fn = stubApi({ GET: [json(pub)], PUT: [json({ ...pub, enabled: false, updated_at: 101 })] });
+    render(<PublishingCard />);
+    await user.click(await screen.findByRole("switch", { name: "Publishing" }));
+    await user.click(screen.getByRole("button", { name: "Save" }));
+    await screen.findByRole("status");
+    expect(screen.queryByRole("alertdialog")).not.toBeInTheDocument();
+    expect(puts(fn)).toEqual([{ enabled: false, privacy: "public", expected_updated_at: 100 }]);
+  });
+
+  it("does not ask when public and on were already saved", async () => {
+    const user = userEvent.setup();
+    const pub = saved({ privacy: "public" });
+    const fn = stubApi({ GET: [json(pub)], PUT: [json({ ...pub, updated_at: 101 })] });
+    render(<PublishingCard />);
+    await user.click(await screen.findByRole("button", { name: "Save" }));
+    await screen.findByRole("status");
+    expect(screen.queryByRole("alertdialog")).not.toBeInTheDocument();
+    expect(puts(fn)).toHaveLength(1);
+  });
+
+  it("asks when switching on while public is already chosen, but not while off", async () => {
+    const user = userEvent.setup();
+    const offPublic = saved({ enabled: false, privacy: "public" });
+    const fn = stubApi({ GET: [json(offPublic)], PUT: [json({ ...offPublic, updated_at: 101 })] });
+    render(<PublishingCard />);
+    await user.click(await screen.findByRole("button", { name: "Save" }));
+    await screen.findByRole("status");
+    expect(screen.queryByRole("alertdialog")).not.toBeInTheDocument();
+    expect(puts(fn)).toHaveLength(1);
+    await user.click(screen.getByRole("switch", { name: "Publishing" }));
+    await user.click(screen.getByRole("button", { name: "Save" }));
+    expect(await screen.findByRole("alertdialog")).toBeInTheDocument();
+    expect(puts(fn)).toHaveLength(1);
+  });
+
+  it("keeps the form up through a conflict reload and puts focus on Save", async () => {
+    const user = userEvent.setup();
+    let release: (r: Response) => void = () => {};
+    const reloadAnswer = new Promise<Response>((resolve) => (release = resolve));
+    const calls: string[] = [];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (_p: string, init?: RequestInit) => {
+        const method = init?.method ?? "GET";
+        calls.push(method);
+        if (method === "PUT") return new Response("settings changed since you loaded them", { status: 409 });
+        return calls.filter((m) => m === "GET").length === 1 ? json(saved()) : reloadAnswer;
+      }),
+    );
+    render(<PublishingCard />);
+    await user.selectOptions(await screen.findByLabelText("Privacy"), "unlisted");
+    await user.click(screen.getByRole("button", { name: "Save" }));
+    await waitFor(() => expect(calls).toEqual(["GET", "PUT", "GET"]));
+    // The reload is still in flight: the form has not gone away.
+    expect(screen.getByRole("switch", { name: "Publishing" })).toBeInTheDocument();
+    release(json(saved({ privacy: "private", updated_at: 150 })));
+    expect(await screen.findByRole("alert")).toHaveTextContent(/changed since you opened them/i);
+    await waitFor(() => expect(screen.getByRole("button", { name: "Save" })).toHaveFocus());
+  });
+
+  it("does not bring an old conflict alert back after a failed reload is retried", async () => {
+    const user = userEvent.setup();
+    stubApi({
+      GET: [json(saved()), new Response("internal error", { status: 500 }), json(saved({ updated_at: 150 }))],
+      PUT: [new Response("settings changed since you loaded them", { status: 409 })],
+    });
+    render(<PublishingCard />);
+    await user.selectOptions(await screen.findByLabelText("Privacy"), "unlisted");
+    await user.click(screen.getByRole("button", { name: "Save" }));
+    expect(await screen.findByRole("alert")).toHaveTextContent("internal error");
+    await user.click(screen.getByRole("button", { name: "Retry" }));
+    await screen.findByRole("switch", { name: "Publishing" });
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+  });
 });

@@ -26,6 +26,11 @@ const PRIVACY_LABELS: Record<PublishPrivacy, string> = {
   public: "Public (anyone can find it)",
 };
 
+/** True only when this save turns on public posting that is not already saved. */
+function wouldNewlyPublishPublicly(stored: PublishSettings, enabled: boolean, privacy: PublishPrivacy): boolean {
+  return enabled && privacy === "public" && !(stored.enabled && stored.privacy === "public");
+}
+
 /** In-page question before a public save, like the delete question: Escape or Cancel closes it. */
 function PublicConfirm({ busy, onConfirm, onCancel }: { busy: boolean; onConfirm: () => void; onCancel: () => void }) {
   const onKeyDown = (e: KeyboardEvent) => {
@@ -74,14 +79,25 @@ export function PublishingCard() {
     setPrivacy(stored.privacy);
   }, []);
 
-  const reload = useCallback(async () => {
-    setLoad({ kind: "loading" });
-    try {
-      show(await getPublishSettings());
-    } catch (e) {
-      setLoad({ kind: "error", message: messageOf(e) });
-    }
-  }, [show]);
+  /**
+   * Reads the stored settings again. `keepForm` leaves the form mounted while it waits (a
+   * conflict reload), so focus and the owner's place are not lost. Any earlier message is
+   * cleared, so an old alert cannot come back. Resolves true if the reload worked.
+   */
+  const reload = useCallback(
+    async (keepForm = false): Promise<boolean> => {
+      setError(null);
+      if (!keepForm) setLoad({ kind: "loading" });
+      try {
+        show(await getPublishSettings());
+        return true;
+      } catch (e) {
+        setLoad({ kind: "error", message: messageOf(e) });
+        return false;
+      }
+    },
+    [show],
+  );
 
   // Initial load: state is set only when the request settles, as on the Connections screen.
   useEffect(() => {
@@ -114,8 +130,10 @@ export function PublishingCard() {
       setNotice("Publishing settings saved.");
     } catch (e) {
       if (isSettingsConflict(e)) {
-        setError(CONFLICT_NOTICE);
-        await reload();
+        if (await reload(true)) {
+          setError(CONFLICT_NOTICE);
+          returnFocus.current = true;
+        }
       } else {
         setError(messageOf(e));
       }
@@ -125,7 +143,7 @@ export function PublishingCard() {
   }
 
   function onSaveClick() {
-    if (privacy === "public") setConfirming(true);
+    if (load.kind === "ready" && wouldNewlyPublishPublicly(load.stored, enabled, privacy)) setConfirming(true);
     else void save();
   }
 
