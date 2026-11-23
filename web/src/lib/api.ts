@@ -243,3 +243,48 @@ const isConnectStatus = (b: unknown): b is ConnectStatus =>
 export async function getConnectStatus(): Promise<ConnectStatus> {
   return readChecked(await call("/api/connect/status"), isConnectStatus);
 }
+
+export type PublishPrivacy = "private" | "unlisted" | "public";
+
+export const PUBLISH_PRIVACIES: readonly PublishPrivacy[] = ["private", "unlisted", "public"];
+
+export interface PublishSettings {
+  enabled: boolean;
+  privacy: PublishPrivacy;
+  /** Null while no settings have been saved (the deploy-time defaults are in force). */
+  updated_at: number | null;
+  source: "settings" | "defaults";
+}
+
+export interface SavePublishSettingsBody {
+  enabled: boolean;
+  privacy: PublishPrivacy;
+  /** The updated_at from the last load; null when that load had none. */
+  expected_updated_at: number | null;
+}
+
+const isPublishSettings = (b: unknown): b is PublishSettings =>
+  isRecord(b) &&
+  typeof b.enabled === "boolean" &&
+  PUBLISH_PRIVACIES.includes(b.privacy as PublishPrivacy) &&
+  (b.updated_at === null || Number.isInteger(b.updated_at)) &&
+  (b.source === "settings" || b.source === "defaults");
+
+export async function getPublishSettings(): Promise<PublishSettings> {
+  return readChecked(await call("/api/settings/publish"), isPublishSettings);
+}
+
+/** Resolves to what the server stored. A 409 means someone saved since the last load. */
+export async function savePublishSettings(body: SavePublishSettingsBody): Promise<PublishSettings> {
+  return readChecked(await sendJson("PUT", "/api/settings/publish", body), isPublishSettings);
+}
+
+/**
+ * The Worker's fixed 409 text for a save made against settings that have since changed.
+ * Must equal `CONFLICT_MESSAGE` in `crates/worker/src/settings_dto.rs`; a Rust test there
+ * reads this file and fails if the two differ.
+ */
+export const SETTINGS_CONFLICT_MESSAGE = "settings changed since you loaded them";
+
+export const isSettingsConflict = (e: unknown): boolean =>
+  e instanceof ApiError && e.status === 409 && e.message === SETTINGS_CONFLICT_MESSAGE;

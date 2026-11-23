@@ -5,9 +5,15 @@ import { CONNECT_ERROR_MESSAGES, GENERIC_CONNECT_ERROR } from "@/lib/connect";
 
 afterEach(() => vi.unstubAllGlobals());
 
+const publishSettings = { enabled: false, privacy: "private", updated_at: null, source: "defaults" };
+
+/** Answers the status call with the given flags and the settings call with the defaults. */
 function stubStatus(connected: boolean, needsReconnect: boolean) {
-  const body = { youtube: { connected, needs_reconnect: needsReconnect } };
-  vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response(JSON.stringify(body))));
+  const status = { youtube: { connected, needs_reconnect: needsReconnect } };
+  vi.stubGlobal(
+    "fetch",
+    vi.fn(async (path: string) => new Response(JSON.stringify(path === "/api/settings/publish" ? publishSettings : status))),
+  );
 }
 
 const none = { connected: false, errorMessage: null };
@@ -72,11 +78,19 @@ describe("Connections", () => {
     expect(screen.getByRole("link", { name: "Connect YouTube" })).toBeInTheDocument();
   });
 
-  it("asks for nothing but the status", async () => {
+  it("asks only for the connection status and the publish settings", async () => {
     stubStatus(false, false);
     render(<Connections result={none} />);
     await screen.findByText("Not connected");
+    await screen.findByRole("switch", { name: "Publishing" });
     const fetchFn = vi.mocked(fetch);
-    expect(fetchFn.mock.calls.map((c) => c[0])).toEqual(["/api/connect/status"]);
+    expect(fetchFn.mock.calls.map((c) => c[0]).sort()).toEqual(["/api/connect/status", "/api/settings/publish"]);
+  });
+
+  it("shows the Publishing card below YouTube", async () => {
+    stubStatus(false, false);
+    render(<Connections result={none} />);
+    expect(await screen.findByRole("heading", { name: "Publishing" })).toBeInTheDocument();
+    expect(await screen.findByRole("switch", { name: "Publishing" })).toBeInTheDocument();
   });
 });

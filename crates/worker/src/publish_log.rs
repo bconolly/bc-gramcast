@@ -6,6 +6,8 @@
 use domain::publish::is_valid_external_id;
 use domain::publish_app::{Outcome, PublishReport};
 use domain::queue::is_post_id;
+use domain::settings::RunGate;
+use domain::youtube::Privacy;
 
 pub const DISABLED_LINE: &str = "publish disabled";
 
@@ -14,12 +16,32 @@ pub const DISABLED_LINE: &str = "publish disabled";
 pub enum RunFailure {
     Setup,
     List,
+    /// The publish settings could not be read or decoded.
+    Settings,
+}
+
+/// What a scheduled run does after reading the settings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RunStart {
+    /// Log this fixed line and return without publishing.
+    Stop(&'static str),
+    /// Go on, with this privacy for the publisher.
+    Publish(Privacy),
+}
+
+pub fn run_start(gate: RunGate) -> RunStart {
+    match gate {
+        RunGate::Stop => RunStart::Stop(failure_line(RunFailure::Settings)),
+        RunGate::Disabled => RunStart::Stop(DISABLED_LINE),
+        RunGate::Publish(privacy) => RunStart::Publish(privacy),
+    }
 }
 
 pub fn failure_line(f: RunFailure) -> &'static str {
     match f {
         RunFailure::Setup => "publish run failed: setup",
         RunFailure::List => "publish run failed: list",
+        RunFailure::Settings => "publish run failed: settings",
     }
 }
 
@@ -202,9 +224,28 @@ mod tests {
     }
 
     #[test]
+    fn a_run_stops_with_a_fixed_line_or_goes_on_with_the_stored_privacy() {
+        assert_eq!(
+            run_start(RunGate::Stop),
+            RunStart::Stop("publish run failed: settings")
+        );
+        assert_eq!(
+            run_start(RunGate::Disabled),
+            RunStart::Stop("publish disabled")
+        );
+        for p in [Privacy::Private, Privacy::Unlisted, Privacy::Public] {
+            assert_eq!(run_start(RunGate::Publish(p)), RunStart::Publish(p));
+        }
+    }
+
+    #[test]
     fn the_fixed_lines_are_fixed() {
         assert_eq!(DISABLED_LINE, "publish disabled");
         assert_eq!(failure_line(RunFailure::Setup), "publish run failed: setup");
         assert_eq!(failure_line(RunFailure::List), "publish run failed: list");
+        assert_eq!(
+            failure_line(RunFailure::Settings),
+            "publish run failed: settings"
+        );
     }
 }

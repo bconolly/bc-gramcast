@@ -16,6 +16,7 @@ function stubEmptyApi() {
     "/api/slots/pattern": '{"utc_offset_minutes":600,"rules":[]}',
     "/api/slots/next?count=5": '{"slots":[]}',
     "/api/connect/status": '{"youtube":{"connected":false,"needs_reconnect":false}}',
+    "/api/settings/publish": '{"enabled":false,"privacy":"private","updated_at":null,"source":"defaults"}',
   };
   vi.stubGlobal(
     "fetch",

@@ -123,6 +123,16 @@ impl Privacy {
         }
     }
 
+    /// Exactly `private`, `unlisted` or `public`. Anything else is `None`.
+    pub fn parse(value: &str) -> Option<Privacy> {
+        match value {
+            "private" => Some(Privacy::Private),
+            "unlisted" => Some(Privacy::Unlisted),
+            "public" => Some(Privacy::Public),
+            _ => None,
+        }
+    }
+
     /// The value YouTube's `privacyStatus` takes.
     pub fn status(self) -> &'static str {
         match self {
@@ -394,6 +404,16 @@ mod tests {
         assert_eq!(Privacy::from_var(Some("unlisted")), Privacy::Unlisted);
         assert_eq!(Privacy::from_var(Some("public")), Privacy::Public);
         assert_eq!(Privacy::Unlisted.status(), "unlisted");
+    }
+
+    #[test]
+    fn privacy_parse_accepts_only_the_three_exact_names() {
+        assert_eq!(Privacy::parse("private"), Some(Privacy::Private));
+        assert_eq!(Privacy::parse("unlisted"), Some(Privacy::Unlisted));
+        assert_eq!(Privacy::parse("public"), Some(Privacy::Public));
+        for bad in ["", "Public", " public", "public ", "pub", "true"] {
+            assert_eq!(Privacy::parse(bad), None, "{bad:?}");
+        }
     }
 
     #[test]
