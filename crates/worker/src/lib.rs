@@ -20,6 +20,8 @@ mod publish_adapters;
 #[cfg(target_arch = "wasm32")]
 mod scheduled;
 #[cfg(target_arch = "wasm32")]
+mod settings_adapters;
+#[cfg(target_arch = "wasm32")]
 mod youtube_adapters;
 
 #[cfg(target_arch = "wasm32")]
@@ -29,9 +31,12 @@ mod entry {
     };
     use crate::dto::{self, PatchPostBody, PatternJson, QueuePostBody, StartUploadBody};
     use crate::publish_adapters::D1PublishRepository;
+    use crate::settings_adapters::D1SettingsRepository;
+    use crate::settings_dto::{self, PutBody};
     use domain::app;
     use domain::auth::{self, AccessConfig, AuthError};
     use domain::queue_view;
+    use domain::settings;
     use worker::*;
 
     /// Fails closed. Returns the response that denies the request, or `None` to
@@ -177,6 +182,8 @@ mod entry {
             .get_async("/api/slots/pattern", get_pattern_route)
             .put_async("/api/slots/pattern", put_pattern_route)
             .get_async("/api/slots/next", next_slots_route)
+            .get_async("/api/settings/publish", get_publish_settings_route)
+            .put_async("/api/settings/publish", put_publish_settings_route)
             .get_async("/api/connect/youtube/start", crate::connect_routes::start)
             .get_async(
                 "/api/connect/youtube/callback",
@@ -305,6 +312,40 @@ mod entry {
         match app::set_pattern(&repo, offset, rules).await {
             Ok(p) => Response::from_json(&dto::pattern_to_json(&p)),
             Err(e) => app_error(&e),
+        }
+    }
+
+    fn settings_error(e: &settings::SettingsError) -> Result<Response> {
+        let (code, msg) = settings_dto::settings_error_status(e);
+        Response::error(msg, code)
+    }
+
+    async fn get_publish_settings_route(_req: Request, ctx: Ctx) -> Result<Response> {
+        let repo = D1SettingsRepository::new(ctx.env.d1("DB")?);
+        let enabled = var_text(&ctx.env, "PUBLISH_ENABLED");
+        let privacy = var_text(&ctx.env, "PUBLISH_PRIVACY");
+        match settings::load_settings(&repo, enabled.as_deref(), privacy.as_deref()).await {
+            Ok(s) => Response::from_json(&settings_dto::effective_to_json(&s)),
+            Err(e) => settings_error(&e),
+        }
+    }
+
+    async fn put_publish_settings_route(mut req: Request, ctx: Ctx) -> Result<Response> {
+        if let Some(rejected) = require_json(&req)? {
+            return Ok(rejected);
+        }
+        let Ok(body) = req.json::<PutBody>().await else {
+            return Response::error("bad request", 400);
+        };
+        let update =
+            match settings::parse_update(body.enabled, &body.privacy, body.expected_updated_at) {
+                Ok(u) => u,
+                Err(e) => return settings_error(&e),
+            };
+        let repo = D1SettingsRepository::new(ctx.env.d1("DB")?);
+        match settings::save_settings(&repo, now_secs(), update).await {
+            Ok(saved) => Response::from_json(&settings_dto::saved_to_json(&saved)),
+            Err(e) => settings_error(&e),
         }
     }
 
