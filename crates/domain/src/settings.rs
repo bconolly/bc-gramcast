@@ -132,6 +132,24 @@ pub fn next_updated_at(now: i64, expected: Option<u64>) -> u64 {
     clock.max(after).min(MAX_UPDATED_AT)
 }
 
+/// What a scheduled run does with the settings read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RunGate {
+    /// The settings could not be read or decoded: stop, publish nothing.
+    Stop,
+    Disabled,
+    Publish(Privacy),
+}
+
+/// Fail closed: only a successful read that says enabled lets a run publish.
+pub fn run_gate(read: &Result<EffectiveSettings, SettingsError>) -> RunGate {
+    match read {
+        Ok(s) if s.enabled => RunGate::Publish(s.privacy),
+        Ok(_) => RunGate::Disabled,
+        Err(_) => RunGate::Stop,
+    }
+}
+
 pub async fn load_settings(
     repo: &impl SettingsRepository,
     enabled_var: Option<&str>,
@@ -408,6 +426,32 @@ mod tests {
             pollster::block_on(save_settings(&repo, 1, update(true, "private", None))),
             Err(SettingsError::Port(PortError("down".into())))
         );
+    }
+
+    #[test]
+    fn a_run_publishes_only_after_a_good_read_that_says_enabled() {
+        let eff = |enabled, updated_at| {
+            Ok(EffectiveSettings {
+                enabled,
+                privacy: Privacy::Unlisted,
+                updated_at,
+            })
+        };
+        assert_eq!(
+            run_gate(&eff(true, Some(1))),
+            RunGate::Publish(Privacy::Unlisted)
+        );
+        assert_eq!(
+            run_gate(&eff(true, None)),
+            RunGate::Publish(Privacy::Unlisted)
+        );
+        assert_eq!(run_gate(&eff(false, Some(1))), RunGate::Disabled);
+        assert_eq!(run_gate(&Err(SettingsError::BadRow)), RunGate::Stop);
+        assert_eq!(
+            run_gate(&Err(SettingsError::Port(PortError("x".into())))),
+            RunGate::Stop
+        );
+        assert_eq!(run_gate(&Err(SettingsError::Conflict)), RunGate::Stop);
     }
 
     #[test]
