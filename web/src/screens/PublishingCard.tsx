@@ -109,7 +109,10 @@ export function PublishingCard() {
         const stored = await getPublishSettings();
         if (!mounted.current) return false;
         show(stored);
-        if (afterConflict) setError(CONFLICT_NOTICE);
+        if (afterConflict) {
+          setError(CONFLICT_NOTICE);
+          returnFocus.current = true;
+        }
         return true;
       } catch (e) {
         if (!mounted.current) return false;
@@ -138,7 +141,7 @@ export function PublishingCard() {
       returnFocus.current = false;
       saveRef.current?.focus();
     }
-  }, [busy, confirming]);
+  }, [busy, confirming, load.kind]);
 
   async function save() {
     if (load.kind !== "ready") return;
@@ -153,7 +156,7 @@ export function PublishingCard() {
     } catch (e) {
       if (!mounted.current) return;
       if (isSettingsConflict(e)) {
-        if (await reload(true, true)) returnFocus.current = true;
+        await reload(true, true);
       } else {
         setError(messageOf(e));
       }

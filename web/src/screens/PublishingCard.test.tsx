@@ -233,6 +233,19 @@ describe("PublishingCard", () => {
     expect(screen.getByRole("alert")).toHaveTextContent(/changed since you opened them/i);
   });
 
+  it("puts focus on Save when a Retry succeeds after a conflict whose reload failed", async () => {
+    const user = userEvent.setup();
+    stubApi({
+      GET: [json(saved()), new Response("internal error", { status: 500 }), json(saved({ updated_at: 150 }))],
+      PUT: [new Response("settings changed since you loaded them", { status: 409 })],
+    });
+    render(<PublishingCard />);
+    await user.selectOptions(await screen.findByLabelText("Privacy"), "unlisted");
+    await user.click(screen.getByRole("button", { name: "Save" }));
+    await user.click(await screen.findByRole("button", { name: "Retry" }));
+    await waitFor(() => expect(screen.getByRole("button", { name: "Save" })).toHaveFocus());
+  });
+
   it("shows no conflict notice when a Retry follows an ordinary load failure", async () => {
     const user = userEvent.setup();
     stubApi({ GET: [new Response("internal error", { status: 500 }), json(saved())] });
